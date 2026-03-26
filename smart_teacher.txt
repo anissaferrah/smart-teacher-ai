@@ -1,0 +1,294 @@
+🎓 🧠 Smart Teacher
+
+Professeur IA Vocal Interactif en Temps Réel
+
+🎯 Objectif du projet
+
+Développer un professeur virtuel intelligent capable de :
+
+👉 présenter des cours (slides/PDF) sans modification 👉 expliquer les concepts de manière pédagogique 👉 interagir en temps réel par la voix avec les étudiants
+
+💡 Idée principale
+
+👉 “Transformer des supports de cours existants en une expérience d’apprentissage interactive, proche d’un vrai enseignant, grâce à l’intelligence artificielle vocale.”
+
+⚙️ Fonctionnement global
+
+Choix chapitre → Affichage slides → Présentation vocale → Explication → 
+Interruption étudiant → Réponse IA → Reprise du cours
+
+🔊 Interaction vocale intelligente
+
+Le système permet une conversation naturelle :
+
+
+
+
+
+ 🎙️ L’IA parle (présente le cours) 
+
+
+
+ 🧠 Détection automatique quand l’étudiant parle (VAD) 
+
+
+
+ ✋ L’IA s’arrête immédiatement 
+
+
+
+ ❓ L’étudiant pose une question 
+
+
+
+ 🤖 L’IA répond de façon contextualisée 
+
+
+
+ ▶️ Reprise du cours au bon endroit 
+
+👉 Cela reproduit une interaction enseignant–étudiant réelle
+
+📚 Gestion des cours
+
+
+
+
+
+ 📄 Slides/PDF non modifiés 
+
+
+
+ 🧠 Explications générées à partir du contenu 
+
+
+
+ 📑 Organisation : cours → chapitres → sections 
+
+
+
+ 🔄 Navigation intelligente : 
+
+
+
+
+
+ “Passe au chapitre suivant” 
+
+
+
+ “Explique encore ce point” 
+
+🎓 Intelligence pédagogique
+
+Le Smart Teacher est capable de :
+
+
+
+
+
+ adapter la vitesse d’explication 
+
+
+
+ reformuler un concept 
+
+
+
+ donner des exemples 
+
+
+
+ détecter la confusion 
+
+
+
+ proposer des quiz oraux 
+
+🧱 Architecture technique
+
+🔊 Système vocal
+
+
+
+
+
+ STT : Whisper / Vosk 
+
+
+
+ TTS : ElevenLabs / Piper 
+
+
+
+ VAD : WebRTC VAD / Silero 
+
+
+
+ Streaming audio : WebSockets 
+
+🧠 Intelligence
+
+
+
+
+
+ Backend : Python (FastAPI) 
+
+
+
+ RAG : LangChain + Qdrant 
+
+
+
+ LLM : Mistral / LLaMA / API 
+
+
+
+ Gestion contexte : Redis 
+
+💾 Données
+
+
+
+
+
+ PostgreSQL : structure des cours 
+
+
+
+ MinIO / S3 : stockage des slides 
+
+
+
+ Elasticsearch : historique 
+
+
+
+ ClickHouse : analytics 
+
+🌐 Frontend
+
+
+
+
+
+ React (interface étudiant) 
+
+
+
+ WebRTC / Jitsi (visioconférence) 
+
+
+
+ Socket.io (temps réel) 
+
+🔄 Gestion des états
+
+PRESENTING → LISTENING → PROCESSING → RESPONDING → PRESENTING
+
+👉 Permet une conversation fluide et naturelle
+
+📊 Indicateurs de performance (KPIs)
+
+
+
+
+
+ ⏱️ Latence interruption < 500 ms 
+
+
+
+ ⚡ Réponse < 5 s 
+
+
+
+ 🎯 Précision STT (WER) < 5% 
+
+
+
+ 🔊 Qualité voix (MOS) > 4.0 
+
+🎯 Résultat final
+
+👉 L’étudiant peut :
+
+
+
+
+
+ suivre un cours comme en classe 
+
+
+
+ écouter les slides avec explication 
+
+
+
+ poser des questions à tout moment 
+
+
+
+ recevoir des réponses personnalisées 
+
+📦 Livrables
+
+
+
+
+
+ API Smart Teacher (backend complet) 
+
+
+
+ Interface étudiant (web) 
+
+
+
+ SDK JavaScript 
+
+
+
+ Dashboard professeur 
+
+
+
+ Outil de gestion de cours 
+
+
+
+ Documentation complète 
+
+⏳ Plan du projet (résumé)
+
+
+
+
+
+ 🔧 Mise en place audio (STT, TTS, VAD) 
+
+
+
+ 🧠 Développement IA (RAG + LLM) 
+
+
+
+ 📚 Intégration des cours 
+
+
+
+ 🔄 Interaction temps réel 
+
+
+
+ 🌐 Interface + WebRTC 
+
+
+
+ 🧪 Tests + optimisation 
+
+🔥 Conclusion (phrase parfaite)
+
+👉
+
+“Smart Teacher est un professeur IA vocal interactif capable de présenter des cours réels, d’interagir naturellement avec les étudiants en temps réel, et d’adapter son enseignement pour offrir une تجربة proche d’un véritable environnement pédagogique.” je veux sa 

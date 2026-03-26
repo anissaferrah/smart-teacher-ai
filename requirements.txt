@@ -1,0 +1,96 @@
+# ============================================================================
+# SMART TEACHER - REQUIREMENTS (Version stable)
+# ============================================================================
+
+# Core Framework
+fastapi
+uvicorn
+python-dotenv
+pydantic
+
+# WebSocket & HTTP
+websockets
+httpx
+python-multipart
+aiofiles
+
+# Audio Processing
+faster-whisper
+sounddevice
+numpy
+torch
+torchaudio
+librosa
+pydub
+webrtcvad
+
+# Text-to-Speech
+edge-tts
+elevenlabs
+
+# LLM & RAG
+openai
+langchain
+langchain-openai
+langchain-community
+langchain-qdrant
+qdrant-client
+pypdf
+pdf2image
+pdfminer-six
+python-docx
+python-pptx
+pillow
+markdown
+tiktoken
+sentence-transformers
+
+# Database
+asyncpg
+sqlalchemy
+alembic
+redis
+psycopg2-binary
+
+# Analytics & Search
+clickhouse-connect
+elasticsearch
+
+# Storage
+minio
+boto3
+
+# Utilities
+langdetect
+pytz
+python-magic
+python-magic-bin
+requests
+aiohttp
+tenacity
+pyyaml
+colorama
+tqdm
+
+# Unstructured (extraction de documents) - version allégée
+unstructured
+unstructured-inference
+unstructured-pytesseract
+pypdfium2
+
+# OCR (optionnel, désactiver si problèmes)
+pytesseract
+pdfplumber
+
+# Testing & Development
+pytest
+pytest-asyncio
+pytest-cov
+black
+isort
+flake8
+mypy
+
+# Monitoring
+prometheus-client
+psutil

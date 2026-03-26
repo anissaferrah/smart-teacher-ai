@@ -1,0 +1,11 @@
+event_time,session_id,student_id,course_id,language,level,event_type,question,answer_length,stt_time,llm_time,tts_time,total_time,kpi_ok,subject,chapter_idx,section_idx,confidence,interruptions
+2026-03-25T12:15:07.622918,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:15:39.263013,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:15:50.414213,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:15:59.102585,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:16:08.634480,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:16:11.754947,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:16:14.284025,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:16:17.685678,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:16:20.886088,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-25T12:16:25.295506,3d12412a-d3a8-4540-ae75-f800912052e5,,,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0

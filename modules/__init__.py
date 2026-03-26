@@ -1,0 +1,1 @@
+"""Smart Teacher — Package modules"""
