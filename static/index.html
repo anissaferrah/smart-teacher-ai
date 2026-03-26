@@ -221,6 +221,7 @@ const SID=crypto.randomUUID();
 let ws=null,wsR=false,wsSS=false;
 let cCourse=null,cCourseId=null,chI=0,sI=0;
 let paused=false,curAud=null,audBuf=[],pendAns=null;
+let audBufStreamId=null,interruptedStreamId=null;
 let recg=false,mr=null,ac=[],selFiles=[];
 let wInt=null;const NB=26;
 // Position sauvegardée avant interruption pour la question
@@ -280,13 +281,22 @@ function handle(m){
   else if(m.type==='transcription'){addM(activeChat(),m.text,'s',`🗣️ ${(m.lang||'').toUpperCase()}`);}
   else if(m.type==='answer_text'){pendAns={text:m.text,subject:m.subject};}
   else if(m.type==='audio_chunk'){
-    bufAud(m.data,m.mime,m.final);
+    if(interruptedStreamId!==null && m.stream_id===interruptedStreamId){
+      if(m.final)interruptedStreamId=null;
+      return;
+    }
+    bufAud(m.data,m.mime,m.final,m.stream_id);
     if(m.final&&pendAns){
       addM(activeChat(),pendAns.text,'t','Professeur');
       pendAns=null;
       // NE PAS reprendre ici — on attend le signal resume_course du serveur
       // ou le onended de bufAud pour les sections normales de cours
     }
+  }
+  else if(m.type==='audio_interrupted'){
+    interruptedStreamId=m.stream_id??null;
+    stopAud();
+    pendAns=null;
   }
   else if(m.type==='resume_course'){
     // Le serveur a terminé sa réponse à la question → reprendre EXACTEMENT où on était
@@ -494,8 +504,12 @@ function unlockAudio(){
 document.addEventListener('click',unlockAudio);
 document.addEventListener('keydown',unlockAudio);
 
-function bufAud(b64,mime,final){
+function bufAud(b64,mime,final,streamId=null){
   if(!b64)return;
+  if(streamId!==null && streamId!==undefined){
+    if(audBufStreamId===null)audBufStreamId=streamId;
+    else if(audBufStreamId!==streamId){audBuf=[];audBufStreamId=streamId;}
+  }
   try{audBuf.push(Uint8Array.from(atob(b64),c=>c.charCodeAt(0)));}
   catch(e){console.error('base64 decode error',e);return;}
   if(final){
@@ -503,6 +517,7 @@ function bufAud(b64,mime,final){
     const m=new Uint8Array(tot);
     let off=0;audBuf.forEach(c=>{m.set(c,off);off+=c.length;});
     audBuf=[];
+    audBufStreamId=null;
     const blob=new Blob([m],{type:mime||'audio/mpeg'});
     const url=URL.createObjectURL(blob);
     stopAud();
@@ -549,7 +564,7 @@ function bufAud(b64,mime,final){
     }
   }
 }
-function stopAud(){if(curAud){curAud.pause();curAud=null;}audBuf=[];animWF('off');}
+function stopAud(){if(curAud){curAud.pause();curAud=null;}audBuf=[];audBufStreamId=null;animWF('off');}
 
 // ── MESSAGES ──────────────────────────────────────────────
 function addM(area,text,type,lbl=''){

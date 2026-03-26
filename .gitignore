@@ -13,6 +13,8 @@ build/
 # Project data
 logs/
 data/
+courses/
+python
 *.db
 *.sqlite
 

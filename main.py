@@ -315,12 +315,80 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     saved_chi:     int         = 0      # position chapitre sauvegardée
     saved_si:      int         = 0      # position section sauvegardée
     in_course:     bool        = False  # étudiant en cours de présentation
+    send_lock:     asyncio.Lock = asyncio.Lock()
+    audio_stream_task: asyncio.Task | None = None
+    current_stream_id: int = 0
 
     async def send(data: dict):
-        await websocket.send_json(data)
+        async with send_lock:
+            await websocket.send_json(data)
 
     async def send_state(state: DialogState):
         await send({"type": "state_change", "state": state.value})
+
+    async def set_listening_state() -> None:
+        if ctx:
+            await dialogue.transition(ctx.session_id, DialogState.LISTENING)
+        await send_state(DialogState.LISTENING)
+
+    async def _stream_audio(audio_bytes: bytes, mime: str | None, stream_id: int) -> None:
+        chunk_size = 4096
+        total_len = len(audio_bytes)
+        for i in range(0, total_len, chunk_size):
+            chunk = audio_bytes[i:i + chunk_size]
+            await send({
+                "type":      "audio_chunk",
+                "stream_id": stream_id,
+                "data":      base64.b64encode(chunk).decode(),
+                "mime":      mime,
+                "final":     (i + chunk_size) >= total_len,
+            })
+            # Laisse la boucle événementielle respirer entre chunks
+            await asyncio.sleep(0)
+
+    async def cancel_audio_stream(notify_client: bool = False) -> None:
+        nonlocal audio_stream_task
+        if audio_stream_task and not audio_stream_task.done():
+            audio_stream_task.cancel()
+            try:
+                await audio_stream_task
+            except asyncio.CancelledError:
+                pass
+        audio_stream_task = None
+        if notify_client:
+            await send({"type": "audio_interrupted", "stream_id": current_stream_id})
+
+    async def start_audio_stream(
+        audio_bytes: bytes | None,
+        mime: str | None,
+        auto_listening: bool = True,
+    ) -> None:
+        nonlocal audio_stream_task, current_stream_id
+        await cancel_audio_stream(notify_client=False)
+
+        if not audio_bytes:
+            if auto_listening:
+                await set_listening_state()
+            return
+
+        current_stream_id += 1
+        stream_id = current_stream_id
+
+        async def runner() -> None:
+            nonlocal audio_stream_task
+            try:
+                await _stream_audio(audio_bytes, mime, stream_id)
+                if auto_listening:
+                    await set_listening_state()
+            except asyncio.CancelledError:
+                pass
+            except Exception as stream_exc:
+                log.error(f"[{session_id[:8]}] audio stream error: {stream_exc}")
+            finally:
+                if asyncio.current_task() is audio_stream_task:
+                    audio_stream_task = None
+
+        audio_stream_task = asyncio.create_task(runner())
 
     try:
         while True:
@@ -355,6 +423,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 if not audio_buffer:
                     await send({"type": "error", "message": "Aucun audio reçu"})
                     continue
+                await cancel_audio_stream(notify_client=False)
 
                 # Assembler et convertir l'audio
                 full_audio = b"".join(audio_buffer)
@@ -393,33 +462,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 await send({"type": "answer_text", "text": result["answer"],
                             "subject": result["subject"], "rag_chunks": result["rag_chunks"]})
 
-                # Envoyer l'audio TTS en chunks
-                if result["audio_bytes"]:
-                    chunk_size = 4096
-                    audio_data = result["audio_bytes"]
-                    for i in range(0, len(audio_data), chunk_size):
-                        chunk = audio_data[i:i + chunk_size]
-                        await send({
-                            "type":  "audio_chunk",
-                            "data":  base64.b64encode(chunk).decode(),
-                            "mime":  result["mime"],
-                            "final": (i + chunk_size) >= len(audio_data),
-                        })
+                # Stream audio asynchrone (interruption possible immédiatement)
+                await start_audio_stream(
+                    audio_bytes=result["audio_bytes"],
+                    mime=result["mime"],
+                    auto_listening=True,
+                )
 
                 # Envoyer les métriques
                 await send({"type": "performance", **result["performance"]})
-
-                # Retour en LISTENING
-                if ctx:
-                    await dialogue.transition(ctx.session_id, DialogState.LISTENING)
-                await send_state(DialogState.LISTENING)
 
             # ── interrupt — l'étudiant coupe l'IA ─────────────────────
             elif msg_type == "interrupt":
                 if ctx:
                     await dialogue.handle_interruption(ctx.session_id)
                 audio_buffer.clear()
-                await send_state(DialogState.LISTENING)
+                await cancel_audio_stream(notify_client=True)
+                await set_listening_state()
                 log.info(f"[{session_id[:8]}] ⚡ Interruption")
 
             # ── present_section — présenter une section de cours ─────
@@ -435,6 +494,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
                 if not content_txt:
                     continue
+                await cancel_audio_stream(notify_client=False)
 
                 if ctx:
                     await dialogue.transition(ctx.session_id, DialogState.PRESENTING)
@@ -483,21 +543,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
                 await send({"type": "answer_text", "text": ai_resp, "subject": "course"})
 
-                # Envoyer audio en chunks
-                if audio_bytes:
-                    chunk_size = 4096
-                    for i in range(0, len(audio_bytes), chunk_size):
-                        chunk = audio_bytes[i:i + chunk_size]
-                        await send({
-                            "type":  "audio_chunk",
-                            "data":  base64.b64encode(chunk).decode(),
-                            "mime":  mime,
-                            "final": (i + chunk_size) >= len(audio_bytes),
-                        })
-
-                if ctx:
-                    await dialogue.transition(ctx.session_id, DialogState.LISTENING)
-                await send_state(DialogState.LISTENING)
+                await start_audio_stream(
+                    audio_bytes=audio_bytes,
+                    mime=mime,
+                    auto_listening=True,
+                )
 
                 # Analytics
                 try:
@@ -514,6 +564,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 content = msg.get("content", "").strip()
                 if not content:
                     continue
+                await cancel_audio_stream(notify_client=False)
 
                 # Détecter commande vocale de navigation
                 nav = voice_nav.detect(content, session_lang)
@@ -636,6 +687,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             await send({"type": "error", "message": str(exc)})
         except Exception:
             pass
+    finally:
+        await cancel_audio_stream(notify_client=False)
 
 
 # ══════════════════════════════════════════════════════════════════════
