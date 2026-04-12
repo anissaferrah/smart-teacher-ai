@@ -3,12 +3,12 @@
 ║        SMART TEACHER — Module Présentateur de Cours v2             ║
 ║                                                                      ║
 ║  AMÉLIORATIONS v2 :                                                  ║
-║    ✅ Quiz spécialisés Data Mining (par chapitre ch1..ch7)           ║
-║    ✅ Phrases de transition spécifiques au domaine informatique      ║
-║    ✅ Découpage en phrases amélioré (préserve les abréviations DM)   ║
-║    ✅ Concepts DM : présentation avec algorithme + complexité        ║
+║    ✅ Quiz génériques par chapitre                                    ║
+║    ✅ Phrases de transition adaptées à tous les cours                ║
+║    ✅ Découpage en phrases amélioré                                   ║
+║    ✅ Concepts présentés avec vocabulaire oral                        ║
 ║    ✅ ScriptGenerator enrichi : formules orales (pas LaTeX)         ║
-║    ✅ CourseLoader.from_dm_dict() pour les chapitres ch1..ch7        ║
+║    ✅ CourseLoader.from_chapters() pour les chapitres numérotés      ║
 ║    ✅ Timeout de sécurité par section (évite les boucles infinies)   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
@@ -50,7 +50,7 @@ class Section:
 class Chapter:
     title:      str
     sections:   list[Section] = field(default_factory=list)
-    chapter_idx: int = 0    # 1-7 pour DM
+    chapter_idx: int = 0    # Index du chapitre
 
 
 @dataclass
@@ -63,20 +63,20 @@ class Course:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  GÉNÉRATEUR DE SCRIPTS — SPÉCIALISÉ DATA MINING
+#  GÉNÉRATEUR DE SCRIPTS — GÉNÉRIQUE
 # ══════════════════════════════════════════════════════════════════════
 
 class ScriptGenerator:
     """
     Génère les scripts de présentation adaptés à la langue et au niveau.
-    Spécialisé pour le domaine Data Mining / Informatique (M2).
+    Adapté à n'importe quel domaine de cours.
     """
 
     # ── Introductions / transitions ───────────────────────────────────
     INTROS = {
         "en": {
             "course":   "Welcome! Today we are studying {title}. "
-                        "This is a Master's level course on Data Mining. "
+                        "This is a Master's level course. "
                         "Feel free to interrupt me anytime with a question.",
             "chapter":  "Now let's move to Chapter {order}: {title}.",
             "section":  "In this part, we will cover: {title}. {content}",
@@ -93,7 +93,7 @@ class ScriptGenerator:
         },
         "fr": {
             "course":   "Bonjour ! Aujourd'hui nous étudions {title}. "
-                        "Il s'agit d'un cours de Data Mining niveau Master. "
+                        "Il s'agit d'un cours de niveau Master. "
                         "N'hésitez pas à m'interrompre si vous avez des questions.",
             "chapter":  "Passons au chapitre {order} : {title}.",
             "section":  "Dans cette partie, nous allons voir : {title}. {content}",
@@ -119,90 +119,90 @@ class ScriptGenerator:
         },
     }
 
-    # ── Quiz spécialisés DM par chapitre ─────────────────────────────
-    # Organisés par chapter_idx (1-7) pour le cours DM
-    DM_QUIZ_BY_CHAPTER = {
+    # ── Quiz génériques par chapitre ─────────────────────────────────
+    # Organisés par chapter_idx pour les cours structurés
+    QUIZ_BY_CHAPTER = {
         "en": {
-            1: [  # Introduction
-                "Can you explain the difference between Data Mining and Machine Learning?",
-                "What are the three pillars of modern AI mentioned in this chapter?",
-                "What does KDD stand for, and what is its purpose?",
+            1: [
+                "Can you explain the main idea of this chapter in your own words?",
+                "What are the three most important concepts in this chapter?",
+                "Can you give a simple example related to this chapter?",
             ],
-            2: [  # Data, Dataset, Data Warehouse
-                "What is the difference between a database and a data warehouse?",
-                "Can you name three types of data attributes we studied?",
-                "What is the difference between OLAP and OLTP?",
+            2: [
+                "What is the difference between the main concepts introduced here?",
+                "Can you name three ideas we studied in this chapter?",
+                "How would you apply one concept from this chapter in practice?",
             ],
-            3: [  # EDA
-                "What is the difference between univariate and bivariate analysis?",
-                "Can you name two visualization techniques used in EDA?",
-                "Why is exploratory analysis important before applying ML algorithms?",
+            3: [
+                "What is the difference between the approaches discussed in this chapter?",
+                "Can you name two methods or tools mentioned here?",
+                "Why is this chapter important before moving to the next topic?",
             ],
-            4: [  # Data Cleaning
-                "What are the main strategies to handle missing values?",
-                "How do you detect and handle outliers in a dataset?",
-                "What is the difference between normalization and standardization?",
+            4: [
+                "What are the main strategies discussed in this chapter?",
+                "How do you explain the key process covered here?",
+                "What is the difference between the two ideas introduced in this section?",
             ],
-            5: [  # Feature Engineering
-                "What is the difference between feature selection and feature extraction?",
-                "Can you explain what PCA does and why we use it?",
-                "Why is feature engineering important for model performance?",
+            5: [
+                "What is the difference between the methods presented here?",
+                "Can you explain why the concept in this chapter matters?",
+                "Why is this topic important for the overall course?",
             ],
-            6: [  # Supervised ML
-                "What is the difference between classification and regression?",
-                "How does cross-validation help evaluate a model?",
-                "What does the AUC-ROC curve tell us about a classifier?",
+            6: [
+                "What is the difference between the two techniques presented here?",
+                "How does the method explained in this chapter help evaluation?",
+                "What does the main result from this chapter tell us?",
             ],
-            7: [  # Unsupervised ML
-                "What is the main difference between k-means and hierarchical clustering?",
-                "How do you choose the value of k in k-means?",
-                "What is the Apriori algorithm used for?",
+            7: [
+                "What is the main difference between the methods discussed here?",
+                "How would you choose between the approaches introduced in this chapter?",
+                "What is one practical use of the idea explained here?",
             ],
-            0: [  # Generic DM
+            0: [
                 "Can you explain {term} in your own words?",
-                "What is the purpose of {term} in Data Mining?",
+                "What is the purpose of {term} in this course?",
                 "Can you give a real-world application of {term}?",
             ],
         },
         "fr": {
             1: [
-                "Quelle est la différence entre le Data Mining et le Machine Learning ?",
-                "Quels sont les trois piliers de l'IA moderne vus dans ce chapitre ?",
-                "Que signifie KDD et quel est son objectif ?",
+                "Pouvez-vous expliquer l'idée principale de ce chapitre ?",
+                "Quels sont les trois concepts les plus importants vus ici ?",
+                "Pouvez-vous donner un exemple simple lié à ce chapitre ?",
             ],
             2: [
-                "Quelle est la différence entre une base de données et un entrepôt de données ?",
-                "Pouvez-vous nommer trois types d'attributs de données ?",
-                "Quelle est la différence entre OLAP et OLTP ?",
+                "Quelle est la différence entre les concepts principaux présentés ici ?",
+                "Pouvez-vous nommer trois idées étudiées dans ce chapitre ?",
+                "Comment appliqueriez-vous un concept de ce chapitre en pratique ?",
             ],
             3: [
-                "Quelle est la différence entre l'analyse univariée et bivariée ?",
-                "Citez deux techniques de visualisation utilisées en EDA.",
-                "Pourquoi l'analyse exploratoire est-elle essentielle avant le ML ?",
+                "Quelle est la différence entre les approches discutées dans ce chapitre ?",
+                "Citez deux méthodes ou outils mentionnés ici.",
+                "Pourquoi ce chapitre est-il important avant de passer à la suite ?",
             ],
             4: [
-                "Quelles sont les stratégies principales pour gérer les valeurs manquantes ?",
-                "Comment détecte-t-on et gère-t-on les outliers dans un dataset ?",
-                "Quelle est la différence entre normalisation et standardisation ?",
+                "Quelles sont les stratégies principales présentées dans ce chapitre ?",
+                "Comment expliquez-vous le processus clé vu ici ?",
+                "Quelle est la différence entre les deux idées introduites dans cette section ?",
             ],
             5: [
-                "Quelle est la différence entre sélection et extraction de features ?",
-                "Expliquez ce que fait la PCA et pourquoi on l'utilise.",
-                "Pourquoi le feature engineering améliore les performances des modèles ?",
+                "Quelle est la différence entre les méthodes présentées ici ?",
+                "Expliquez pourquoi le concept de ce chapitre est important.",
+                "Pourquoi ce sujet est-il important pour le cours dans son ensemble ?",
             ],
             6: [
-                "Quelle est la différence entre classification et régression ?",
-                "Comment la validation croisée aide-t-elle à évaluer un modèle ?",
-                "Qu'est-ce que la courbe ROC-AUC nous indique sur un classifieur ?",
+                "Quelle est la différence entre les deux techniques présentées ici ?",
+                "Comment la méthode expliquée dans ce chapitre aide-t-elle à évaluer ?",
+                "Que nous indique le résultat principal de ce chapitre ?",
             ],
             7: [
-                "Quelle est la principale différence entre k-means et le clustering hiérarchique ?",
-                "Comment choisit-on la valeur de k dans k-means ?",
-                "À quoi sert l'algorithme Apriori ?",
+                "Quelle est la principale différence entre les méthodes discutées ici ?",
+                "Comment choisiriez-vous entre les approches introduites dans ce chapitre ?",
+                "Quel est un usage concret de l'idée expliquée ici ?",
             ],
             0: [
                 "Pouvez-vous expliquer {term} avec vos propres mots ?",
-                "Quel est le rôle de {term} en Data Mining ?",
+                "Quel est le rôle de {term} dans ce cours ?",
             ],
         },
     }
@@ -216,24 +216,23 @@ class ScriptGenerator:
         except KeyError:
             return template
 
-    def get_dm_quiz(self, lang: str, chapter_idx: int = 0) -> str:
-        """Retourne une question quiz adaptée au chapitre DM en cours."""
+    def get_quiz_for_chapter(self, lang: str, chapter_idx: int = 0) -> str:
+        """Retourne une question quiz adaptée au chapitre en cours."""
         lang = lang[:2].lower()
-        by_ch = self.DM_QUIZ_BY_CHAPTER.get(lang, self.DM_QUIZ_BY_CHAPTER["en"])
+        by_ch = self.QUIZ_BY_CHAPTER.get(lang, self.QUIZ_BY_CHAPTER["en"])
         questions = by_ch.get(chapter_idx, by_ch.get(0, ["Can you summarize what we just covered?"]))
         # Rotation selon le temps pour ne pas toujours poser la même question
         idx = int(time.time()) % len(questions)
         return questions[idx]
 
     def get_quiz(self, lang: str, subject: str, term: str, chapter_idx: int = 0) -> str:
-        """Compatibilité API — préfère get_dm_quiz() pour DM."""
-        if subject == "data_mining":
-            q = self.get_dm_quiz(lang, chapter_idx)
+        """Retourne une question générique adaptée au chapitre ou au terme."""
+        if chapter_idx:
+            q = self.get_quiz_for_chapter(lang, chapter_idx)
             if "{term}" in q:
                 return q.format(term=term)
             return q
 
-        # Fallback générique
         generic = {
             "en": f"Can you explain {term} in your own words?",
             "fr": f"Pouvez-vous expliquer {term} avec vos propres mots ?",
@@ -249,7 +248,7 @@ class ScriptGenerator:
 class CoursePresenter:
     """
     Présente un cours section par section avec gestion des interruptions.
-    Optimisé pour le domaine Data Mining.
+    Optimisé pour les cours structurés en chapitres et sections.
     """
 
     def __init__(
@@ -479,12 +478,12 @@ class CoursePresenter:
             yield result
 
     async def present_quiz(self) -> AsyncGenerator:
-        """Pose un quiz DM adapté au chapitre courant."""
+        """Pose un quiz adapté au chapitre courant."""
         chapter = self.course.chapters[self.chapter_idx]
         ch_idx  = getattr(chapter, "chapter_idx", 0)
         section = chapter.sections[self.section_idx]
 
-        question = self.script.get_dm_quiz(self.language, chapter_idx=ch_idx)
+        question = self.script.get_quiz_for_chapter(self.language, chapter_idx=ch_idx)
 
         # Fallback sur concept si disponible
         if not question and section.concepts:
@@ -502,7 +501,7 @@ class CoursePresenter:
     def _split_sentences(self, text: str) -> list[str]:
         """
         Découpe le texte en phrases.
-        Préserve les abréviations courantes en DM/CS :
+        Préserve les abréviations courantes :
         e.g., i.e., Fig., vs., etc., PCA., SVM., k-NN.
         """
         import re
@@ -560,7 +559,7 @@ class CoursePresenter:
             "percent":        pct,
             "chapter":        chapter.title,
             "chapter_idx":    self.chapter_idx + 1,
-            "chapter_dm_idx": getattr(chapter, "chapter_idx", self.chapter_idx + 1),
+            "chapter_order": getattr(chapter, "chapter_idx", self.chapter_idx + 1),
             "chapter_total":  len(self.course.chapters),
             "section":        section.title,
             "section_idx":    self.section_idx + 1,
@@ -576,7 +575,7 @@ class CoursePresenter:
 class CourseLoader:
     """
     Charge un cours depuis différentes sources.
-    Méthode spéciale pour les chapitres DM ch1..ch7.
+    Méthodes génériques pour les chapitres numérotés.
     """
 
     @staticmethod
@@ -609,24 +608,23 @@ class CourseLoader:
 
         return Course(
             title=data["title"],
-            subject=data.get("subject", "data_mining"),
+            subject=data.get("subject", "general"),
             language=data.get("language", "en"),
             level=data.get("level", "université"),
             chapters=chapters,
         )
 
     @staticmethod
-    def from_dm_chapters(chapters_dict: dict[int, dict]) -> Course:
+    def from_chapters(chapters_dict: dict[int, dict]) -> Course:
         """
-        Crée un cours complet depuis le dict retourné par CourseBuilder.build_dm_course().
-        chapters_dict = {1: {cours ch1}, 2: {cours ch2}, ..., 7: {cours ch7}}
+        Crée un cours complet depuis un dict de chapitres numérotés.
+        chapters_dict = {1: {...}, 2: {...}, ...}
         """
-        from multimodal_rag import DM_CHAPTER_MAP
         all_chapters = []
 
         for ch_idx in sorted(chapters_dict.keys()):
             ch_data = chapters_dict[ch_idx]
-            ch_title = DM_CHAPTER_MAP.get(f"ch{ch_idx}", ("Unknown", ch_idx))[0]
+            ch_title = ch_data.get("chapter_title") or ch_data.get("title") or f"Chapter {ch_idx}"
 
             sections = []
             for inner_ch in ch_data.get("chapters", []):
@@ -655,8 +653,8 @@ class CourseLoader:
                 ))
 
         return Course(
-            title="Data Mining — M2 SII",
-            subject="data_mining",
+            title="Generic Course",
+            subject="general",
             language="en",
             level="université",
             chapters=all_chapters,
@@ -664,7 +662,7 @@ class CourseLoader:
 
     @staticmethod
     def from_text(title: str, text: str, language: str = "en",
-                  subject: str = "data_mining", level: str = "université") -> Course:
+                  subject: str = "general", level: str = "université") -> Course:
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         sections   = []
         for i, para in enumerate(paragraphs):
@@ -713,7 +711,7 @@ class CourseLoader:
 
             return Course(
                 title=db_course.title,
-                subject=db_course.subject or "data_mining",
+                subject=db_course.subject or "general",
                 language=db_course.language or "en",
                 level=db_course.level or "université",
                 chapters=chapters,
@@ -723,58 +721,49 @@ class CourseLoader:
             return None
 
     @staticmethod
-    def demo_dm_course(language: str = "en") -> Course:
-        """Cours DM de démonstration (ch1: Introduction, ch2: Data)."""
+    def demo_course(language: str = "en") -> Course:
+        """Cours de démonstration générique."""
         return CourseLoader.from_dict({
-            "title":    "Data Mining — M2 SII",
-            "subject":  "data_mining",
+            "title":    "Generic Demonstration Course",
+            "subject":  "general",
             "language": language,
             "level":    "université",
             "chapters": [
                 {
-                    "title": "Introduction to Data Mining",
+                    "title": "Introduction",
                     "order": 1,
                     "chapter_idx": 1,
                     "sections": [
                         {
-                            "title":   "What is Data Mining?",
+                            "title":   "What is the topic?",
                             "content": (
-                                "Data mining is the process of discovering patterns and extracting "
-                                "useful knowledge from large datasets using statistics, mathematics, "
-                                "and machine learning algorithms. "
-                                "It goes beyond simply collecting data — it's about making sense of it "
-                                "to drive informed decisions. "
-                                "Data mining acts as a bridge between raw data and actionable knowledge."
+                                "A course topic is a subject that combines ideas, methods, and examples. "
+                                "The goal is to understand the main concepts clearly. "
+                                "We use a simple explanation first, then connect it to practical use."
                             ),
                             "duration_s": 90,
                             "concepts": [
                                 {
-                                    "term": "Knowledge Discovery in Databases (KDD)",
-                                    "definition": "The overall process of extracting useful knowledge "
-                                                  "from data, encompassing preprocessing, mining, and interpretation.",
-                                    "example": "Discovering that customers who buy diapers also tend to buy beer.",
+                                    "term": "Core idea",
+                                    "definition": "The main idea or principle that helps organize the lesson.",
+                                    "example": "A clear definition that the student can remember.",
                                     "type": "definition",
                                 }
                             ],
                         },
                         {
-                            "title":   "AI vs Data Mining",
+                            "title":   "Main ideas in context",
                             "content": (
-                                "Artificial intelligence is the broader field that includes machine learning, "
-                                "deep learning, and agentic systems. "
-                                "Data mining is a subset that focuses specifically on extracting patterns "
-                                "from existing datasets using algorithms like k-means, decision trees, "
-                                "and association rule mining. "
-                                "The three pillars of modern AI are data, algorithms, and hardware — "
-                                "and data mining sits at the intersection of all three."
+                                "A subject can include several related concepts, methods, and examples. "
+                                "The important part is to compare them clearly and explain how they fit together. "
+                                "A good explanation stays simple, concrete, and useful for revision."
                             ),
                             "duration_s": 90,
                             "concepts": [
                                 {
-                                    "term": "Machine Learning",
-                                    "definition": "A subset of AI where systems learn patterns from data "
-                                                  "without being explicitly programmed.",
-                                    "example": "A spam filter that learns to classify emails from examples.",
+                                    "term": "Comparison",
+                                    "definition": "A way to see similarities and differences between ideas.",
+                                    "example": "Comparing two chapters to understand what each one adds.",
                                     "type": "definition",
                                 }
                             ],
@@ -782,27 +771,23 @@ class CourseLoader:
                     ],
                 },
                 {
-                    "title": "Data, Dataset, Data Warehouse",
+                    "title": "Key Concepts",
                     "order": 2,
                     "chapter_idx": 2,
                     "sections": [
                         {
-                            "title":   "Types of Data",
+                            "title":   "Types of ideas",
                             "content": (
-                                "In data mining we distinguish several types of data. "
-                                "Structured data lives in relational databases with rows and columns. "
-                                "Unstructured data includes text, images, and videos. "
-                                "Semi-structured data like JSON or XML sits in between. "
-                                "Understanding the data type is critical before choosing any algorithm."
+                                "In any course we can distinguish several types of information. "
+                                "Some content is structured, some is unstructured, and some is mixed. "
+                                "Understanding the form of the content helps choose the right explanation."
                             ),
                             "duration_s": 90,
                             "concepts": [
                                 {
-                                    "term": "Data Warehouse",
-                                    "definition": "A centralized repository that integrates data from "
-                                                  "multiple sources, optimized for analytical queries.",
-                                    "example": "A company's sales data warehouse that aggregates data "
-                                               "from all regional offices for OLAP analysis.",
+                                    "term": "Structure",
+                                    "definition": "The way information is organized inside a chapter or lesson.",
+                                    "example": "A lesson divided into definition, example, and summary.",
                                     "type": "definition",
                                 }
                             ],

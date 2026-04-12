@@ -3,11 +3,11 @@
 ║        SMART TEACHER — Navigation Vocale v2                        ║
 ║                                                                      ║
 ║  AMÉLIORATIONS v2 :                                                  ║
-║    ✅ Commandes DM spécifiques : "go to chapter 3", "ch3", "explain k-means"
+║    ✅ Commandes de navigation par chapitre                          ║
 ║    ✅ Détection directe de numéro de chapitre (ch1..ch7)            ║
 ║    ✅ Navigation par titre de section (fuzzy matching)               ║
-║    ✅ Commandes anglaises enrichies (domaine CS/DM)                  ║
-║    ✅ Réponses confirmant le chapitre DM ciblé                       ║
+║    ✅ Commandes anglaises enrichies                                   ║
+║    ✅ Réponses confirmant le chapitre ciblé                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -19,8 +19,8 @@ from typing import Optional
 
 log = logging.getLogger("SmartTeacher.VoiceNav")
 
-# Chapitres DM
-DM_CHAPTERS = {
+# Chapitres génériques
+CHAPTERS = {
     1: "Introduction",
     2: "Data, Dataset, Data Warehouse",
     3: "Exploratory Data Analysis",
@@ -62,7 +62,7 @@ class NavResult:
 class VoiceNavigator:
     """
     Analyse le texte transcrit et détecte les commandes de navigation.
-    Optimisé pour le cours Data Mining M2.
+    Optimisé pour la navigation dans des cours chapitrés.
     """
 
     PATTERNS = {
@@ -216,8 +216,8 @@ class VoiceNavigator:
         },
     }
 
-    # Mapping de nom de section DM → chapter_idx
-    DM_SECTION_NAMES = {
+    # Mapping de nom de section → chapter_idx
+    SECTION_NAMES = {
         "introduction": 1,
         "data warehouse": 2, "dataset": 2, "data,": 2,
         "exploratory": 3, "eda": 3,
@@ -248,8 +248,8 @@ class VoiceNavigator:
                     raw_text=text,
                 )
 
-        # Noms textuels DM
-        for name, ch_idx in self.DM_SECTION_NAMES.items():
+        # Noms textuels génériques
+        for name, ch_idx in self.SECTION_NAMES.items():
             if name in text_lower:
                 # Vérifier que c'est bien une commande de navigation
                 nav_indicators = [
@@ -294,9 +294,9 @@ class VoiceNavigator:
         return NavResult(command=NavCommand.NONE, raw_text=text)
 
     def _name_to_chapter(self, name: str) -> int | None:
-        """Convertit un nom de chapitre DM en index."""
+        """Convertit un nom de chapitre en index."""
         name_lower = name.lower()
-        for kw, idx in self.DM_SECTION_NAMES.items():
+        for kw, idx in self.SECTION_NAMES.items():
             if kw in name_lower:
                 return idx
         return None
@@ -306,9 +306,9 @@ class VoiceNavigator:
         """Retourne une réponse verbale confirmant la commande."""
         lang = language[:2].lower()
 
-        # Réponse spéciale GOTO_CHAPTER avec nom DM
+        # Réponse spéciale GOTO_CHAPTER avec nom de chapitre
         if command == NavCommand.GOTO_CHAPTER and chapter_idx:
-            ch_title = DM_CHAPTERS.get(chapter_idx, f"Chapter {chapter_idx}")
+            ch_title = CHAPTERS.get(chapter_idx, f"Chapter {chapter_idx}")
             responses = {
                 "en": f"Sure, jumping to Chapter {chapter_idx}: {ch_title}.",
                 "fr": f"D'accord, je passe au Chapitre {chapter_idx} : {ch_title}.",

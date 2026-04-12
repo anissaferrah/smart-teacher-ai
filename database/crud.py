@@ -1,59 +1,188 @@
 # database/crud.py
 """
-Smart Teacher — Opérations CRUD pour PostgreSQL
+Smart Teacher — CRUD Operations for PostgreSQL.
+
+Provides async database operations for managing:
+    - Courses with hierarchical structure (chapters → sections → concepts)
+    - Learning sessions and student progress
+    - Interaction logs for analytics and KPI tracking
+
+All operations are async-compatible with SQLAlchemy AsyncSession.
 """
 
-import uuid
 import logging
+import uuid
+from datetime import datetime
 from typing import Optional, List
-from sqlalchemy import select, update, func
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.models import Course, Chapter, Section, Concept, LearningSession, Interaction
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from database.models import Course, Chapter, Section, Concept, LearningSession, Interaction, Student
 
 log = logging.getLogger("SmartTeacher.CRUD")
 
 
-# ══════════════════════════════════════════════════════════════════════
-# COURS
-# ══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+# AUTHENTICATION OPERATIONS
+# ════════════════════════════════════════════════════════════════════════
 
-async def create_course(db: AsyncSession, course_data: dict) -> Course:
-    """Crée un nouveau cours."""
+
+async def create_student(
+    db: AsyncSession,
+    email: str,
+    password_hash: str,
+    first_name: str = "Utilisateur",
+    last_name: str = "",
+    preferred_language: str = "fr"
+) -> Student:
+    """
+    Create a new student account.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    email : str
+        Student email (must be unique)
+    password_hash : str
+        Hashed password
+    first_name : str
+        Student's first name
+    last_name : str
+        Student's last name
+    preferred_language : str
+        Preferred language code (default: "fr")
+    
+    Returns
+    -------
+    Student
+        Created student object
+    """
+    student = Student(
+        email=email,
+        password_hash=password_hash,
+        first_name=first_name,
+        last_name=last_name,
+        preferred_language=preferred_language
+    )
+    db.add(student)
+    await db.flush()
+    log.debug(f"Created student: {student.id} ({email})")
+    return student
+
+
+# ════════════════════════════════════════════════════════════════════════
+# COURSE OPERATIONS
+# ════════════════════════════════════════════════════════════════════════
+
+
+async def create_course(
+    db: AsyncSession,
+    course_data: dict
+) -> Course:
+    """
+    Create a new course.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    course_data : dict
+        Course metadata with keys: title, subject, language, level, description, file_path
+    
+    Returns
+    -------
+    Course
+        Created course object (with ID populated after flush)
+    
+    Raises
+    ------
+    sqlalchemy.exc.IntegrityError
+        If required fields are missing
+    """
     course = Course(**course_data)
     db.add(course)
     await db.flush()
+    log.debug(f"Created course: {course.id}")
     return course
 
 
-async def create_course_with_structure(db: AsyncSession, course_data: dict) -> uuid.UUID:
+async def create_course_with_structure(
+    db: AsyncSession,
+    course_data: dict
+) -> uuid.UUID:
     """
-    Crée un cours complet avec sa structure hiérarchique.
-    course_data = {
-        "title": "...",
-        "subject": "...",
-        "language": "...",
-        "level": "...",
-        "chapters": [
-            {
-                "title": "...",
-                "order": 1,
-                "sections": [
-                    {
-                        "title": "...",
-                        "order": 1,
-                        "content": "...",
-                        "duration_s": 120,
-                        "concepts": [
-                            {"term": "...", "definition": "...", "example": "..."}
-                        ]
-                    }
-                ]
-            }
-        ]
-    }
+    Create a complete course with hierarchical structure in one transaction.
+    
+    Recursively creates Course → Chapters → Sections → Concepts
+    and ensures referential integrity within a single transaction.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    course_data : dict
+        Nested structure with keys:
+        - title (str): Course title
+        - subject (str, optional): Subject area
+        - language (str, optional): ISO 639-1 code (default: "fr")
+        - level (str, optional): Course level (default: "lycée")
+        - description (str, optional): Course description
+        - file_path (str, optional): Source file path
+        - chapters (list[dict]): Chapter definitions, each with:
+            - title (str): Chapter title
+            - order (int): Order within course
+            - summary (str, optional): Chapter summary
+            - sections (list[dict]): Section definitions, each with:
+                - title (str): Section title
+                - order (int): Order within chapter
+                - content (str, optional): Original course content
+                - duration_s (int, optional): Duration in seconds (default: 120)
+                - image_urls (list[str], optional): Associated slide URLs
+                - concepts (list[dict]): Concept definitions, each with:
+                    - term (str): Concept term
+                    - definition (str, optional): Definition
+                    - example (str, optional): Example or use case
+                    - type (str, optional): Concept type (default: "definition")
+    
+    Returns
+    -------
+    uuid.UUID
+        ID of created course
+    
+    Raises
+    ------
+    ValueError
+        If course_data is malformed
+    sqlalchemy.exc.IntegrityError
+        If database constraints violated
+    
+    Examples
+    --------
+    >>> course_id = await create_course_with_structure(db, {
+    ...     "title": "Statistics 101",
+    ...     "language": "fr",
+    ...     "chapters": [
+    ...         {
+    ...             "title": "Chapter 1: Introduction",
+    ...             "order": 1,
+    ...             "sections": [
+    ...                 {
+    ...                     "title": "What is this course about?",
+    ...                     "order": 1,
+    ...                     "content": "This course is about...",
+    ...                     "concepts": [
+    ...                         {"term": "k-means", "definition": "..."}
+    ...                     ]
+    ...                 }
+    ...             ]
+    ...         }
+    ...     ]
+    ... })
     """
-    # Créer le cours
+    # Create course
     course = Course(
         title=course_data["title"],
         subject=course_data.get("subject", "general"),
@@ -64,8 +193,9 @@ async def create_course_with_structure(db: AsyncSession, course_data: dict) -> u
     )
     db.add(course)
     await db.flush()
+    log.info(f"Created course: {course.id} - {course.title}")
 
-    # Créer les chapitres et sections
+    # Create chapters
     for ch_idx, ch_data in enumerate(course_data.get("chapters", [])):
         chapter = Chapter(
             course_id=course.id,
@@ -76,18 +206,26 @@ async def create_course_with_structure(db: AsyncSession, course_data: dict) -> u
         db.add(chapter)
         await db.flush()
 
+        # Create sections
         for sec_idx, sec_data in enumerate(ch_data.get("sections", [])):
+            image_url = sec_data.get("image_url", "")
+            image_urls = sec_data.get("image_urls", [])
+            if not image_url and image_urls:
+                image_url = image_urls[0]
+
             section = Section(
                 chapter_id=chapter.id,
                 title=sec_data["title"],
                 order=sec_data.get("order", sec_idx + 1),
                 content=sec_data.get("content", ""),
                 duration_s=sec_data.get("duration_s", 120),
+                image_url=image_url,
                 image_urls=sec_data.get("image_urls", []),
             )
             db.add(section)
             await db.flush()
 
+            # Create concepts
             for c_data in sec_data.get("concepts", []):
                 concept = Concept(
                     section_id=section.id,
@@ -99,17 +237,56 @@ async def create_course_with_structure(db: AsyncSession, course_data: dict) -> u
                 db.add(concept)
 
     await db.commit()
+    log.info(f"✅ Course structure committed: {course.id}")
     return course.id
 
 
-async def get_course(db: AsyncSession, course_id: uuid.UUID) -> Optional[Course]:
-    """Récupère un cours par son ID."""
+async def get_course(
+    db: AsyncSession,
+    course_id: uuid.UUID
+) -> Optional[Course]:
+    """
+    Retrieve a course by ID.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    course_id : uuid.UUID
+        Course ID
+    
+    Returns
+    -------
+    Course or None
+        Course object if found, otherwise None
+    """
     result = await db.execute(select(Course).where(Course.id == course_id))
     return result.scalar_one_or_none()
 
 
-async def get_course_with_structure(db: AsyncSession, course_id: uuid.UUID) -> Optional[Course]:
-    """Récupère un cours avec tous ses chapitres, sections et concepts."""
+async def get_course_with_structure(
+    db: AsyncSession,
+    course_id: uuid.UUID
+) -> Optional[Course]:
+    """
+    Retrieve a course with complete hierarchical structure eagerly loaded.
+    
+    Loads Course → Chapters → Sections → Concepts in a single query
+    using selectinload to avoid N+1 queries.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    course_id : uuid.UUID
+        Course ID
+    
+    Returns
+    -------
+    Course or None
+        Course with all chapters, sections, and concepts populated,
+        or None if course not found
+    """
     result = await db.execute(
         select(Course)
         .where(Course.id == course_id)
@@ -122,34 +299,98 @@ async def get_course_with_structure(db: AsyncSession, course_id: uuid.UUID) -> O
     return result.scalar_one_or_none()
 
 
-async def get_all_courses(db: AsyncSession) -> List[Course]:
-    """Récupère tous les cours."""
-    result = await db.execute(select(Course).order_by(Course.created_at.desc()))
-    return result.scalars().all()
+async def get_all_courses(
+    db: AsyncSession
+) -> List[Course]:
+    """
+    Retrieve all courses ordered by creation date (newest first).
+    Eager-loads relationships to avoid lazy-loading errors.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    
+    Returns
+    -------
+    list[Course]
+        All courses in database (may be empty list)
+    """
+    from sqlalchemy.orm import selectinload
+    
+    from database.models import Chapter
+    
+    result = await db.execute(
+        select(Course)
+        .options(selectinload(Course.chapters).selectinload(Chapter.sections))
+        .order_by(Course.created_at.desc())
+    )
+    courses = result.unique().scalars().all()
+    log.debug(f"Retrieved {len(courses)} courses")
+    return courses
 
 
-async def delete_course(db: AsyncSession, course_id: uuid.UUID) -> bool:
-    """Supprime un cours."""
+async def delete_course(
+    db: AsyncSession,
+    course_id: uuid.UUID
+) -> bool:
+    """
+    Delete a course and all associated data (cascade).
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    course_id : uuid.UUID
+        Course ID
+    
+    Returns
+    -------
+    bool
+        True if course was deleted, False if course not found
+    """
     course = await get_course(db, course_id)
     if course:
         await db.delete(course)
         await db.commit()
+        log.info(f"Deleted course: {course_id}")
         return True
     return False
 
 
-# ══════════════════════════════════════════════════════════════════════
-# SESSIONS D'APPRENTISSAGE
-# ══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+# LEARNING SESSION OPERATIONS
+# ════════════════════════════════════════════════════════════════════════
 
-async def create_learning_session(
+
+async def create_learning_session( 
     db: AsyncSession,
     student_id: str,
     course_id: Optional[uuid.UUID] = None,
     language: str = "fr",
     level: str = "lycée"
 ) -> LearningSession:
-    """Crée une nouvelle session d'apprentissage."""
+    """
+    Create a new learning session for a student.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    student_id : str
+        Anonymous student identifier (hash or UUID format)
+    course_id : uuid.UUID, optional
+        Course the student is working on
+    language : str, optional
+        ISO 639-1 language code (default: "fr")
+    level : str, optional
+        Student level (default: "lycée")
+    
+    Returns
+    -------
+    LearningSession
+        Created session with ID populated after flush
+    """
     session = LearningSession(
         student_id=student_id,
         course_id=course_id,
@@ -158,46 +399,229 @@ async def create_learning_session(
     )
     db.add(session)
     await db.flush()
+    log.info(f"Created learning session: {session.id} for student {student_id}")
     return session
+
+
+async def get_session(
+    db: AsyncSession,
+    session_id: uuid.UUID
+) -> Optional[LearningSession]:
+    """
+    Retrieve a learning session by ID.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    session_id : uuid.UUID
+        Session ID
+    
+    Returns
+    -------
+    LearningSession or None
+        Session object if found, otherwise None
+    """
+    result = await db.execute(select(LearningSession).where(LearningSession.id == session_id))
+    return result.scalar_one_or_none()
 
 
 async def update_session_state(
     db: AsyncSession,
     session_id: uuid.UUID,
     state: str,
-    chapter_index: int = None,
-    section_index: int = None,
-    char_position: int = None
+    chapter_index: Optional[int] = None,
+    section_index: Optional[int] = None,
+    char_position: Optional[int] = None
 ) -> Optional[LearningSession]:
-    """Met à jour l'état d'une session."""
-    stmt = update(LearningSession).where(LearningSession.id == session_id)
-    updates = {"state": state}
+    """
+    Update a session's state and optionally its position within course.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    session_id : uuid.UUID
+        Session ID
+    state : str
+        New state: "IDLE", "PRESENTING", "LISTENING", "PROCESSING", "RESPONDING"
+    chapter_index : int, optional
+        Zero-indexed chapter being studied
+    section_index : int, optional
+        Zero-indexed section within chapter
+    char_position : int, optional
+        Character position in section content (for resume)
+    
+    Returns
+    -------
+    LearningSession or None
+        Updated session, or None if not found
+    """
+    updates = {"state": state, "updated_at": datetime.utcnow()}
     if chapter_index is not None:
         updates["chapter_index"] = chapter_index
     if section_index is not None:
         updates["section_index"] = section_index
     if char_position is not None:
         updates["char_position"] = char_position
-    await db.execute(stmt.values(**updates))
+    
+    stmt = update(LearningSession).where(LearningSession.id == session_id).values(**updates)
+    await db.execute(stmt)
     await db.commit()
+    
+    log.debug(f"Updated session {session_id} state={state}")
     return await get_session(db, session_id)
 
 
-async def get_session(db: AsyncSession, session_id: uuid.UUID) -> Optional[LearningSession]:
-    """Récupère une session par son ID."""
-    result = await db.execute(select(LearningSession).where(LearningSession.id == session_id))
-    return result.scalar_one_or_none()
-
-
-async def end_session(db: AsyncSession, session_id: uuid.UUID) -> None:
-    """Termine une session."""
-    from datetime import datetime
+async def end_session(
+    db: AsyncSession,
+    session_id: uuid.UUID
+) -> None:
+    """
+    End a learning session (set end_at timestamp and state to IDLE).
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    session_id : uuid.UUID
+        Session ID
+    """
     await db.execute(
         update(LearningSession)
         .where(LearningSession.id == session_id)
-        .values(ended_at=datetime.utcnow(), state="IDLE")
+        .values(ended_at=datetime.utcnow(), state="IDLE", updated_at=datetime.utcnow())
     )
     await db.commit()
+    log.info(f"Ended session: {session_id}")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# INTERACTION LOGGING
+# ════════════════════════════════════════════════════════════════════════
+
+
+async def log_interaction(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    student_id: str,
+    course_id: Optional[uuid.UUID],
+    interaction_type: str = "qa",
+    question: Optional[str] = None,
+    answer: Optional[str] = None,
+    language: str = "fr",
+    stt_time: float = 0.0,
+    llm_time: float = 0.0,
+    tts_time: float = 0.0,
+    total_time: float = 0.0,
+    kpi_ok: int = 0
+) -> Interaction:
+    """
+    Log a student-teacher interaction for analytics.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    session_id : uuid.UUID
+        Parent learning session ID
+    student_id : str
+        Anonymous student identifier
+    course_id : uuid.UUID, optional
+        Course involved in interaction
+    interaction_type : str, optional
+        Type: "qa" (question/answer), "interrupt", "navigation" (default: "qa")
+    question : str, optional
+        Student's question (from STT output)
+    answer : str, optional
+        Teacher's response (from LLM output)
+    language : str, optional
+        ISO 639-1 language code (default: "fr")
+    stt_time : float, optional
+        Speech-to-text processing time in seconds
+    llm_time : float, optional
+        Language model inference time in seconds
+    tts_time : float, optional
+        Text-to-speech generation time in seconds
+    total_time : float, optional
+        Total wall-clock time in seconds
+    kpi_ok : int, optional
+        1 if response met KPI (≤5s), 0 otherwise
+    
+    Returns
+    -------
+    Interaction
+        Created interaction log record
+    """
+    interaction = Interaction(
+        session_id=session_id,
+        student_id=student_id,
+        course_id=course_id,
+        type=interaction_type,
+        question=question,
+        answer=answer,
+        language=language,
+        stt_time=stt_time,
+        llm_time=llm_time,
+        tts_time=tts_time,
+        total_time=total_time,
+        kpi_ok=kpi_ok,
+    )
+    db.add(interaction)
+    await db.flush()
+    log.debug(
+        f"Logged interaction: {interaction_type} (total={total_time:.2f}s, kpi={kpi_ok})"
+    )
+    return interaction
+
+
+async def get_session_stats(
+    db: AsyncSession,
+    session_id: uuid.UUID
+) -> dict:
+    """
+    Retrieve aggregated statistics for a learning session.
+    
+    Parameters
+    ----------
+    db : AsyncSession
+        Database session
+    session_id : uuid.UUID
+        Session ID
+    
+    Returns
+    -------
+    dict
+        Statistics with keys:
+        - total_interactions: Number of interactions
+        - avg_response_time: Average total_time across interactions
+        - kpi_met_count: Number of interactions where KPI was met
+        - kpi_percentage: Percentage of interactions meeting KPI
+    """
+    result = await db.execute(
+        select(Interaction).where(Interaction.session_id == session_id)
+    )
+    interactions = result.scalars().all()
+    
+    if not interactions:
+        return {
+            "total_interactions": 0,
+            "avg_response_time": 0.0,
+            "kpi_met_count": 0,
+            "kpi_percentage": 0.0,
+        }
+    
+    total = len(interactions)
+    avg_time = sum(i.total_time for i in interactions) / total
+    kpi_count = sum(1 for i in interactions if i.kpi_ok == 1)
+    kpi_pct = (kpi_count / total * 100) if total > 0 else 0.0
+    
+    return {
+        "total_interactions": total,
+        "avg_response_time": avg_time,
+        "kpi_met_count": kpi_count,
+        "kpi_percentage": kpi_pct,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════

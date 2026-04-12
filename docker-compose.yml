@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Smart Teacher — Docker Compose Complet
 # Démarrage minimal : docker-compose up -d
 # Démarrage complet : docker-compose --profile full up -d
@@ -22,6 +20,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - smart_teacher
 
   redis:
     image: redis:7-alpine
@@ -36,6 +36,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - smart_teacher
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -51,6 +53,8 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    networks:
+      - smart_teacher
 
   # MinIO - Stockage medias (activer avec --profile full)
   minio:
@@ -73,6 +77,8 @@ services:
       start_period: 20s
     profiles:
       - full
+    networks:
+      - smart_teacher
 
   # Elasticsearch - Recherche historique (activer avec --profile full)
   elasticsearch:
@@ -94,6 +100,8 @@ services:
       start_period: 60s
     profiles:
       - full
+    networks:
+      - smart_teacher
 
   # ClickHouse - Analytics (activer avec --profile full)
   clickhouse:
@@ -101,7 +109,6 @@ services:
     container_name: smart_teacher_clickhouse
     ports:
       - "8123:8123"
-      - "9900:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
     environment:
@@ -116,6 +123,28 @@ services:
       start_period: 30s
     profiles:
       - full
+    networks:
+      - smart_teacher
+
+  # Ollama - Local LLM (Mistral) - PROFESSIONNEL ⭐
+  ollama:
+    image: ollama/ollama:latest
+    container_name: smart_teacher_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - smart_teacher
+    restart: unless-stopped
 
 volumes:
   postgres_data:
@@ -124,3 +153,8 @@ volumes:
   minio_data:
   es_data:
   clickhouse_data:
+  ollama_models:
+
+networks:
+  smart_teacher:
+    driver: bridge

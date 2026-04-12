@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -227,7 +228,7 @@ class SlideSynchronizer:
           3. Premières phrases du texte
         Le texte original n'est JAMAIS modifié.
         """
-        if not text:
+        if not text or not text.strip():
             return []
 
         # 1. Listes existantes
@@ -288,15 +289,17 @@ class SlideSynchronizer:
             import pypdf
             slides = []
             with open(pdf_path, "rb") as f:
-                reader = pypdf.PdfReader(f)
-                for i, page in enumerate(reader.pages):
-                    text = page.extract_text() or ""
-                    if text.strip():
-                        slides.append({
-                            "page":    i + 1,
-                            "content": text.strip(),    # contenu complet, non tronqué
-                            "total":   len(reader.pages),
-                        })
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", module=r"pypdf\.generic\._base")
+                    reader = pypdf.PdfReader(f, strict=False)
+                    for i, page in enumerate(reader.pages):
+                        text = page.extract_text() or ""
+                        if text.strip():
+                            slides.append({
+                                "page":    i + 1,
+                                "content": text.strip(),    # contenu complet, non tronqué
+                                "total":   len(reader.pages),
+                            })
             return slides
         except Exception as exc:
             log.warning(f"PDF extraction failed: {exc}")

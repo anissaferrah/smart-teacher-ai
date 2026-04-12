@@ -21,7 +21,7 @@ from typing import Optional
 
 log = logging.getLogger("SmartTeacher.Search")
 
-ES_HOST     = os.getenv("ELASTICSEARCH_HOST", "")   # ex: http://localhost:9200
+ES_HOST     = os.getenv("ELASTICSEARCH_HOST", "http://localhost:9200")   # ex: http://localhost:9200
 ES_USER     = os.getenv("ELASTICSEARCH_USER", "")
 ES_PASSWORD = os.getenv("ELASTICSEARCH_PASSWORD", "")
 ES_INDEX    = "smart_teacher_transcripts"
@@ -66,17 +66,18 @@ class TranscriptSearcher:
             kwargs: dict = {"hosts": [ES_HOST]}
             if ES_USER:
                 kwargs["basic_auth"] = (ES_USER, ES_PASSWORD)
-            self._es = Elasticsearch(**kwargs)
-            if self._es.ping():
+            # ⬇️ Ajouter timeout rapide pour fallback si Elasticsearch non dispo
+            self._es = Elasticsearch(**kwargs, request_timeout=2)
+            if self._es.ping(request_timeout=2):
                 self._ensure_index()
                 self._use_es = True
                 log.info("✅ Elasticsearch connecté : %s", ES_HOST)
             else:
-                log.warning("⚠️  Elasticsearch ping failed → recherche en mémoire")
+                log.info("ℹ️ Elasticsearch ping failed → recherche en mémoire")
         except ImportError:
-            log.warning("⚠️  elasticsearch-py non installé → recherche en mémoire")
+            log.info("ℹ️ elasticsearch-py non installé → recherche en mémoire")
         except Exception as e:
-            log.warning("⚠️  Elasticsearch non dispo (%s) → recherche en mémoire", e)
+            log.info("ℹ️ Elasticsearch non dispo (%s) → recherche en mémoire", e)
 
     def _ensure_index(self):
         """Crée l'index avec le bon mapping si absent."""
@@ -124,7 +125,8 @@ class TranscriptSearcher:
                 self._es.index(index=ES_INDEX, document=entry.to_doc())
                 return True
             except Exception as e:
-                log.error("ES index error: %s", e)
+                log.info("ℹ️ ES index error (%s) → fallback mémoire", e)
+                self._use_es = False
 
         # Fallback mémoire (garder les 5000 derniers)
         self._memory_index.append(entry)
@@ -187,8 +189,9 @@ class TranscriptSearcher:
                 results.append(doc)
             return results
         except Exception as e:
-            log.error("ES search error: %s", e)
-            return []
+            log.info("ℹ️ ES search error (%s) → fallback mémoire", e)
+            self._use_es = False
+            return self._memory_search(query, language, course_id, role, limit)
 
     def _memory_search(self, query, language, course_id, role, limit) -> list[dict]:
         q = query.lower()

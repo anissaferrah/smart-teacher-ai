@@ -87,7 +87,8 @@ class SmartTeacher {
   _handleMessage(msg) {
     switch (msg.type) {
       case 'state_change':
-        this.onStateChange(msg.state);
+        // ✅ PASS FULL MESSAGE OBJECT SO UI CAN DISPLAY METRICS
+        this.onStateChange(msg);
         break;
       case 'transcription':
         this.onTranscription(msg.text, msg.lang, msg.confidence);

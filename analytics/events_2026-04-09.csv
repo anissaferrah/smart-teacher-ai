@@ -1,0 +1,2 @@
+event_time,session_id,student_id,course_id,language,level,event_type,question,answer_length,stt_time,llm_time,tts_time,total_time,kpi_ok,subject,chapter_idx,section_idx,confidence,interruptions
+2026-04-09T22:37:35.135718,01194cb5-1501-4953-8d5e-fbba0f04f4a9,,,en,lycée,qa,what is data mining,36,0,7.011,1.345,8.356,False,,0,0,0.0,0

@@ -1,0 +1,7 @@
+event_time,session_id,student_id,course_id,language,level,event_type,question,answer_length,stt_time,llm_time,tts_time,total_time,kpi_ok,subject,chapter_idx,section_idx,confidence,interruptions
+2026-03-27T22:37:39.123705,c52fb38c-717e-4121-bc78-bb44ab79a617,,ac87b067-81bf-468c-b719-72188fdcd428,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-03-27T22:38:09.879819,c52fb38c-717e-4121-bc78-bb44ab79a617,,ac87b067-81bf-468c-b719-72188fdcd428,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,1,0.0,0
+2026-03-27T22:38:18.731596,c52fb38c-717e-4121-bc78-bb44ab79a617,,ac87b067-81bf-468c-b719-72188fdcd428,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,2,0.0,0
+2026-03-27T22:38:41.393813,c52fb38c-717e-4121-bc78-bb44ab79a617,,ac87b067-81bf-468c-b719-72188fdcd428,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,3,0.0,0
+2026-03-27T22:38:57.592890,c52fb38c-717e-4121-bc78-bb44ab79a617,,ac87b067-81bf-468c-b719-72188fdcd428,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,4,0.0,0
+2026-03-27T22:39:07.842140,c52fb38c-717e-4121-bc78-bb44ab79a617,,ac87b067-81bf-468c-b719-72188fdcd428,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,5,0.0,0

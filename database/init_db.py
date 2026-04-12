@@ -4,11 +4,23 @@ Smart Teacher — Initialisation de la base de données PostgreSQL
 """
 
 import logging
+import sys
+from pathlib import Path
+
+# Add parent directory to path to import config
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import text
 
 from config import Config
-from database.models import Base
+from database.models import (
+    Base, 
+    Student, Course, Chapter, Section, Concept, 
+    LearningSession, Interaction,
+    StudentProfile, StudentMistake,
+    RAGChunk, SystemLog, PerformanceMetric, LLMCache
+)
 
 log = logging.getLogger("SmartTeacher.Database")
 
@@ -52,5 +64,5 @@ async def check_db_connection() -> bool:
         log.info("✅ Connexion PostgreSQL établie")
         return True
     except Exception as e:
-        log.error(f"❌ Connexion PostgreSQL échouée: {e}")
+        log.warning(f"⚠️ Connexion PostgreSQL indisponible: {e}")
         return False

@@ -64,11 +64,6 @@ class SpeechRateAdapter:
             "collège":    "en-US-JennyNeural",
             "université": "en-US-GuyNeural",
         },
-        "tr": {
-            "lycée":      "tr-TR-EmelNeural",
-            "collège":    "tr-TR-EmelNeural",
-            "université": "tr-TR-AhmetNeural",
-        },
     }
 
     def get_config(self, language: str = "fr", level: str = "lycée",

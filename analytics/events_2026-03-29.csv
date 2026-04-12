@@ -1,0 +1,2 @@
+event_time,session_id,student_id,course_id,language,level,event_type,question,answer_length,stt_time,llm_time,tts_time,total_time,kpi_ok,subject,chapter_idx,section_idx,confidence,interruptions
+2026-03-29T11:56:53.747732,341e95d1-3ab4-4f3f-857b-e1ab911b7eae,,ac87b067-81bf-468c-b719-72188fdcd428,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0

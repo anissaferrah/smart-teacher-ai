@@ -1,152 +1,314 @@
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║        SMART TEACHER — Stockage Média (MinIO / Local fallback)     ║
-║                                                                      ║
-║  Gère le stockage des fichiers multimédia :                         ║
-║    - PDF uploadés par les professeurs                               ║
-║    - Slides extraites (images PNG)                                  ║
-║    - Fichiers audio TTS générés                                     ║
-║    - Ressources diverses                                            ║
-║                                                                      ║
-║  Si MinIO n'est pas configuré → stockage local dans ./media/        ║
-╚══════════════════════════════════════════════════════════════════════╝
+Smart Teacher — Media Storage Module.
+
+Unified abstraction layer for media file storage:
+    - Local filesystem storage (default fallback)
+    - MinIO S3-compatible object storage (if configured)
+    - Automatic provider detection and fallback
+    
+Supported media types:
+    - PDF documents (user uploads)
+    - Slide images (PNG/JPG from PDF conversion)
+    - Audio files (MP3 from TTS generation)
+    - Course resources and metadata
+    
+Usage:
+    storage = MediaStorage()
+    
+    # Upload
+    url = storage.upload_bytes(b"...", "slides/ch1/1.png", "image/png")
+    
+    # Download
+    audio_bytes = storage.get_bytes("audio/response_123.mp3")
+    
+    # Check existence
+    exists = storage.exists("pdfs/chapter_1.pdf")
+    
+    # List contents
+    files = storage.list_objects("slides/ch1/")
 """
 
-import os
-import logging
 import hashlib
+import logging
+import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 log = logging.getLogger("SmartTeacher.MediaStorage")
 
-# ── Configuration ──────────────────────────────────────────────────────
-MINIO_ENDPOINT  = os.getenv("MINIO_ENDPOINT",  "")          # ex: localhost:9000
-MINIO_ACCESS    = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET    = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-MINIO_BUCKET    = os.getenv("MINIO_BUCKET",    "smart-teacher")
-MINIO_SECURE    = os.getenv("MINIO_SECURE",    "false").lower() == "true"
-LOCAL_MEDIA_DIR = Path(os.getenv("LOCAL_MEDIA_DIR", "./media"))
+# ════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ════════════════════════════════════════════════════════════════════════
+
+MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "")
+MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_BUCKET: str = os.getenv("MINIO_BUCKET", "smart-teacher")
+MINIO_SECURE: bool = os.getenv("MINIO_SECURE", "false").lower() == "true"
+LOCAL_MEDIA_DIR: Path = Path(os.getenv("LOCAL_MEDIA_DIR", "./media"))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# MEDIA STORAGE
+# ════════════════════════════════════════════════════════════════════════
 
 
 class MediaStorage:
     """
-    Interface unifiée pour MinIO ou stockage local.
-    Détecte automatiquement si MinIO est disponible.
+    Unified media storage interface with automatic provider fallback.
+    
+    Attempts to use MinIO if configured, otherwise falls back to
+    local filesystem storage. All operations are transparent to caller.
+    
+    Attributes
+    ----------
+    _minio : object or None
+        MinIO client instance (if initialized)
+    _use_minio : bool
+        Flag indicating active provider (False = local, True = MinIO)
     """
 
-    def __init__(self):
-        self._minio   = None
-        self._use_minio = False
-        self._init_storage()
+    def __init__(self) -> None:
+        """Initialize storage backend automatically."""
+        self._minio: Optional[object] = None
+        self._use_minio: bool = False
+        self._initialized = False  # Lazy initialization flag
+        self._init_local_dirs()
 
-    def _init_storage(self):
-        """Initialise MinIO si configuré, sinon stockage local."""
+    def _init_local_dirs(self) -> None:
+        """Initialize local directories only (non-blocking)."""
         LOCAL_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         (LOCAL_MEDIA_DIR / "slides").mkdir(exist_ok=True)
         (LOCAL_MEDIA_DIR / "pdfs").mkdir(exist_ok=True)
         (LOCAL_MEDIA_DIR / "audio").mkdir(exist_ok=True)
+        log.info(f"📁 Local storage directories ready: {LOCAL_MEDIA_DIR}")
+
+    def _init_storage(self) -> None:
+        """
+        Initialize storage backend with automatic fallback (lazy).
+        
+        Attempts MinIO connection; falls back to local filesystem if
+        MinIO is not configured or unavailable.
+        """
+        if self._initialized:
+            return
+        
+        self._initialized = True
 
         if not MINIO_ENDPOINT:
-            log.info("📁 Stockage local actif : %s", LOCAL_MEDIA_DIR)
+            log.info(f"📁 Using local storage (MinIO not configured)")
             return
 
         try:
             from minio import Minio
-            from minio.error import S3Error
 
             self._minio = Minio(
                 MINIO_ENDPOINT,
-                access_key=MINIO_ACCESS,
-                secret_key=MINIO_SECRET,
+                access_key=MINIO_ACCESS_KEY,
+                secret_key=MINIO_SECRET_KEY,
                 secure=MINIO_SECURE,
+                connect_timeout=2,  # Short timeout
+                region="us-east-1",
             )
-            # Créer le bucket si inexistant
+
+            # Ensure bucket exists
             if not self._minio.bucket_exists(MINIO_BUCKET):
                 self._minio.make_bucket(MINIO_BUCKET)
-                log.info("🪣 Bucket MinIO créé : %s", MINIO_BUCKET)
+                log.info(f"🪣 MinIO bucket created: {MINIO_BUCKET}")
             else:
-                log.info("✅ MinIO connecté : %s/%s", MINIO_ENDPOINT, MINIO_BUCKET)
+                log.info(f"✅ MinIO connected: {MINIO_ENDPOINT}/{MINIO_BUCKET}")
 
             self._use_minio = True
 
         except ImportError:
-            log.warning("⚠️  minio package non installé → stockage local")
-        except Exception as e:
-            log.warning("⚠️  MinIO non disponible (%s) → stockage local", e)
+            log.warning("⚠️ minio package not installed → local storage fallback")
+        except Exception as exc:
+            log.warning(f"⚠️ MinIO unavailable ({exc}) → local storage fallback")
 
-    # ── Upload ───────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # UPLOAD OPERATIONS
+    # ════════════════════════════════════════════════════════════════════════
 
-    def upload_bytes(self, data: bytes, object_name: str, content_type: str = "application/octet-stream") -> str:
+    def upload_bytes(
+        self,
+        data: bytes,
+        object_name: str,
+        content_type: str = "application/octet-stream"
+    ) -> str:
         """
-        Sauvegarde des bytes.
-        Retourne l'URL publique (MinIO) ou le chemin local.
+        Upload bytes to storage and return accessible URL/path.
+        
+        Parameters
+        ----------
+        data : bytes
+            File content
+        object_name : str
+            Storage path (e.g., "slides/ch1/1.png", "audio/response.mp3")
+        content_type : str, optional
+            MIME type (default: "application/octet-stream")
+        
+        Returns
+        -------
+        str
+            Public URL (MinIO) or relative path (local)
         """
+        self._init_storage()
         if self._use_minio:
             return self._minio_upload_bytes(data, object_name, content_type)
         return self._local_save_bytes(data, object_name)
 
     def upload_file(self, file_path: str, object_name: str) -> str:
-        """Sauvegarde un fichier depuis le disque."""
+        """
+        Upload file from disk to storage.
+        
+        Parameters
+        ----------
+        file_path : str
+            Local file pathname
+        object_name : str
+            Storage destination path
+        
+        Returns
+        -------
+        str
+            Public URL or relative path
+        """
         if self._use_minio:
             return self._minio_upload_file(file_path, object_name)
         return self._local_copy_file(file_path, object_name)
 
-    # ── Download ─────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # DOWNLOAD OPERATIONS
+    # ════════════════════════════════════════════════════════════════════════
 
     def get_url(self, object_name: str, expires_hours: int = 24) -> str:
-        """Retourne une URL signée (MinIO) ou chemin local."""
+        """
+        Generate presigned URL for file access.
+        
+        Parameters
+        ----------
+        object_name : str
+            Storage path
+        expires_hours : int, optional
+            URL expiration time in hours (default: 24)
+        
+        Returns
+        -------
+        str
+            Presigned URL (MinIO) or relative path (local)
+        """
         if self._use_minio:
             try:
                 from datetime import timedelta
                 return self._minio.presigned_get_object(
-                    MINIO_BUCKET, object_name,
+                    MINIO_BUCKET,
+                    object_name,
                     expires=timedelta(hours=expires_hours)
                 )
-            except Exception as e:
-                log.error("MinIO get_url error: %s", e)
+            except Exception as exc:
+                log.error(f"MinIO URL generation failed: {exc}")
                 return ""
-        # Local : URL relative
+
+        # Local: return relative URL
         return f"/media/{object_name}"
 
     def get_bytes(self, object_name: str) -> Optional[bytes]:
-        """Télécharge un objet et retourne ses bytes."""
+        """
+        Download file content as bytes.
+        
+        Parameters
+        ----------
+        object_name : str
+            Storage path
+        
+        Returns
+        -------
+        bytes or None
+            File content if found, None otherwise
+        """
         if self._use_minio:
             try:
                 response = self._minio.get_object(MINIO_BUCKET, object_name)
                 data = response.read()
                 response.close()
                 return data
-            except Exception as e:
-                log.error("MinIO get_bytes error: %s", e)
+            except Exception as exc:
+                log.error(f"MinIO download failed: {exc}")
                 return None
+
+        # Local: read from filesystem
         path = LOCAL_MEDIA_DIR / object_name
         return path.read_bytes() if path.exists() else None
 
+    # ════════════════════════════════════════════════════════════════════════
+    # METADATA OPERATIONS
+    # ════════════════════════════════════════════════════════════════════════
+
     def exists(self, object_name: str) -> bool:
+        """
+        Check if file exists in storage.
+        
+        Parameters
+        ----------
+        object_name : str
+            Storage path
+        
+        Returns
+        -------
+        bool
+            True if file exists, False otherwise
+        """
         if self._use_minio:
             try:
                 self._minio.stat_object(MINIO_BUCKET, object_name)
                 return True
             except Exception:
                 return False
+
         return (LOCAL_MEDIA_DIR / object_name).exists()
 
     def delete(self, object_name: str) -> bool:
+        """
+        Delete file from storage.
+        
+        Parameters
+        ----------
+        object_name : str
+            Storage path
+        
+        Returns
+        -------
+        bool
+            True if deleted successfully, False otherwise
+        """
         if self._use_minio:
             try:
                 self._minio.remove_object(MINIO_BUCKET, object_name)
                 return True
             except Exception:
                 return False
+
         path = LOCAL_MEDIA_DIR / object_name
         if path.exists():
             path.unlink()
             return True
         return False
 
-    def list_objects(self, prefix: str = "") -> list[str]:
+    def list_objects(self, prefix: str = "") -> List[str]:
+        """
+        List all objects under prefix.
+        
+        Parameters
+        ----------
+        prefix : str, optional
+            Storage path prefix (e.g., "slides/ch1/")
+        
+        Returns
+        -------
+        list[str]
+            List of object names matching prefix
+        """
         if self._use_minio:
             try:
                 objects = self._minio.list_objects(MINIO_BUCKET, prefix=prefix, recursive=True)

@@ -24,8 +24,8 @@ from typing import Optional
 
 log = logging.getLogger("SmartTeacher.Analytics")
 
-CH_HOST     = os.getenv("CLICKHOUSE_HOST",     "")        # ex: localhost
-CH_PORT     = int(os.getenv("CLICKHOUSE_PORT", "9000"))
+CH_HOST     = os.getenv("CLICKHOUSE_HOST",     "localhost")        # ex: localhost
+CH_PORT     = int(os.getenv("CLICKHOUSE_PORT", "8123"))             # Port HTTP (NOT 9000)
 CH_DB       = os.getenv("CLICKHOUSE_DB",       "smart_teacher")
 CH_USER     = os.getenv("CLICKHOUSE_USER",     "default")
 CH_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "")
@@ -90,12 +90,19 @@ class AnalyticsEngine:
     def __init__(self):
         self._ch     = None
         self._use_ch = False
+        self._ch_initialized = False  # Track if initialization was attempted
         self._cache: list[LearningEvent] = []
         CSV_DIR.mkdir(parents=True, exist_ok=True)
         self._csv_path = CSV_DIR / f"events_{date.today().isoformat()}.csv"
-        self._init_ch()
+        # Lazy initialization of ClickHouse - don't block startup
 
     def _init_ch(self):
+        # Skip if already tried to initialize
+        if self._ch_initialized:
+            return
+        
+        self._ch_initialized = True
+        
         if not CH_HOST:
             log.info("📊 ClickHouse non configuré → analytics CSV + mémoire")
             return
@@ -104,6 +111,8 @@ class AnalyticsEngine:
             self._ch = clickhouse_connect.get_client(
                 host=CH_HOST, port=CH_PORT,
                 database=CH_DB, username=CH_USER, password=CH_PASSWORD,
+                connect_timeout=2,  # Short timeout to avoid blocking
+                send_receive_timeout=2,
             )
             self._ch.command(self.CREATE_TABLE_SQL)
             self._use_ch = True
@@ -128,7 +137,8 @@ class AnalyticsEngine:
         # CSV
         self._write_csv(evt)
 
-        # ClickHouse
+        # ClickHouse (lazy init)
+        self._init_ch()
         if self._use_ch:
             self._ch_insert(evt)
 
@@ -172,12 +182,14 @@ class AnalyticsEngine:
 
     def kpi_summary(self, hours: int = 24) -> dict:
         """Résumé des KPIs sur les N dernières heures."""
+        self._init_ch()
         if self._use_ch:
             return self._ch_kpi_summary(hours)
         return self._mem_kpi_summary(hours)
 
     def progression_by_course(self, course_id: str) -> list[dict]:
         """Progression des sections vues pour un cours."""
+        self._init_ch()
         if self._use_ch:
             return self._ch_progression(course_id)
         return self._mem_progression(course_id)

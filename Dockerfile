@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p courses logs data/multimodal_db static
+RUN mkdir -p courses logs data/rag_cache media/audio media/pdfs media/slides static
 
 EXPOSE 8000
 

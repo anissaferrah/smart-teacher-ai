@@ -1,89 +1,398 @@
-"""
-╔══════════════════════════════════════════════════════════════════════╗
-║           SMART TEACHER — Module LLM v2 (Cerveau IA)              ║
-║                                                                      ║
-║  AMÉLIORATIONS v2 :                                                  ║
-║    ✅ Prompt système spécialisé Data Mining / M2 (par langue)       ║
-║    ✅ Contexte chapitre injecté dans chaque réponse                 ║
-║    ✅ _clean_for_speech() amélioré : préserve acronymes DM          ║
-║    ✅ present() adapté : intro DM-spécifique par chapitre           ║
-║    ✅ ask() : contexte chapitre passé au système                    ║
-╚══════════════════════════════════════════════════════════════════════╝
-"""
+"""Smart Teacher — LLM Module (OpenAI GPT + Local LLM Fallback)"""
+
+from __future__ import annotations
 
 import logging
 import re
 import time
+from difflib import SequenceMatcher
 
+import requests
 from openai import OpenAI
+
 from config import Config
+from modules.local_llm import LocalLLMFallback
 
 log = logging.getLogger("SmartTeacher.LLM")
 
-# Chapitres DM
-DM_CHAPTERS = {
-    1: "Introduction to Data Mining",
-    2: "Data, Dataset, Data Warehouse",
-    3: "Exploratory Data Analysis",
-    4: "Data Cleaning & Preprocessing",
-    5: "Feature Engineering",
-    6: "Supervised Machine Learning",
-    7: "Unsupervised Machine Learning",
-}
 
-# ── Prompts système — spécialisés Data Mining M2 ──────────────────────────────
-_SYSTEM_PROMPTS = {
+_FALLBACK_PROMPTS = {
     "en": (
-        "You are Smart Teacher, a highly experienced professor specializing in "
-        "Data Mining, Machine Learning, and Artificial Intelligence. "
+        "You are Smart Teacher, a highly experienced professor. "
         "You are teaching a Master's level course (M2) at a university. "
-        "You ALWAYS answer as if you are SPEAKING in class — never writing. "
+        "You ALWAYS answer as if you are SPEAKING in class - never writing. "
         "Be concise (max 4 natural sentences) unless more detail is requested. "
-        "Use precise technical terminology (k-means, SVM, AUC, Gini impurity, etc.) "
-        "without dumbing it down. "
-        "If a course context is provided, base your answer on it. "
+        "Use precise technical terminology without dumbing it down. "
         "NEVER use markdown, bullet points, or LaTeX. "
-        "Write formulas in plain words: 'entropy equals minus sum of p log p'."
+        "If an idea has already been stated, do not repeat it with slightly different wording."
     ),
     "fr": (
-        "Tu es Smart Teacher, un professeur expert en Data Mining, "
-        "Machine Learning et Intelligence Artificielle. "
+        "Tu es Smart Teacher, un professeur expert. "
         "Tu enseignes un cours de niveau Master 2 à l'université. "
-        "Tu réponds TOUJOURS comme si tu PARLAIS en cours — jamais comme un texte écrit. "
+        "Tu réponds TOUJOURS comme si tu PARLAIS en cours - jamais comme un texte écrit. "
         "Sois concis (max 4 phrases naturelles) sauf si plus de détails sont demandés. "
-        "Utilise la terminologie technique précise (k-means, SVM, AUC, Gini...). "
-        "Si un contexte de cours est fourni, base ta réponse dessus. "
+        "Utilise la terminologie technique précise. "
         "JAMAIS de markdown, listes, ni LaTeX. "
-        "Les formules en clair : 'l'entropie égale moins la somme de p log p'."
+        "Si une idée a déjà été dite, ne la répète pas avec des mots proches."
     ),
     "ar": (
-        "أنت Smart Teacher، أستاذ خبير في استخراج البيانات والتعلم الآلي. "
-        "تدرّس مقرراً جامعياً من مستوى الماستر. "
-        "أجب دائماً كما لو كنت تتحدث في الفصل الدراسي. "
-        "كن موجزاً (4 جمل كحد أقصى). استخدم المصطلحات التقنية الدقيقة. "
-        "لا markdown، لا LaTeX، لا قوائم. أجب فقط بالعربية."
+        "أنت أستاذ جامعي خبير جداً. تعلّم طلابك بوضوح وبساطة. "
+        "اشرح الفكرة بطريقة طبيعية وسهلة الفهم، كما تتحدث في الفصل. "
+        "لا تستخدم كلمات معقدة غير ضرورية. استخدم العربية الفصحى البسيطة. "
+        "أجب بـ 3 إلى 4 جمل فقط، واضحة وقصيرة. "
+        "NO markdown. NO code. NO English. عربي فقط."
     ),
 }
+
+
+_FALLBACK_PRESENTATION_PROMPTS = {
+    "en": (
+        "You are an experienced professor presenting a lecture to M2 students. "
+        "Present only the current slide content out loud naturally. "
+        "Focus only on this slide/page, not future slides. "
+        "- NEVER read word for word. Rephrase in your own words.\n"
+        "- ZERO markdown and LaTeX.\n"
+        "- 3 to 5 natural sentences. Only in English."
+    ),
+    "fr": (
+        "Tu es un professeur expérimenté qui présente un cours à des étudiants M2. "
+        "Présente seulement le contenu de la slide courante à voix haute naturellement. "
+        "Concentre-toi sur cette slide/page, pas sur les suivantes. "
+        "- NE LIS JAMAIS le texte mot pour mot. Reformule.\n"
+        "- ZÉRO markdown et LaTeX.\n"
+        "- 3 à 5 phrases naturelles. Uniquement en français."
+    ),
+    "ar": (
+        "أنت أستاذ خبير. "
+        "قدّم فقط محتوى الشريحة الحالية بصوت طبيعي. "
+        "ركّز على هذه الشريحة/page وليس الشرائح القادمة. "
+        "- لا markdown ولا LaTeX.\n"
+        "- 3 إلى 5 جمل طبيعية. أجب بالعربية فقط."
+    ),
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DÉTECTION AUTOMATIQUE DE CONFUSION (S29-32)
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_confusion(
+    transcript: str,
+    previous_message: str = "",
+    language: str = "fr"
+) -> tuple[bool, str]:
+    """
+    ✅ Détecte si l'étudiant est confus ou demande une clarification.
+    
+    Critères :
+    1. Mots clés de confusion dans le transcript
+    2. Même question posée 2x (similarité > 0.8)
+    
+    Returns: (is_confused, reason)
+    """
+    if not transcript:
+        return False, ""
+    
+    transcript_lower = transcript.lower().strip()
+    
+    # Mots clés par langue
+    confusion_keywords = {
+        "fr": ["comprends pas", "je comprends pas", "c'est pas clair", "quoi", "hein", 
+               "peux tu répéter", "reexplique", "explique mieux", "c'est confus", "comprend rien"],
+        "en": ["don't understand", "i don't get it", "what", "huh", "can you repeat", 
+               "explain again", "that's confusing", "not clear"],
+        "ar": ["ما فهمت", "فهمت ما", "اشرح أكثر", "يمكن تعيد", "ايش", "غير واضح"]
+    }
+    
+    lang_keywords = confusion_keywords.get(language.lower()[:2], confusion_keywords["fr"])
+    
+    # 1️⃣ Détection par mot clé
+    for keyword in lang_keywords:
+        if keyword in transcript_lower:
+            return True, f"Confusion keyword detected: '{keyword}'"
+    
+    # 2️⃣ Détection de question répétée (similarité)
+    if previous_message:
+        from difflib import SequenceMatcher
+        similarity = SequenceMatcher(None, transcript_lower, previous_message.lower()).ratio()
+        if similarity > 0.75:  # 75% similaire = même question
+            return True, f"Question répétée (similarité: {similarity:.0%})"
+    
+    return False, ""
+
+
+def get_clarification_prompt(language: str = "fr", domain: str = None) -> str:
+    """
+    ✅ Prompt spécial quand l'étudiant demande une clarification.
+    Demande une explication PLUS SIMPLE et PLUS DIRECTE.
+    """
+    clarification_prompts = {
+        "en": (
+            "The student is confused. Your task is to CLARIFY and SIMPLIFY your explanation.\n"
+            "- Use ONLY simple words (no advanced terminology).\n"
+            "- Give a CONCRETE EXAMPLE first.\n"
+            "- Explain the core idea in 2-3 sentences maximum.\n"
+            "- Then explain the more technical part.\n"
+            "- Ask: 'Does that make sense?'"
+        ),
+        "fr": (
+            "L'étudiant est confus. Tu dois CLARIFIER et SIMPLIFIER ta réponse.\n"
+            "- Utilise des mots FACILES (pas de jargon).\n"
+            "- Donne d'ABORD un EXEMPLE CONCRET.\n"
+            "- Explique l'idée centrale en 2-3 phrases max.\n"
+            "- Puis explique la partie plus technique.\n"
+            "- Demande : 'C'est plus clair?'"
+        ),
+        "ar": (
+            "الطالب لم يفهم. يجب عليك أن تشرح بطريقة أبسط.\n"
+            "- استخدم كلمات بسيطة وسهلة.\n"
+            "- أعطِ مثالاً محسوساً أولاً.\n"
+            "- شرح الفكرة الأساسية في 2-3 جمل فقط.\n"
+            "- ثم شرح الجزء الأكثر تقنية.\n"
+            "- اسأل: 'هل أصبح الأمر أوضح؟'"
+        ),
+    }
+    
+    lang = language.lower()[:2]
+    return clarification_prompts.get(lang, clarification_prompts["en"])
+
+
+def get_system_prompt(domain: str = None, language: str = "en") -> str:
+    """Génère un prompt système dynamique basé sur le domaine."""
+    try:
+        from domains_config import DOMAINS
+    except ImportError:
+        log.warning("⚠️  domains_config not available, using fallback prompts")
+        return _FALLBACK_PROMPTS.get(language, _FALLBACK_PROMPTS["en"])
+
+    lang = language.lower()[:2] if language else "en"
+
+    if domain and domain in DOMAINS:
+        domain_desc = DOMAINS[domain].get("description", "specialty subjects")
+        domain_name = DOMAINS[domain].get("name", domain)
+    else:
+        domain_desc = "specialty subjects"
+        domain_name = "diverse topics"
+
+    prompts_map = {
+        "en": (
+            f"You are Smart Teacher, a highly experienced professor specializing in {domain_desc}. "
+            f"You are teaching a Master's level course (M2) at a university. "
+            f"You ALWAYS answer as if you are SPEAKING in class - never writing. "
+            f"Be concise (max 4 natural sentences) unless more detail is requested. "
+            f"Use precise technical terminology appropriate to {domain_name} without dumbing it down. "
+            f"If a course context is provided, base your answer on it. "
+            f"NEVER use markdown, bullet points, or LaTeX. "
+            f"If the same idea appears more than once, merge it into one explanation. "
+            f"Write formulas in plain words."
+        ),
+        "fr": (
+            f"Tu es Smart Teacher, un professeur expert en {domain_desc}. "
+            f"Tu enseignes un cours de niveau Master 2 à l'université. "
+            f"Tu réponds TOUJOURS comme si tu PARLAIS en cours - jamais comme un texte écrit. "
+            f"Sois concis (max 4 phrases naturelles) sauf si plus de détails sont demandés. "
+            f"Utilise la terminologie technique précise en {domain_name}. "
+            f"Si un contexte de cours est fourni, base ta réponse dessus. "
+            f"JAMAIS de markdown, listes, ni LaTeX. "
+            f"Si une même idée apparaît plusieurs fois, fusionne-la en une seule explication. "
+            f"Les formules en clair."
+        ),
+        "ar": (
+            f"أنت Smart Teacher، أستاذ خبير في {domain_desc}. "
+            f"تدرّس مقرراً جامعياً من مستوى الماستر. "
+            f"أجب دائماً كما لو كنت تتحدث في الفصل الدراسي. "
+            f"كن موجزاً (4 جمل كحد أقصى). استخدم المصطلحات التقنية الدقيقة. "
+            f"إذا تكررت الفكرة نفسها، فادمجها في شرح واحد. "
+            f"لا markdown، لا LaTeX، لا قوائم. أجب فقط بالعربية."
+        ),
+    }
+
+    return prompts_map.get(lang, prompts_map["en"])
+
+
+def get_presentation_prompt(domain: str = None, language: str = "en", chapter_title: str = "") -> str:
+    """Génère un prompt de présentation centré sur la slide courante."""
+    try:
+        from domains_config import DOMAINS
+    except ImportError:
+        log.warning("⚠️  domains_config not available, using fallback presentation prompts")
+        return _FALLBACK_PRESENTATION_PROMPTS.get(language, _FALLBACK_PRESENTATION_PROMPTS["en"])
+
+    lang = language.lower()[:2] if language else "en"
+
+    if domain and domain in DOMAINS:
+        domain_desc = DOMAINS[domain].get("description", "specialty subjects")
+        domain_name = DOMAINS[domain].get("name", domain)
+    else:
+        domain_desc = "specialty subjects"
+        domain_name = "this field"
+
+    chapter_ctx = f"\nThis content is from the chapter: '{chapter_title}'." if chapter_title else ""
+
+    prompts_map = {
+        "en": (
+            f"You are an experienced {domain_name} professor presenting a lecture to M2 students. "
+            f"You receive the current slide content and must PRESENT only this slide out loud.{chapter_ctx}\n\n"
+            "ABSOLUTE RULES:\n"
+            "- Focus only on the current slide/page, never on future slides.\n"
+            "- Start naturally: 'In this section, we will look at...'.\n"
+            "- NEVER read the text word for word. Rephrase in your own words.\n"
+            "- ZERO markdown: no **, no #, no bullet points, no lists.\n"
+            "- ZERO LaTeX: write math in plain words.\n"
+            "- Keep ALL technical terminology from this domain.\n"
+            "- If the slide repeats the same idea in several bullets, synthesize it once.\n"
+            "- Do not restate the same point with small wording changes.\n"
+            "- Natural academic transitions.\n"
+            "- A concrete domain-specific example.\n"
+            "- 3 to 5 natural sentences. Only in English."
+        ),
+        "fr": (
+            f"Tu es un professeur de {domain_name} expérimenté qui présente un cours à des étudiants M2. "
+            f"Tu reçois le contenu de la slide courante et dois PRÉSENTER uniquement cette slide à voix haute.{chapter_ctx}\n\n"
+            "RÈGLES ABSOLUES :\n"
+            "- Concentre-toi uniquement sur la slide/page courante, jamais sur les suivantes.\n"
+            "- Commence naturellement : 'Dans cette partie, nous allons voir...'.\n"
+            "- NE LIS JAMAIS le texte mot pour mot. Reformule avec tes propres mots.\n"
+            "- ZÉRO markdown : pas de **, pas de #, pas de tirets, pas de listes.\n"
+            "- ZÉRO LaTeX : formules en clair.\n"
+            "- Conserve TOUS les termes techniques du domaine.\n"
+            "- Si la slide répète la même idée plusieurs fois, synthétise une seule fois.\n"
+            "- Ne redis pas le même point avec de petites variations.\n"
+            "- Transitions académiques naturelles.\n"
+            "- Un exemple concret spécifique au domaine.\n"
+            "- 3 à 5 phrases naturelles. Uniquement en français."
+        ),
+        "ar": (
+            f"أنت أستاذ متخصص في {domain_desc} تقدم محاضرة لطلاب الماستر.{chapter_ctx}\n\n"
+            "قواعد مطلقة:\n"
+            "- ركز فقط على الشريحة الحالية، وليس على الشرائح القادمة.\n"
+            "- لا markdown، لا LaTeX، جمل طبيعية فقط.\n"
+            "- احتفظ بالمصطلحات التقنية من هذا التخصص.\n"
+            "- إذا كررت الشريحة الفكرة نفسها أكثر من مرة، فادمجها مرة واحدة.\n"
+            "- لا تعِد صياغة النقطة نفسها بصيغ متقاربة.\n"
+            "- 3 إلى 5 جمل طبيعية. أجب فقط بالعربية."
+        ),
+    }
+
+    return prompts_map.get(lang, prompts_map["en"])
 
 
 class Brain:
     def __init__(self):
         self.client: OpenAI | None = None
-        self.history: list[dict]   = []
-        self.max_history_len       = Config.MAX_HISTORY_TURNS * 2
+        self.fallback: LocalLLMFallback | None = None
+        self.history: list[dict] = []
+        self.max_history_len = Config.MAX_HISTORY_TURNS * 2
+        
+        # ✅ Rate limiting: per-session throttler (session_id -> {last_call_time, call_count, minute_reset_time})
+        self.session_throttlers: dict[str, dict] = {}
+        self.min_call_interval = 1.0  # Minimum 1 second between calls per session
+        self.max_calls_per_minute = 10  # Maximum 10 calls per minute per session
 
         if Config.OPENAI_API_KEY:
             try:
                 self.client = OpenAI(api_key=Config.OPENAI_API_KEY)
-                log.info("✅ OpenAI connecté")
+                log.info("✅ OpenAI API clé valide")
             except Exception as exc:
-                log.error(f"❌ OpenAI init: {exc}")
+                log.error(f"❌ OpenAI erreur: {exc}")
         else:
-            log.warning("⚠️  OPENAI_API_KEY absent — LLM désactivé")
+            log.info("ℹ️ OpenAI non configuré (fallback Ollama utilisé)")
+
+        self.fallback = LocalLLMFallback(model="mistral")
 
     def clear_memory(self):
         self.history = []
         log.info("🧠 Mémoire effacée")
+    
+    def _check_rate_limit(self, session_id: str | None = None) -> tuple[bool, str]:
+        """
+        ✅ Check if LLM call is allowed for this session.
+        
+        Returns:
+            (allowed: bool, reason: str)
+            - If allowed, reason is empty string
+            - If not allowed, reason explains why
+        """
+        if not session_id:
+            # No session_id provided, always allow (for backward compatibility)
+            return True, ""
+        
+        now = time.time()
+        
+        if session_id not in self.session_throttlers:
+            # First call for this session
+            self.session_throttlers[session_id] = {
+                "last_call_time": now,
+                "call_count": 0,
+                "minute_reset_time": now,
+            }
+            return True, ""
+        
+        throttler = self.session_throttlers[session_id]
+        
+        # 1. Check minimum interval between calls (1 second)
+        time_since_last_call = now - throttler["last_call_time"]
+        if time_since_last_call < self.min_call_interval:
+            wait_time = self.min_call_interval - time_since_last_call
+            reason = f"Rate limited: wait {wait_time:.1f}s (min interval: {self.min_call_interval}s)"
+            return False, reason
+        
+        # 2. Check per-minute call limit
+        time_since_minute_reset = now - throttler["minute_reset_time"]
+        if time_since_minute_reset > 60:
+            # Reset minute counter
+            throttler["call_count"] = 0
+            throttler["minute_reset_time"] = now
+        
+        if throttler["call_count"] >= self.max_calls_per_minute:
+            reason = f"Per-minute limit reached ({self.max_calls_per_minute} calls/min)"
+            return False, reason
+        
+        # All checks passed - update throttler
+        throttler["last_call_time"] = now
+        throttler["call_count"] += 1
+        return True, ""
+
+    def _call_ollama_sync(self, prompt: str, temperature: float = 0.7, max_tokens: int = 400) -> str | None:
+        """Appel synchrone à Ollama via HTTP."""
+        if not self.fallback or not self.fallback.available:
+            return None
+
+        try:
+            log.info("🖥️ Appel Ollama synchrone...")
+            payload = {
+                "model": self.fallback.model,
+                "prompt": prompt,
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "stream": False,
+            }
+            response = requests.post(
+                f"{self.fallback.base_url}/api/generate",
+                json=payload,
+                timeout=180,
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                answer = result.get("response", "").strip()
+                if answer:
+                    log.info(f"✅ Ollama réponse : {len(answer)} chars")
+                    return answer
+                log.warning("⚠️  Ollama réponse vide")
+                return None
+
+            log.error(f"❌ Ollama HTTP {response.status_code}")
+            return None
+        except requests.exceptions.Timeout:
+            log.error("❌ Ollama timeout (>120s=2min) — Le modèle est très lent. Vérifiez votre machine.")
+            return None
+        except requests.exceptions.ConnectionError:
+            log.error("❌ Ollama connexion échouée — Lancez: docker-compose up -d ollama")
+            return None
+        except Exception as exc:
+            log.error(f"❌ Ollama erreur : {exc}")
+            return None
 
     def ask(
         self,
@@ -93,21 +402,21 @@ class Brain:
         chapter_idx: int | None = None,
         chapter_title: str = "",
         section_title: str = "",
+        domain: str | None = None,
+        session_id: str | None = None,  # ✅ For rate limiting
     ) -> tuple[str, float]:
-        """
-        Répond à une question de l'étudiant.
-
-        NOUVEAU : chapter_idx injecté dans le prompt système
-        pour contextualiser la réponse au chapitre en cours.
-        """
-        if not self.client:
-            return "Le LLM n'est pas connecté.", 0.0
-
+        """Répond à une question de l'étudiant."""
+        # ✅ Check rate limit before proceeding
+        allowed, reason = self._check_rate_limit(session_id)
+        if not allowed:
+            log.warning(f"[{session_id[:8] if session_id else 'NA'}] ⚠️  {reason}")
+            return f"Trop rapide! Attendez une seconde antes de poser une autre question.", 0.0
+        
         start = time.time()
-        lang  = (reply_language or "en").lower()[:2]
-        system_content = _SYSTEM_PROMPTS.get(lang, _SYSTEM_PROMPTS["en"])
+        lang = (reply_language or "en").lower()[:2]
 
-        # Contexte chapitre DM
+        system_content = get_system_prompt(domain, lang)
+
         ch_ctx = ""
         if chapter_title:
             if lang == "en":
@@ -117,44 +426,68 @@ class Brain:
             else:
                 ch_ctx = f"\nنحن الآن في : '{chapter_title}'."
             if section_title:
-                ch_ctx += f" Section: '{section_title}'." if lang == "en" else \
-                          f" Section : '{section_title}'."
-        elif chapter_idx and chapter_idx in DM_CHAPTERS:
-            ch_title = DM_CHAPTERS[chapter_idx]
-            ch_ctx = f"\nWe are in Chapter {chapter_idx}: {ch_title}." if lang == "en" \
-                     else f"\nNous sommes au Chapitre {chapter_idx} : {ch_title}."
+                ch_ctx += f" Section: '{section_title}'." if lang == "en" else f" Section : '{section_title}'."
 
         system_content += ch_ctx
 
-        # Contexte RAG
         if course_context:
             sep = "─" * 40
             system_content += f"\n\n{sep}\nCOURSE CONTEXT:\n{course_context}\n{sep}"
 
-        messages = (
-            [{"role": "system", "content": system_content}]
-            + self.history
-            + [{"role": "user", "content": question}]
-        )
+        messages = [
+            {"role": "system", "content": system_content},
+            *self.history,
+            {"role": "user", "content": question},
+        ]
 
-        try:
-            response = self.client.chat.completions.create(
-                model=Config.GPT_MODEL,
-                messages=messages,
+        if self.client:
+            try:
+                log.info("🤖 Tentative OpenAI...")
+                response = self.client.chat.completions.create(
+                    model=Config.GPT_MODEL,
+                    messages=messages,
+                    temperature=Config.GPT_TEMPERATURE,
+                    max_tokens=Config.GPT_MAX_TOKENS,
+                )
+                answer = self._clean_for_speech(response.choices[0].message.content)
+                answer = self._dedupe_answer_text(answer)
+                self.history.append({"role": "user", "content": question})
+                self.history.append({"role": "assistant", "content": answer})
+                if len(self.history) > self.max_history_len:
+                    self.history = self.history[2:]
+                duration = time.time() - start
+                log.info(f"✅ OpenAI OK | {duration:.2f}s | lang={lang} | {len(answer)} chars")
+                return answer, duration
+            except Exception as openai_err:
+                log.warning(f"⚠️  OpenAI échoué: {openai_err} → Fallback Ollama...")
+
+        if self.fallback and self.fallback.available:
+            log.info("🖥️ Ollama fallback activé (timeout: 2min)...")
+            lang_instruction = {
+                "en": "\n\n[!!!CRITICAL!!!] You MUST respond ONLY in English. Any response in French, Arabic or other languages is forbidden. ONLY English.",
+                "fr": "\n\n[!!!CRITIQUE!!!] Tu DOIS répondre UNIQUEMENT en français. Aucune réponse en anglais, arabe ou autre langue. SEULEMENT du français.",
+                "ar": "\n\n[!!!حرج!!!] يجب أن تجيب باللغة العربية فقط. أي رد بالإنجليزية أو الفرنسية أو لغات أخرى محظور. العربية فقط.",
+            }
+            fallback_prompt = f"{system_content}{lang_instruction.get(lang, lang_instruction['en'])}\n\nQuestion/Prompt: {question}"
+            answer = self._call_ollama_sync(
+                prompt=fallback_prompt,
                 temperature=Config.GPT_TEMPERATURE,
-                max_tokens=Config.GPT_MAX_TOKENS,
+                max_tokens=250,
             )
-            answer = self._clean_for_speech(response.choices[0].message.content)
-            self.history.append({"role": "user",      "content": question})
-            self.history.append({"role": "assistant", "content": answer})
-            if len(self.history) > self.max_history_len:
-                self.history = self.history[2:]
-            duration = time.time() - start
-            log.info(f"LLM ask | {duration:.2f}s | lang={lang} | {len(answer)} chars")
-            return answer, duration
-        except Exception as exc:
-            log.error(f"❌ OpenAI error: {exc}")
-            return "I'm having a technical issue. Please try again.", time.time() - start
+
+            if answer:
+                answer = self._clean_for_speech(answer)
+                answer = self._dedupe_answer_text(answer)
+                self.history.append({"role": "user", "content": question})
+                self.history.append({"role": "assistant", "content": answer})
+                if len(self.history) > self.max_history_len:
+                    self.history = self.history[2:]
+                duration = time.time() - start
+                log.info(f"✅ Ollama OK | {duration:.2f}s | {len(answer)} chars")
+                return answer, duration
+
+        log.error("❌ LLM indisponible (OpenAI + Ollama échoué) — Vérifiez: docker-compose up -d")
+        return "🤖 Assistant indisponible. Vérifiez que les services Docker sont actifs: docker-compose up -d", time.time() - start
 
     def present(
         self,
@@ -164,106 +497,114 @@ class Brain:
         chapter_idx: int | None = None,
         chapter_title: str = "",
         section_title: str = "",
+        domain: str | None = None,
+        session_id: str | None = None,  # ✅ For rate limiting
     ) -> tuple[str, float]:
-        """
-        Présente une section de cours oralement.
-        Contextualisé au chapitre DM courant.
-        """
-        if not self.client:
+        """Présente une slide ou section de cours oralement."""
+        # ✅ Check rate limit before proceeding
+        allowed, reason = self._check_rate_limit(session_id)
+        if not allowed:
+            log.warning(f"[{session_id[:8] if session_id else 'NA'}] ⚠️  {reason}")
+            return "", 0.0
+        
+        if not section_content or not section_content.strip():
+            log.warning("⚠️  Slide content vide — rien à expliquer")
+            return "", 0.0
+
+        if not self.client and not (self.fallback and self.fallback.available):
+            log.error("❌ No LLM available — returning raw content")
             return self._clean_for_speech(section_content), 0.0
 
         start = time.time()
-        lang  = (language or "en").lower()[:2]
+        lang = (language or "en").lower()[:2]
+        system_content = get_presentation_prompt(domain, lang, chapter_title)
 
-        # Contexte chapitre pour le prompt de présentation
-        ch_ctx = ""
-        if chapter_title:
-            ch_ctx = f"\nThis content is from the chapter: '{chapter_title}'." if lang == "en" \
-                     else f"\nCe contenu est du chapitre : '{chapter_title}'."
-        elif chapter_idx and chapter_idx in DM_CHAPTERS:
-            ch_ctx = f"\nChapter: {DM_CHAPTERS[chapter_idx]}."
-
-        present_prompts = {
-            "en": (
-                "You are an experienced Data Mining professor presenting a lecture to M2 students. "
-                "You receive raw course content and must PRESENT it out loud.\n\n"
-                f"{ch_ctx}\n\n"
-                "ABSOLUTE RULES:\n"
-                "- Start naturally: 'In this section, we will look at...', 'Now let's discuss...'\n"
-                "- NEVER read the text word for word. Rephrase in your own words.\n"
-                "- ZERO markdown: no **, no #, no bullet points, no lists.\n"
-                "- ZERO LaTeX: write math in plain words "
-                "('entropy equals minus sum of p times log p').\n"
-                "- Keep ALL technical DM/ML terms: k-means, SVM, AUC, Gini, etc.\n"
-                "- Natural academic transitions: 'Now, what's important here is...', "
-                "'Let me elaborate on...', 'This connects to...'\n"
-                "- A concrete DM/ML example (not a generic daily-life analogy).\n"
-                "- 6 to 10 natural sentences. Only in English."
-            ),
-            "fr": (
-                "Tu es un professeur de Data Mining expérimenté qui présente un cours à des étudiants M2. "
-                "Tu reçois le contenu brut d'une section et dois le PRÉSENTER à voix haute.\n\n"
-                f"{ch_ctx}\n\n"
-                "RÈGLES ABSOLUES :\n"
-                "- Commence naturellement : 'Dans cette partie, nous allons voir...'\n"
-                "- NE LIS JAMAIS le texte mot pour mot. Reformule avec tes propres mots.\n"
-                "- ZÉRO markdown : pas de **, pas de #, pas de tirets, pas de listes.\n"
-                "- ZÉRO LaTeX : formules en clair "
-                "('l'entropie égale moins la somme de p fois log p').\n"
-                "- Conserve TOUS les termes techniques DM/ML : k-means, SVM, AUC, Gini, etc.\n"
-                "- Transitions académiques naturelles : 'Ce qui est important ici...', "
-                "'Cela rejoint le concept de...'\n"
-                "- Un exemple concret DM/ML (pas une analogie de la vie quotidienne générique).\n"
-                "- 6 à 10 phrases naturelles. Uniquement en français."
-            ),
-            "ar": (
-                "أنت أستاذ متخصص في استخراج البيانات تقدم محاضرة لطلاب الماستر.\n\n"
-                f"{ch_ctx}\n\n"
-                "قواعد مطلقة:\n"
-                "- لا markdown، لا LaTeX، جمل طبيعية فقط.\n"
-                "- احتفظ بالمصطلحات التقنية: k-means، SVM، AUC، Gini.\n"
-                "- 6 إلى 10 جمل طبيعية. أجب فقط بالعربية."
-            ),
-        }
-
-        # Ajustement selon le niveau
         level_hint = ""
         if student_level == "université" and lang == "en":
             level_hint = " Use precise technical terminology appropriate for Master's level students."
         elif student_level == "lycée" and lang == "en":
             level_hint = " Simplify slightly without losing technical accuracy."
+        system_content += level_hint
 
-        system_content = present_prompts.get(lang, present_prompts["en"]) + level_hint
+        if self.client:
+            try:
+                log.info("🤖 Presentation: OpenAI...")
+                response = self.client.chat.completions.create(
+                    model=Config.GPT_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": f"Content to present:\n\n{section_content}"},
+                    ],
+                    temperature=0.7,
+                    max_tokens=400,
+                )
+                answer = self._clean_for_speech(response.choices[0].message.content.strip())
+                answer = self._dedupe_answer_text(answer)
+                duration = time.time() - start
+                log.info(f"✅ OpenAI present OK | {duration:.2f}s | ch={chapter_idx} | {len(answer)} chars")
+                return answer, duration
+            except Exception as openai_err:
+                log.warning(f"⚠️  OpenAI presentation failed: {openai_err} → Trying Ollama...")
 
-        try:
-            response = self.client.chat.completions.create(
-                model=Config.GPT_MODEL,
-                messages=[
-                    {"role": "system", "content": system_content},
-                    {"role": "user",   "content": f"Content to present:\n\n{section_content}"},
-                ],
+        if self.fallback and self.fallback.available:
+            log.info("🖥️ Presentation: Ollama fallback (timeout: 2min)...")
+            lang_instruction = {
+                "en": "\n\n*** IMPORTANT: You MUST respond ONLY in English. Do NOT respond in French. ***",
+                "fr": "\n\n*** IMPORTANT: Tu DOIS répondre UNIQUEMENT en français. Ne réponds pas en anglais. ***",
+                "ar": "\n\n*** هام: يجب أن تجيب باللغة العربية فقط. لا تجب بالإنجليزية أو الفرنسية. ***",
+            }
+            fallback_prompt = f"{system_content}{lang_instruction.get(lang, lang_instruction['en'])}\n\nContent to present:\n\n{section_content}"
+            answer = self._call_ollama_sync(
+                prompt=fallback_prompt,
                 temperature=0.7,
-                max_tokens=700,
+                max_tokens=300,
             )
-            answer   = self._clean_for_speech(response.choices[0].message.content.strip())
-            duration = time.time() - start
-            log.info(f"LLM present | {duration:.2f}s | ch={chapter_idx} | {len(answer)} chars")
-            return answer, duration
-        except Exception as exc:
-            log.error(f"❌ LLM present error: {exc}")
-            return self._clean_for_speech(section_content), time.time() - start
+
+            if answer:
+                answer = self._clean_for_speech(answer)
+                answer = self._dedupe_answer_text(answer)
+                duration = time.time() - start
+                log.info(f"✅ Ollama present OK | {duration:.2f}s | {len(answer)} chars")
+                return answer, duration
+
+        log.warning("⚠️  All LLMs failed → returning raw content")
+        return self._clean_for_speech(section_content), time.time() - start
 
     def chat(self, content: str, language: str = "en") -> str:
         """Alias rétrocompatible."""
         text, _ = self.present(section_content=content, language=language)
         return text
 
+    def _dedupe_answer_text(self, text: str) -> str:
+        clean_text = text.strip()
+        if not clean_text:
+            return clean_text
+
+        sentences = re.split(r"(?<=[.!?])\s+", clean_text)
+        kept_sentences: list[str] = []
+        seen_signatures: list[str] = []
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            signature = re.sub(r"[^\w\sÀ-ÿ]+", " ", sentence.lower())
+            signature = re.sub(r"\s+", " ", signature).strip()
+            if not signature:
+                continue
+
+            if any(SequenceMatcher(None, signature, seen).ratio() >= 0.9 for seen in seen_signatures[-4:]):
+                continue
+
+            kept_sentences.append(sentence)
+            seen_signatures.append(signature)
+
+        deduped = " ".join(kept_sentences).strip()
+        return deduped or clean_text
+
     def _clean_for_speech(self, text: str) -> str:
-        """
-        Supprime markdown et LaTeX pour la synthèse vocale.
-        PRÉSERVE les acronymes DM : k-means, SVM, AUC, k-NN, etc.
-        """
-        # Protéger les acronymes importants avant le nettoyage
+        """Supprime markdown et LaTeX pour la synthèse vocale."""
         protected_map: dict[str, str] = {}
         dm_terms = [
             "k-means", "k-NN", "k-nn", "t-SNE", "t-sne", "U-MAP", "u-map",
@@ -275,7 +616,6 @@ class Brain:
                 protected_map[ph] = term
                 text = re.sub(re.escape(term), ph, text, flags=re.IGNORECASE)
 
-        # Nettoyage standard
         text = re.sub(r'\\\[.*?\\\]', '', text, flags=re.DOTALL)
         text = re.sub(r'\$\$.*?\$\$', '', text, flags=re.DOTALL)
         text = re.sub(r'\\\(.*?\\\)', '', text, flags=re.DOTALL)
@@ -294,7 +634,6 @@ class Brain:
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = re.sub(r'  +', ' ', text)
 
-        # Restaurer les acronymes protégés
         for ph, term in protected_map.items():
             text = text.replace(ph, term)
 

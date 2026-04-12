@@ -1,0 +1,11 @@
+event_time,session_id,student_id,course_id,language,level,event_type,question,answer_length,stt_time,llm_time,tts_time,total_time,kpi_ok,subject,chapter_idx,section_idx,confidence,interruptions
+2026-04-11T10:51:36.053127,7e2e8ef2-1246-46a1-be49-24e959a04620,,,ar,lycée,qa,ماهو هذا الدرس,1320,0,295.174,8.722,303.896,False,,0,0,0.0,0
+2026-04-11T13:48:18.531369,829483f1-319e-494c-a4d6-4a64ef3bdc18,,,en,lycée,qa,what is data mining?,903,0,83.226,2.835,86.061,False,,0,0,0.0,0
+2026-04-11T14:05:43.602317,2f894fb2-51b2-46d1-994e-a78cfc057a82,,,en,lycée,qa,what is data mining,1026,0,173.374,5.407,178.781,False,,0,0,0.0,0
+2026-04-11T15:09:39.436520,0107812d-8515-48ee-8ad0-725ab74a85e2,,,en,lycée,qa,what is data mining?,830,0,165.438,3.356,168.794,False,,0,0,0.0,0
+2026-04-11T15:36:56.055097,4d28106a-be5e-4a1f-9d18-9f469e540176,,,en,lycée,qa,what is data mining ?,1058,0,152.197,3.526,155.723,False,,0,0,0.0,0
+2026-04-11T17:15:25.009484,f0c2f860-4bfc-418c-9780-28193b2d1a5a,,,en,lycée,qa,what is data mining?,799,0,53.474,2.983,56.457,False,,0,0,0.0,0
+2026-04-11T17:20:10.744338,180c61ca-78ab-48e6-a744-ae9a3445821d,,,en,lycée,qa,can you explain what is data mining?,589,0,88.809,3.686,92.495,False,,0,0,0.0,0
+2026-04-11T17:32:10.165058,41dadb26-1760-498a-9ed6-31056b949267,,,en,lycée,qa,what is data mining,700,0,97.36,2.738,100.097,False,,0,0,0.0,0
+2026-04-11T17:39:09.804837,d894eea6-278a-4918-bf34-2ad1ec87a707,,,en,lycée,qa,what is dATA MINING,746,0,61.599,27.151,88.75,False,,0,0,0.0,0
+2026-04-11T18:22:26.511042,a7012d7b-db52-456e-855e-1862b47e1897,,,en,lycée,qa,what is data mining,979,0,174.178,7.307,181.485,False,,0,0,0.0,0

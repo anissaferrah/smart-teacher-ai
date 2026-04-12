@@ -1,15 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║        SMART TEACHER — Constructeur de Cours v2                    ║
+║        SMART TEACHER — Constructeur de Cours v3                    ║
 ║                                                                      ║
-║  AMÉLIORATIONS v2 :                                                  ║
-║    ✅ Chargement direct depuis courses/dm/ch1..ch7 (sans GPT)        ║
+║  AMÉLIORATIONS v3 :                                                  ║
+║    ✅ Structure hiérarchique : Domain → Courses → Chapters          ║
+║    ✅ Support multi-domaines                                     ║
+║    ✅ Chargement depuis courses/{domain}/{course}/                  ║
 ║    ✅ Préservation de la structure PPTX slide par slide              ║
-║    ✅ Subject forcé à 'data_mining' pour les cours DM               ║
-║    ✅ GPT Structurer avec prompt DM/CS (pas générique)               ║
-║    ✅ build_from_dm_folder() : pipeline complet depuis courses/dm/   ║
-║    ✅ Détection automatique du niveau (M2 → université)             ║
-║    ✅ Concepts DM extraits intelligemment (algorithmes, métriques)   ║
+║    ✅ Subject automatique selon le domaine & cours                  ║
+║    ✅ Pipeline complet : build_course_chapters()                    ║
+║    ✅ Détection automatique du niveau (université)                  ║
+║    ✅ Concepts extraits intelligemment                              ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -18,23 +19,16 @@ import logging
 import os
 import re
 import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
-from openai import AsyncOpenAI
+# Import configuration domaines & cours
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from domains_config import DEFAULT_DOMAIN, DEFAULT_COURSE, get_chapters, get_courses
 
 log = logging.getLogger("SmartTeacher.CourseBuilder")
-
-# Chapitres DM
-DM_CHAPTERS = {
-    1: "Introduction",
-    2: "Data, Dataset, Data Warehouse",
-    3: "Exploratory Data Analysis",
-    4: "Data Cleaning & Preprocessing",
-    5: "Feature Engineering",
-    6: "Supervised Machine Learning",
-    7: "Unsupervised Machine Learning",
-}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -106,9 +100,11 @@ class TextExtractor:
             import pypdf
             text = ""
             with open(path, "rb") as f:
-                reader = pypdf.PdfReader(f)
-                for page in reader.pages:
-                    text += (page.extract_text() or "") + "\n\n"
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", module=r"pypdf\.generic\._base")
+                    reader = pypdf.PdfReader(f, strict=False)
+                    for page in reader.pages:
+                        text += (page.extract_text() or "") + "\n\n"
             return text.strip()
         except ImportError:
             pass
@@ -135,157 +131,197 @@ class TextExtractor:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  STRUCTUREUR GPT — SPÉCIALISÉ DATA MINING
+#  STRUCTUREUR LOCAL — TESSERACT OCR (sans API OpenAI)
 # ══════════════════════════════════════════════════════════════════════
 
-class GPTStructurer:
+class LocalStructurer:
     """
-    Utilise GPT pour transformer un texte brut en cours structuré.
-    Spécialisé pour le domaine Data Mining / Informatique.
+    ✅ Structure le texte SANS modifier le contenu original.
+    ✅ Utilise Tesseract-OCR local (gratuit, rapide).
+    ✅ Génère les PNG pour l'affichage.
+    ✅ Indexe le texte brut directement sans appel OpenAI.
     """
-
-    # Prompt DM/CS spécialisé
-    DM_SYSTEM_PROMPT = """Tu es un expert en Data Mining, Machine Learning et Informatique.
-Tu reçois le contenu brut d'un cours universitaire de Data Mining (M2).
-Tu dois le transformer en un cours structuré PRÉSENTABLE À VOIX HAUTE par un professeur IA.
-
-RÈGLES IMPORTANTES :
-- Chaque section doit être rédigée comme un professeur qui PARLE en cours (pas comme un manuel)
-- CONSERVE tous les termes techniques : k-means, SVM, PCA, AUC, Gini, etc.
-- Le niveau est Master 2 (M2) — vocabulaire technique avancé autorisé
-- Chaque section = environ 2-3 minutes de présentation orale
-- Les concepts doivent inclure des algorithmes, métriques, et exemples concrets DM/ML
-- NE SIMPLIFIE PAS la terminologie technique
-
-Réponds UNIQUEMENT en JSON valide, sans texte avant ou après.
-Format JSON requis :
-{
-  "title": "Titre du cours",
-  "subject": "data_mining",
-  "level": "université",
-  "language": "en",
-  "chapters": [
-    {
-      "title": "Titre du chapitre",
-      "order": 1,
-      "sections": [
-        {
-          "title": "Titre de la section",
-          "order": 1,
-          "content": "Texte rédigé pour être LU À VOIX HAUTE. Minimum 3-4 phrases naturelles et complètes avec la terminologie DM précise.",
-          "duration_s": 120,
-          "concepts": [
-            {
-              "term": "Terme technique DM/ML",
-              "definition": "Définition précise et complète",
-              "example": "Exemple concret appliqué à DM/ML",
-              "type": "definition|algorithm|metric|formula"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}"""
-
-    GENERIC_SYSTEM_PROMPTS = {
-        "fr": """Tu es un expert en pédagogie. 
-Tu reçois le texte brut d'un cours.
-Transforme-le en cours structuré PRÉSENTABLE À VOIX HAUTE.
-Réponds UNIQUEMENT en JSON valide avec ce format :
-{
-  "title": "Titre", "subject": "cs", "level": "université", "language": "fr",
-  "chapters": [{"title":"..","order":1,"sections":[{"title":"..","order":1,
-  "content":"Texte oral naturel minimum 3 phrases.","duration_s":120,
-  "concepts":[{"term":"..","definition":"..","example":"..","type":"definition"}]}]}]
-}""",
-        "en": """You are a pedagogy expert.
-Transform the raw course text into a structured course PRESENTABLE OUT LOUD.
-Reply ONLY with valid JSON using this format:
-{
-  "title": "Title", "subject": "cs", "level": "university", "language": "en",
-  "chapters": [{"title":"..","order":1,"sections":[{"title":"..","order":1,
-  "content":"Natural oral text minimum 3 sentences.","duration_s":120,
-  "concepts":[{"term":"..","definition":"..","example":"..","type":"definition"}]}]}]
-}""",
-    }
 
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        """Initialise Tesseract (déjà dans le Dockerfile)"""
+        try:
+            import pytesseract
+            from pdf2image import convert_from_path
+            self.pytesseract = pytesseract
+            self.convert_from_path = convert_from_path
+            self.available_ocr_langs = set()
+            try:
+                self.available_ocr_langs = set(pytesseract.get_languages(config="") or [])
+            except Exception:
+                self.available_ocr_langs = set()
+            log.info("✅ Tesseract-OCR en local activé")
+        except ImportError as e:
+            log.info(f"ℹ️ Tesseract non disponible: {e}")
+            self.pytesseract = None
+            self.convert_from_path = None
+            self.available_ocr_langs = set()
+
+    def _select_ocr_language(self, requested_lang: str) -> str:
+        """Choisit une langue Tesseract réellement installée pour éviter le fallback English par défaut."""
+        if not self.pytesseract or not self.available_ocr_langs:
+            return ""
+
+        requested_parts = [part.strip() for part in requested_lang.split("+") if part.strip()]
+        selected = [part for part in requested_parts if part in self.available_ocr_langs]
+        if selected:
+            return "+".join(selected)
+
+        for fallback in ("fra", "ara", "eng"):
+            if fallback in self.available_ocr_langs:
+                return fallback
+
+        return next(iter(sorted(self.available_ocr_langs)), "")
+
+    def _pdf_to_images(self, pdf_path: str, output_dir: str) -> list[str]:
+        """Convertit PDF en images PNG."""
+        if not self.convert_from_path:
+            return []
+        try:
+            images = self.convert_from_path(pdf_path, dpi=150)
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            paths = []
+            for i, img in enumerate(images, 1):
+                png_path = Path(output_dir) / f"page_{i:03d}.png"
+                img.save(str(png_path), "PNG")
+                paths.append(str(png_path))
+            log.info(f"  ✅ {len(paths)} PNG générées")
+            return paths
+        except Exception as e:
+            log.info(f"  ℹ️ Conversion PDF→PNG échouée: {e}")
+            return []
+
+    def _extract_text_with_ocr(self, pdf_path: str, lang: str = "fra+ara+eng") -> str:
+        """Extrait le texte brut avec Tesseract-OCR."""
+        if not self.pytesseract or not self.convert_from_path:
+            return ""
+        try:
+            resolved_lang = self._select_ocr_language(lang)
+            if not resolved_lang:
+                log.info("ℹ️ OCR ignoré: aucun pack de langue Tesseract disponible")
+                return ""
+
+            images = self.convert_from_path(pdf_path, dpi=150)
+            full_text = ""
+            for img in images:
+                # Utiliser Tesseract pour extraire le texte
+                text = self.pytesseract.image_to_string(img, lang=resolved_lang)
+                full_text += text + "\n\n"
+            return full_text.strip()
+        except Exception as e:
+            log.info(f"ℹ️ OCR échouée: {e}")
+            return ""
 
     async def structure(
         self,
         raw_text: str,
         language: str = "en",
-        level:    str = "université",
-        title:    str = "",
-        subject:  str = "data_mining",
+        level: str = "université",
+        title: str = "",
+        subject: str = DEFAULT_COURSE,
         chapter_idx: int | None = None,
     ) -> dict:
         """
-        Envoie le texte brut à GPT et récupère le cours structuré.
-        Si subject=data_mining → utilise le prompt DM spécialisé.
+        Structure le texte SANS le modifier (100% local).
+        
+        Retourne une structure simple pour l'indexation RAG.
+        Le contenu est gardé intégralement.
         """
-        log.info(f"🧠 Structuration GPT ({len(raw_text)} chars, subj={subject})…")
-        start = time.time()
+        log.info(f"📚 Structuration locale ({len(raw_text)} chars, tesseract)…")
+        
+        # Diviser le texte en sections (~ 500 mots chacune)
+        sentences = [s.strip() for s in raw_text.replace("\n\n", ". ").split(". ") if s.strip()]
+        
+        sections = []
+        current_section = []
+        word_count = 0
+        
+        for sentence in sentences:
+            words = sentence.split()
+            current_section.append(sentence)
+            word_count += len(words)
+            
+            if word_count >= 150:  # ~1 minute orale
+                content = ". ".join(current_section)
+                if content.strip():
+                    sections.append({
+                        "title": content.split("\n")[0][:60] + "...",
+                        "order": len(sections) + 1,
+                        "content": content,
+                        "duration_s": max(60, word_count // 3),  # ~3 mots/seconde
+                        "concepts": self._extract_concepts(content, subject),
+                    })
+                current_section = []
+                word_count = 0
+        
+        # Dernière section
+        if current_section:
+            content = ". ".join(current_section)
+            sections.append({
+                "title": content.split("\n")[0][:60] + "...",
+                "order": len(sections) + 1,
+                "content": content,
+                "duration_s": max(60, word_count // 3),
+                "concepts": self._extract_concepts(content, subject),
+            })
+        
+        return {
+            "title": title or "Cours importé",
+            "subject": subject,
+            "level": level,
+            "language": language,
+            "chapters": [
+                {
+                    "title": f"Chapitre {chapter_idx or 1}",
+                    "order": chapter_idx or 1,
+                    "sections": sections,
+                }
+            ],
+        }
 
-        # Choisir le prompt
-        if subject == "data_mining":
-            system = self.DM_SYSTEM_PROMPT
-        else:
-            lang = language[:2].lower()
-            system = self.GENERIC_SYSTEM_PROMPTS.get(lang, self.GENERIC_SYSTEM_PROMPTS["en"])
+    def _extract_concepts(self, text: str, subject: str = DEFAULT_COURSE) -> list[dict]:
+        """Extrait les concepts clés (simple regex, pas d'IA)."""
+        concepts = []
 
-        # Limiter la taille
-        MAX_CHARS = 14000
-        if len(raw_text) > MAX_CHARS:
-            log.warning(f"⚠️  Texte tronqué : {len(raw_text)} → {MAX_CHARS} chars")
-            raw_text = raw_text[:MAX_CHARS] + "\n\n[... texte tronqué ...]"
+        keywords = {
+            "general": [
+                "concept", "definition", "example", "method", "process",
+                "analysis", "model", "result", "variable", "data",
+            ],
+            "computer_science": [
+                "algorithm", "complexity", "recursion", "tree", "graph",
+                "database", "network", "protocol", "memory", "function",
+            ],
+            "mathematics": [
+                "theorem", "proof", "equation", "integral", "derivative",
+                "matrix", "vector", "probability", "statistics", "formula",
+            ],
+            "science": [
+                "experiment", "measurement", "hypothesis", "observation",
+                "analysis", "result", "variable", "sample", "process",
+            ],
+            "languages": [
+                "grammar", "syntax", "vocabulary", "reading", "writing",
+                "translation", "text", "sentence", "meaning", "context",
+            ],
+        }
 
-        # Contexte chapitre DM
-        ch_context = ""
-        if chapter_idx and chapter_idx in DM_CHAPTERS:
-            ch_context = f"Ce contenu correspond au Chapitre {chapter_idx} : {DM_CHAPTERS[chapter_idx]}.\n"
-
-        user_prompt = (
-            f"{ch_context}"
-            f"Titre suggéré : {title or 'à déterminer'}\n"
-            f"Niveau : {level}\nLangue : {language}\n\n"
-            f"TEXTE DU COURS :\n{raw_text}\n\n"
-            f"Génère le JSON structuré maintenant :"
-        )
-
-        try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user_prompt},
-                ],
-                temperature=0.2,
-                max_tokens=4000,
-                response_format={"type": "json_object"},
-            )
-            raw_json = response.choices[0].message.content
-            data = json.loads(raw_json)
-
-            # Forcer subject=data_mining
-            if subject == "data_mining":
-                data["subject"] = "data_mining"
-                data["level"]   = "université"
-
-            elapsed  = time.time() - start
-            chapters = len(data.get("chapters", []))
-            sections = sum(len(ch.get("sections", [])) for ch in data.get("chapters", []))
-            log.info(f"✅ Structuration : {chapters} chapitres, {sections} sections ({elapsed:.1f}s)")
-            return data
-
-        except json.JSONDecodeError as exc:
-            log.error(f"❌ JSON invalide : {exc}")
-            raise
-        except Exception as exc:
-            log.error(f"❌ GPT erreur : {exc}")
-            raise
+        key_list = keywords.get(subject, keywords["general"])
+        
+        for keyword in key_list:
+            if keyword.lower() in text.lower():
+                concepts.append({
+                    "term": keyword,
+                    "definition": f"Terme trouvé dans le contenu",
+                    "example": "Voir le texte du cours",
+                    "type": "keyword",
+                })
+        
+        return concepts[:5]  # Max 5 concepts par section
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -296,63 +332,112 @@ class CourseBuilder:
     """
     Pipeline complet : fichier/dossier → cours présentable par l'IA.
 
-    Pour le cours Data Mining :
+    Exemple d'usage :
         builder = CourseBuilder()
-        # Charger tous les chapitres ch1..ch7
-        courses = await builder.build_dm_course("C:/Users/Admin/.../courses/dm")
-
-    Pour un fichier unique :
-        course_data = await builder.build_from_file("ch1.pdf", language="en")
+        course_data = await builder.build_from_file("mon_fichier.pdf", language="en")
     """
 
     def __init__(self):
         self.extractor  = TextExtractor()
-        self.structurer = GPTStructurer()
+        self.structurer = LocalStructurer()
 
-    # ── Pipeline Data Mining complet ──────────────────────────────────
-    async def build_dm_course(
+    @staticmethod
+    def _course_slug(value: str | None, fallback: str = DEFAULT_COURSE) -> str:
+        candidate = (value or fallback).strip().lower()
+        candidate = re.sub(r"[^a-z0-9]+", "_", candidate)
+        candidate = candidate.strip("_")
+        return candidate or fallback
+
+    # ── Pipeline de cours complet ─────────────────────────────────────
+    async def build_course_chapters(
         self,
-        courses_dm_path: str,
+        domain: str = DEFAULT_DOMAIN,
+        course: str = DEFAULT_COURSE,
         language: str = "en",
+        auto_detect: bool = False,
+        sample_file: str | None = None,
     ) -> dict[int, dict]:
         """
-        Charge tous les chapitres DM (ch1..ch7) depuis courses/dm/.
+        Charge tous les chapitres d'un cours depuis courses/{domain}/{course}/.
         Retourne un dict {chapter_idx: course_data}.
 
+        Args:
+            domain: Nom du domaine (ex: "informatique")
+            course: Nom du cours (ex: "mathematiques")
+            language: Langue (ex: "fr", "en", "ar")
+            auto_detect: Si True, détecte automatiquement le domaine/cours depuis sample_file
+            sample_file: Chemin vers un fichier PDF pour auto-détection
+
         Structure attendue :
-            courses/dm/
-              ch1.pdf  (ou ch1/, Chapter_1.pdf, etc.)
-              ch2.pdf
+            courses/informatique/mathematiques/
+              Chapter 1.pdf
+              Chapter 2.pdf
               ...
-              ch7.pdf
+              Chapter N.pdf
+
+        Exemples :
+            # Spécifique
+            chapters = await builder.build_course_chapters("informatique", "mathematiques", "fr")
+            
+            # Auto-détection depuis un PDF
+            chapters = await builder.build_course_chapters(
+                auto_detect=True, 
+                sample_file="Chapter 1.pdf",
+                language="fr"
+            )
         """
-        dm_path = Path(courses_dm_path)
-        if not dm_path.exists():
-            raise FileNotFoundError(f"Dossier introuvable : {dm_path}")
+        # Auto-détection si activée
+        if auto_detect and sample_file:
+            log.info(f"🔍 Auto-détection du domaine/cours depuis : {sample_file}")
+            try:
+                from domains_config import auto_detect_course
+                domain, course = auto_detect_course(sample_file)
+                log.info(f"✅ Détecté : {domain} / {course}")
+            except Exception as e:
+                log.info(f"ℹ️  Auto-détection échouée : {e}. Utilisation valeurs par défaut.")
+                domain = DEFAULT_DOMAIN
+                course = DEFAULT_COURSE
+        
+        # Vérifier que le cours existe vraiment dans le dossier du domaine
+        available_courses = get_courses(domain)
+        if course not in available_courses:
+            raise ValueError(
+                f"Cours '{course}' introuvable dans '{domain}'. "
+                f"Disponibles : {available_courses}"
+            )
+
+        # Construire le chemin
+        course_path = Path("courses") / domain / course
+        if not course_path.exists():
+            raise FileNotFoundError(f"Dossier introuvable : {course_path}")
 
         log.info(f"\n{'='*60}")
-        log.info(f"📚 Construction DM : {dm_path}")
+        log.info(f"📚 Construction {domain.upper()} / {course.upper()}")
+        log.info(f"📂 Chemin : {course_path}")
         log.info(f"{'='*60}")
 
         results: dict[int, dict] = {}
 
-        for ch_idx, ch_title in DM_CHAPTERS.items():
-            file_path = self._find_chapter_file(dm_path, ch_idx)
+        # Récupérer les chapitres configurés pour ce cours
+        chapters = get_chapters(domain, course)
+
+        for ch_idx, ch_title in chapters.items():
+            file_path = self._find_chapter_file(course_path, ch_idx)
             if not file_path:
-                log.warning(f"⚠️  Chapitre {ch_idx} introuvable, ignoré")
+                log.info(f"ℹ️  Chapitre {ch_idx} introuvable, ignoré")
                 continue
 
             log.info(f"\n📖 Ch{ch_idx} — {ch_title} : {file_path.name}")
             try:
                 course_data = await self._build_chapter(
-                    file_path, ch_idx, ch_title, language
+                    file_path, ch_idx, ch_title, language, domain=domain, subject=course
                 )
                 results[ch_idx] = course_data
                 log.info(f"  ✅ Ch{ch_idx} structuré")
             except Exception as exc:
                 log.error(f"  ❌ Ch{ch_idx} échoué : {exc}")
 
-        log.info(f"\n✅ DM Course prêt : {len(results)}/7 chapitres chargés")
+        log.info(f"\n✅ Cours {course} prêt : {len(results)}/{len(chapters)} chapitres chargés")
         return results
 
     async def _build_chapter(
@@ -361,8 +446,22 @@ class CourseBuilder:
         chapter_idx: int,
         chapter_title: str,
         language: str,
+        domain: str = DEFAULT_DOMAIN,
+        subject: str = DEFAULT_COURSE,
     ) -> dict:
-        """Construit un chapitre DM depuis un fichier."""
+        """Construit un chapitre depuis un fichier."""
+        
+        # 🎨 Générer les PNG (images visuelles du cours)
+        course_dir = Path("media/slides") / domain / subject
+        chapter_dir = course_dir / f"chapter_{chapter_idx}"
+        chapter_dir.mkdir(parents=True, exist_ok=True)
+        
+        png_paths = self.structurer._pdf_to_images(
+            str(file_path),
+            str(chapter_dir)
+        )
+        log.info(f"  📸 {len(png_paths)} PNG générées → {chapter_dir}")
+        
         # Extraction spéciale PPTX (slide par slide)
         if file_path.suffix.lower() == ".pptx":
             slides = self.extractor.extract_structured_pptx(str(file_path))
@@ -381,33 +480,33 @@ class CourseBuilder:
             language=language,
             level="université",
             title=f"Chapter {chapter_idx}: {chapter_title}",
-            subject="data_mining",
+            subject=subject,
             chapter_idx=chapter_idx,
         )
         course_data["chapter_idx"]   = chapter_idx
         course_data["chapter_title"] = chapter_title
         course_data["file_path"]     = str(file_path)
+        course_data["slides"]        = [f"/media/slides/{domain}/{subject}/chapter_{chapter_idx}/page_{i+1:03d}.png" for i in range(len(png_paths))]
         return course_data
 
-    def _find_chapter_file(self, dm_path: Path, ch_idx: int) -> Path | None:
-        """Trouve le fichier d'un chapitre dans le dossier DM."""
+    def _find_chapter_file(self, course_path: Path, ch_idx: int) -> Path | None:
+        """Trouve le fichier d'un chapitre dans le dossier du cours."""
         patterns = [
             f"ch{ch_idx}.pdf", f"ch{ch_idx}.pptx", f"ch{ch_idx}.docx",
             f"CH{ch_idx}.pdf", f"CH{ch_idx}.pptx",
             f"chapter_{ch_idx}.pdf", f"chapter_{ch_idx}.pptx",
             f"Chapter_{ch_idx}.pdf", f"Chapter_{ch_idx}.pptx",
             f"Chapter{ch_idx}.pdf",
-            f"DM_ch{ch_idx}.pdf", f"dm_ch{ch_idx}.pdf",
         ]
         # Fichiers directs
         for p in patterns:
-            fp = dm_path / p
+            fp = course_path / p
             if fp.exists():
                 return fp
 
         # Sous-dossier
         for sub in [f"ch{ch_idx}", f"CH{ch_idx}", f"chapter_{ch_idx}", f"Chapter_{ch_idx}"]:
-            sub_path = dm_path / sub
+            sub_path = course_path / sub
             if sub_path.is_dir():
                 for ext in ["*.pdf", "*.pptx", "*.docx"]:
                     files = list(sub_path.glob(ext))
@@ -415,7 +514,7 @@ class CourseBuilder:
                         return files[0]
 
         # Chercher par numéro dans le nom
-        for f in dm_path.iterdir():
+        for f in course_path.iterdir():
             name = f.name.lower()
             if (f"ch{ch_idx}" in name or f"chapter{ch_idx}" in name or
                 f"_{ch_idx}." in name or f"{ch_idx}." in name) and \
@@ -430,7 +529,8 @@ class CourseBuilder:
         file_path: str,
         language:  str = "en",
         level:     str = "université",
-        subject:   str = "data_mining",
+        subject:   str = "",
+        domain:    str = DEFAULT_DOMAIN,  # 🎯 Domaine (général, informatique, etc.)
     ) -> dict:
         path = Path(file_path)
         if not path.exists():
@@ -439,6 +539,19 @@ class CourseBuilder:
         log.info(f"\n{'='*60}")
         log.info(f"📚 Construction : {path.name}")
         log.info(f"{'='*60}")
+
+        course_slug = self._course_slug(subject, path.stem)
+
+        # 🎨 Générer les PNG (images visuelles du cours)
+        course_dir = Path("media/slides") / domain / course_slug
+        chapter_dir = course_dir / "chapter_1"
+        chapter_dir.mkdir(parents=True, exist_ok=True)
+        
+        png_paths = self.structurer._pdf_to_images(
+            file_path,
+            str(chapter_dir)
+        )
+        log.info(f"  📸 {len(png_paths)} PNG générées → {chapter_dir}")
 
         raw_text = self.extractor.extract(file_path)
         log.info(f"   ✅ {len(raw_text)} caractères extraits")
@@ -451,33 +564,171 @@ class CourseBuilder:
             language=language,
             level=level,
             title=path.stem.replace("_", " ").replace("-", " ").title(),
-            subject=subject,
+            subject=course_slug,
         )
         course_data["file_path"] = str(file_path)
+        course_data["subject"] = course_slug
+        course_data["slides"] = [f"/media/slides/{domain}/{course_slug}/chapter_1/page_{i+1:03d}.png" for i in range(len(png_paths))]
         self._print_summary(course_data)
         return course_data
+
+    async def build_from_file_direct(
+        self,
+        file_path: str,
+        language: str = "en",
+        level: str = "université",
+        subject: str = "",
+        domain: str = DEFAULT_DOMAIN,
+    ) -> dict:
+        """
+        Construit un cours directement depuis le fichier, sans génération IA.
+        - PPTX : 1 slide = 1 section (structure conservée)
+        - PDF  : 1 page  = 1 section (ordre exact conservé)
+        - DOCX/TXT/MD : sections extraites par heuristique sur les titres
+        """
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Fichier introuvable : {file_path}")
+
+        course_slug = self._course_slug(subject, path.stem)
+
+        log.info(f"\n{'='*60}")
+        log.info(f"📚 Construction directe (sans IA) : {path.name}")
+        log.info(f"{'='*60}")
+
+        sections: list[dict] = []
+        ext = path.suffix.lower()
+        slides: list[str] = []
+
+        if ext == ".pdf":
+            course_dir = Path("media/slides") / domain / course_slug
+            chapter_dir = course_dir / "chapter_1"
+            chapter_dir.mkdir(parents=True, exist_ok=True)
+
+            png_paths = self.structurer._pdf_to_images(str(path), str(chapter_dir))
+            slides = [
+                f"/media/slides/{domain}/{course_slug}/chapter_1/page_{i+1:03d}.png"
+                for i in range(len(png_paths))
+            ]
+
+            pages = self._extract_pdf_pages(str(path))
+            for page_idx, page_text in pages:
+                content = (page_text or "").strip()
+                if not content:
+                    continue
+
+                first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
+                title = first_line[:80] if first_line else f"Page {page_idx}"
+                sections.append({
+                    "title": title,
+                    "order": page_idx,
+                    "page_index": page_idx,
+                    "content": content,
+                    "duration_s": self._estimate_duration(content),
+                    "concepts": [],
+                    "image_url": slides[page_idx - 1] if page_idx - 1 < len(slides) else "",
+                })
+        elif ext == ".pptx":
+            slides_data = self.extractor.extract_structured_pptx(str(path))
+            for i, s in enumerate(slides_data, start=1):
+                title = (s.get("title") or f"Slide {i}").strip()
+                content = (s.get("content") or "").strip()
+                if not content:
+                    continue
+                sections.append({
+                    "title": title,
+                    "order": i,
+                    "page_index": i,
+                    "content": content,
+                    "duration_s": self._estimate_duration(content),
+                    "concepts": [],
+                    "image_url": "",
+                })
+        else:
+            raw_text = self.extractor.extract(str(path)).strip()
+            if len(raw_text) < 30:
+                raise ValueError(f"Texte trop court : {len(raw_text)} chars")
+
+            chunks = self._split_text_into_sections(raw_text)
+            for i, chunk in enumerate(chunks, start=1):
+                title, content = chunk
+                if not content.strip():
+                    continue
+                sections.append({
+                    "title": title or f"Section {i}",
+                    "order": i,
+                    "page_index": i,
+                    "content": content.strip(),
+                    "duration_s": self._estimate_duration(content),
+                    "concepts": [],
+                    "image_url": "",
+                })
+
+        if not sections:
+            raise ValueError("Impossible d'extraire des sections depuis ce fichier")
+
+        course_data = {
+            "title": path.stem.replace("_", " ").replace("-", " ").title(),
+            "subject": course_slug,
+            "language": language,
+            "level": level,
+            "description": "Cours importé directement (sans génération IA)",
+            "chapters": [
+                {
+                    "title": "Chapitre 1",
+                    "order": 1,
+                    "summary": "Import direct du document original",
+                    "sections": sections,
+                }
+            ],
+            "file_path": str(path),
+            "slides": slides,
+        }
+
+        self._print_summary(course_data)
+        return course_data
+
+    def _extract_pdf_pages(self, path: str) -> list[tuple[int, str]]:
+        """Extrait le texte page par page pour conserver l'ordre exact du PDF."""
+        try:
+            import pypdf
+            out: list[tuple[int, str]] = []
+            with open(path, "rb") as f:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", module=r"pypdf\.generic\._base")
+                    reader = pypdf.PdfReader(f, strict=False)
+                    for i, page in enumerate(reader.pages, start=1):
+                        out.append((i, (page.extract_text() or "").strip()))
+            return out
+        except ImportError as exc:
+            raise ImportError("Installez pypdf : pip install pypdf") from exc
 
     async def build_from_text(
         self,
         text:     str,
-        title:    str = "Data Mining Course",
+        title:    str = "Imported Course",
         language: str = "en",
         level:    str = "université",
-        subject:  str = "data_mining",
+        subject:  str = "",
     ) -> dict:
         log.info(f"📝 Construction depuis texte : {len(text)} chars")
+        course_slug = self._course_slug(subject, title)
         return await self.structurer.structure(
-            raw_text=text, language=language, level=level,
-            title=title, subject=subject,
+            raw_text=text,
+            language=language,
+            level=level,
+            title=title,
+            subject=course_slug,
         )
 
-    async def save_to_database(self, course_data: dict, db) -> str:
+    async def save_to_database(self, course_data: dict, db, domain: str = DEFAULT_DOMAIN) -> str:
         from database.models import Course, Chapter, Section, Concept
         log.info("💾 Sauvegarde PostgreSQL…")
 
         course = Course(
-            title=course_data.get("title", "Data Mining"),
-            subject=course_data.get("subject", "data_mining"),
+            title=course_data.get("title", "Cours importé"),
+            domain=domain,  # 🎯 Stocker le domaine
+            subject=course_data.get("subject", DEFAULT_COURSE),
             language=course_data.get("language", "en"),
             level=course_data.get("level", "université"),
             description=course_data.get("description", ""),
@@ -485,6 +736,8 @@ class CourseBuilder:
         )
         db.add(course)
         await db.flush()
+
+        slides = course_data.get("slides", [])  # 🎨 Récupérer les PNG paths
 
         for ch_data in course_data.get("chapters", []):
             chapter = Chapter(
@@ -496,12 +749,28 @@ class CourseBuilder:
             db.add(chapter)
             await db.flush()
 
-            for sec_data in ch_data.get("sections", []):
+            for i, sec_data in enumerate(ch_data.get("sections", [])):
+                # 🎨 Préserver le lien exact entre la section et sa slide PNG.
+                section_order = sec_data.get("page_index") or sec_data.get("order") or (i + 1)
+                image_url = (sec_data.get("image_url") or "").strip()
+
+                if not image_url and section_order:
+                    slide_index = int(section_order) - 1
+                    if 0 <= slide_index < len(slides):
+                        image_url = slides[slide_index]
+
+                if not image_url and i < len(slides):
+                    image_url = slides[i]
+
+                image_urls = sec_data.get("image_urls") or ([] if not image_url else [image_url])
+                
                 section = Section(
                     chapter_id=chapter.id,
                     title=sec_data["title"],
-                    order=sec_data.get("order", 0),
+                    order=section_order,
                     content=sec_data.get("content", ""),
+                    image_url=image_url,  # 🎨 PNG path de cette slide
+                    image_urls=image_urls,
                     duration_s=sec_data.get("duration_s", 120),
                 )
                 db.add(section)
@@ -521,6 +790,64 @@ class CourseBuilder:
         course_id = str(course.id)
         log.info(f"✅ Cours sauvegardé : ID={course_id}")
         return course_id
+
+    def _estimate_duration(self, text: str) -> int:
+        """Estime une durée de lecture (en secondes) selon le nombre de mots."""
+        words = len((text or "").split())
+        # ~130 mots/minute avec bornes raisonnables
+        return max(30, min(600, int((words / 130.0) * 60)))
+
+    def _split_text_into_sections(self, raw_text: str) -> list[tuple[str, str]]:
+        """
+        Découpe un texte brut en sections à partir des lignes de titre probables.
+        Retourne [(title, content), ...].
+        """
+        lines = [ln.rstrip() for ln in raw_text.splitlines()]
+        cleaned = [ln for ln in lines if ln.strip()]
+        if not cleaned:
+            return []
+
+        title_re = re.compile(
+            r"^(?:chapter|chapitre|section|part|partie|module|lesson|lecon)\s*[0-9ivx\-:. ]+.*$",
+            re.IGNORECASE,
+        )
+        numbered_re = re.compile(r"^[0-9]+(?:\.[0-9]+)*[\)\.]?\s+.+$")
+
+        sections: list[tuple[str, list[str]]] = []
+        current_title = "Introduction"
+        current_lines: list[str] = []
+
+        for ln in cleaned:
+            is_short = len(ln) <= 120
+            is_upper = ln.isupper() and len(ln) >= 4
+            is_title = is_short and (title_re.match(ln) or numbered_re.match(ln) or is_upper)
+
+            if is_title and current_lines:
+                sections.append((current_title, current_lines))
+                current_title = ln.strip()
+                current_lines = []
+            elif is_title and not current_lines and current_title == "Introduction":
+                current_title = ln.strip()
+            else:
+                current_lines.append(ln)
+
+        if current_lines:
+            sections.append((current_title, current_lines))
+
+        if not sections:
+            text = "\n".join(cleaned)
+            return [("Contenu", text)]
+
+        out: list[tuple[str, str]] = []
+        for title, body_lines in sections:
+            content = "\n".join(body_lines).strip()
+            if content:
+                out.append((title.strip() or "Section", content))
+
+        if not out:
+            text = "\n".join(cleaned)
+            return [("Contenu", text)]
+        return out
 
     def _print_summary(self, data: dict) -> None:
         chapters = data.get("chapters", [])
