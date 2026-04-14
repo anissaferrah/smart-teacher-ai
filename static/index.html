@@ -264,6 +264,7 @@ let recStartTs=0;
 let savedChI=null,savedSI=null;
 let pendingCourseResume=false;
 let voiceDetected=false;  // ← NOUVEAU: pour tracker si voix a été détectée
+let teacherStreamMsg=null;
 
 function initWF(){const wf=document.getElementById('wf');wf.innerHTML=Array.from({length:NB},(_,i)=>`<div class="wb" id="wb${i}" style="height:4px"></div>`).join('');}
 function animWF(s){clearInterval(wInt);const bs=Array.from({length:NB},(_,i)=>document.getElementById(`wb${i}`));if(!bs[0])return;const labels={off:'En attente',speaking:'Professeur parle',listening:'En ecoute',processing:'Traitement...'};document.getElementById('wlbl').textContent=labels[s]||'En attente';bs.forEach(b=>b.classList.toggle('a',s!=='off'));if(s==='off'){bs.forEach(b=>b.style.height='4px');return;}wInt=setInterval(()=>{bs.forEach((b,i)=>{const h=s==='speaking'?8+Math.sin(Date.now()/200+i*.4)*14+Math.random()*5:s==='listening'?4+Math.random()*18:4+Math.abs(Math.sin(Date.now()/400+i*.5))*8;b.style.height=Math.max(4,h)+'px';});},80);}
@@ -282,6 +283,18 @@ let lastStateMain=null;
 // ━━━ CRITICAL: Define sw() early for inline onclick handlers ━━━
 let activeP='course';
 function sw(n){activeP=n;document.querySelectorAll('.nav-tab').forEach((t,i)=>t.classList.toggle('active',['course','library','qa'][i]===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');}
+function activeChat(){
+  const courseChat=document.getElementById('cChat');
+  const qaChat=document.getElementById('qaM');
+  if(activeP==='qa') return qaChat || courseChat;
+  return courseChat || qaChat;
+}
+function ensureChatVisible(){
+  const col=document.getElementById('chatCol');
+  if(col && col.classList.contains('collapsed')){
+    col.classList.remove('collapsed');
+  }
+}
 let finalMetrics=null;
 let questionMetrics=null;
 let presentationMetrics=null;
@@ -316,15 +329,16 @@ function handle(m){
       // SHOW TYPING INDICATOR WITH STREAMING REASONING LOGS
       if(lastStateMain!==m.state){
         lastStateMain=m.state;
-        if(m.state==='PROCESSING' || m.state==='RESPONDING'){
+        if(m.state==='PROCESSING' || m.state==='RESPONDING' || m.state==='PRESENTING'){
           // ✅ Create reasoning display container
           const msgDiv=document.createElement('div');
           msgDiv.className='msg msg-sys reasoning-display';
           msgDiv.id='typing-indicator';
+          const title=m.state==='PRESENTING' ? '📚 Presentation Process...' : '🤖 Reasoning Process...';
           msgDiv.innerHTML=`<div class="reasoning-header">
             <span class="typing-dots">
               <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-            </span> 🤖 Reasoning Process...
+            </span> ${title}
           </div>
           <div class="reasoning-steps" id="reasoning-steps"></div>`;
           chat.appendChild(msgDiv);
@@ -361,16 +375,8 @@ function handle(m){
     }
   else if(m.type==='stream_end'){
     slideStreamFinished=true;
-    // ✅ DISPLAY PRESENTATION METRICS WHEN STREAM ENDS
-    if(presentationMetrics && Object.keys(presentationMetrics).length>0 && activeP==='course'){
-      let pMetricLines=['📊 Presentation Metrics:'];
-      if(presentationMetrics.tts_time) pMetricLines.push(`   🎙️ TTS: ${presentationMetrics.tts_time.toFixed(2)}s`);
-      if(presentationMetrics.audio_duration!==undefined) pMetricLines.push(`   🔉 Duration: ${presentationMetrics.audio_duration.toFixed(1)}s`);
-      if(presentationMetrics.tts_chunks) pMetricLines.push(`   📦 Chunks: ${presentationMetrics.tts_chunks}`);
-      if(presentationMetrics.total_time) pMetricLines.push(`   ⏱️ Total: ${presentationMetrics.total_time.toFixed(2)}s`);
-      addM(document.getElementById('cChat'), pMetricLines.join('\n'), 'sys');
-      presentationMetrics=null;
-    }
+    teacherStreamMsg=null;
+    pendAns=null;
     if(!curAud&&audioQueue.length===0)handleCourseAudioEnded();
   }
   else if(m.type==='transcription'){
@@ -386,33 +392,47 @@ function handle(m){
       questionMetrics=null;
     }
     // ✅ PUIS AFFICHER LA TRANSCRIPTION
-    addM(activeChat(),m.text,'s',`VOICE ${(m.lang||'').toUpperCase()}`);
+    const chatDiv=teacherStreamMsg?.parentElement||activeChat();
+    const questionMsg=addM(chatDiv,m.text,'s',`VOICE ${(m.lang||'').toUpperCase()}`);
+    if(teacherStreamMsg && teacherStreamMsg.parentElement===chatDiv){
+      chatDiv.insertBefore(questionMsg, teacherStreamMsg);
+    }
   }
   else if(m.type==='answer_text'){
-    // ✅ CORRIGER: Afficher le texte IMMÉDIATEMENT, pas en attente de l'audio
-    pendAns={text:m.text,subject:m.subject};
-    
-    // ✅ RETIRER LE TYPING INDICATOR
-    const typingEl=document.getElementById('typing-indicator');
-    if(typingEl)typingEl.remove();
-    
-    // ✅ AFFICHER RÉPONSE PROFESSEUR TOUT DE SUITE
-    addM(activeChat(),pendAns.text,'t','Teacher');
-  }
-  else if(m.type==='audio_chunk'){if(interruptedStreamId!==null&&m.stream_id===interruptedStreamId){if(m.final)interruptedStreamId=null;return;}bufAud(m.data,m.mime,m.final,m.stream_id);if(m.final&&pendAns){
-    // ✅ AFFICHER METRICS EN UNE SEULE LIGNE EN DESSOUS (quand audio fini)
-    if(finalMetrics){
-      const sttTime=finalMetrics.stt_time ? finalMetrics.stt_time.toFixed(2)+'s' : '...';
-      const ragTime=finalMetrics.retrieval_time ? finalMetrics.retrieval_time.toFixed(3)+'s' : '...';
-      const llmTime=finalMetrics.llm_time ? finalMetrics.llm_time.toFixed(2)+'s' : '...';
-      const ttsTime=finalMetrics.tts_time ? finalMetrics.tts_time.toFixed(2)+'s' : '...';
-      const metricsLine=`🎤 STT: ${sttTime} 🔍 RAG: ${ragTime} 🧠 LLM: ${llmTime} 🎙️ TTS: ${ttsTime}`;
-      addM(activeChat(), metricsLine, 'sys');
-      finalMetrics=null;
+    console.log('✅ answer_text reçu:', m.text);
+    try {
+      ensureChatVisible();
+      const chatDiv = teacherStreamMsg?.parentElement||activeChat();
+      console.log('activeChat():', chatDiv);
+      if(chatDiv && addM){
+        const isPartial=!!m.partial;
+        const isFinal=!!m.final || !m.partial;
+
+        // ✅ RETIRER LE TYPING INDICATOR
+        const typingEl=document.getElementById('typing-indicator');
+        if(typingEl)typingEl.remove();
+
+        // ✅ Un seul message Teacher par tour, mis à jour pendant le streaming
+        if(teacherStreamMsg && teacherStreamMsg.parentElement!==chatDiv){
+          teacherStreamMsg=null;
+        }
+        if(!teacherStreamMsg){
+          teacherStreamMsg=addM(chatDiv, m.text, 't', 'Teacher');
+        } else {
+          const textNode=teacherStreamMsg.lastElementChild;
+          if(textNode) textNode.textContent=m.text;
+        }
+
+        pendAns={text:m.text,subject:m.subject,partial:isPartial,final:isFinal};
+        console.log('✅ Réponse affichée / mise à jour');
+      } else {
+        console.error('❌ activeChat ou addM missing:', {chatDiv, addM: typeof addM});
+      }
+    } catch(e){
+      console.error('❌ Erreur affichage réponse:', e);
     }
-    pendAns=null;
   }
-  }
+  else if(m.type==='audio_chunk'){if(interruptedStreamId!==null&&m.stream_id===interruptedStreamId){if(m.final)interruptedStreamId=null;return;}bufAud(m.data,m.mime,m.final,m.stream_id);if(m.final){pendAns=null;}}
   else if(m.type==='audio_interrupted'){
     // ✅ RETIRER LE TYPING INDICATOR
     const typingEl=document.getElementById('typing-indicator');
@@ -438,7 +458,7 @@ function getIcon(s){return{math:'🔢',biology:'🧬',physics:'⚛️',chemistry
 
 async function startCourse(id){try{const r=await fetch(`/course/${id}/structure`);if(!r.ok)throw new Error('Cours introuvable');cCourse=await r.json();cCourseId=id;chI=0;sI=0;paused=false;syncPauseBtn();document.getElementById('sct').textContent=cCourse.title;document.getElementById('sch').textContent=cCourse.chapters?.[0]?.title||'—';document.getElementById('spf').style.width='0%';['prevBtn','pauseBtn','nextBtn','micCBtn','autoPlayBtn','explainBtn'].forEach(i=>document.getElementById(i).disabled=false);sw('course');document.getElementById('courseSelector').style.display='none';startSess(cCourse.language||'fr',cCourse.level||'lycée');addM(document.getElementById('cChat'),`Cours chargé : ${cCourse.title}. Présentation…`,'sys');setTimeout(()=>presentSec(),600);}catch(e){alert('Erreur : '+e.message);}}
 
-function presentSec(){if(!cCourse||paused)return;const ch=cCourse.chapters?.[chI];const sec=ch?.sections?.[sI];if(!ch||!sec){addM(document.getElementById('cChat'),'🎉 Cours terminé !','sys');return;}activeSlideRequestId=crypto.randomUUID();resetSlidePresentationState();const globalIdx=(cCourse.chapters?.slice(0,chI).reduce((sum,c)=>sum+c.sections.length,0)||0)+sI;activeSlideKey=`${cCourseId||cCourse?.id||''}:${chI}:${sI}`;renderDefSlide(sec,ch,globalIdx,sec.image_url||'',sec.image_url?'image':'section');updateNav();const btn=document.getElementById('explainBtn');if(btn)btn.disabled=false;if(autoPlay)queueAutoNarration();}
+function presentSec(forceResume=false){if(!cCourse||paused)return;const ch=cCourse.chapters?.[chI];const sec=ch?.sections?.[sI];if(!ch||!sec){addM(document.getElementById('cChat'),'🎉 Cours terminé !','sys');return;}activeSlideRequestId=crypto.randomUUID();if(forceResume){clearSlideTimers();}else{resetSlidePresentationState();}const globalIdx=(cCourse.chapters?.slice(0,chI).reduce((sum,c)=>sum+c.sections.length,0)||0)+sI;activeSlideKey=`${cCourseId||cCourse?.id||''}:${chI}:${sI}`;renderDefSlide(sec,ch,globalIdx,sec.image_url||'',sec.image_url?'image':'section');updateNav();const btn=document.getElementById('explainBtn');if(btn)btn.disabled=false;if(forceResume){sendCurrentSlidePresentation(true);return;}if(autoPlay)queueAutoNarration();}
 
 function buildScript(sec){let s=sec.content||'';if(sec.concepts?.length){s+=' À retenir : ';sec.concepts.forEach(c=>{s+=`${c.term} : ${c.definition}. `;if(c.example)s+=`Par exemple : ${c.example}. `;});}return s;}
 
@@ -446,13 +466,13 @@ function updateNav(){const ch=cCourse?.chapters?.[chI];const tot=cCourse?.chapte
 
 function syncPauseBtn(){const btn=document.getElementById('pauseBtn');if(!btn)return;if(paused){btn.textContent='▶ Reprendre';btn.style.background='var(--accent2)';btn.style.color='#000';}else{btn.textContent='⏸ Pause';btn.style.background='';btn.style.color='';}}
 
-function handleNavCommand(m){const action=m.action||m.command||'';const chat=document.getElementById('cChat');if(!action)return;if(activeP!=='course')sw('course');if(!cCourse){addM(chat,`Commande reçue: ${action}`,'sys');return;}const playCurrent=()=>{paused=false;syncPauseBtn();setTimeout(()=>presentSec(),250);};if(action==='next_section'){const ch=cCourse.chapters?.[chI];if(!ch)return;if(sI<ch.sections.length-1)sI++;else if(chI<cCourse.chapters.length-1){chI++;sI=0;}else{addM(chat,'Fin du cours.','sys');return;}addM(chat,'Section suivante...','sys');playCurrent();return;}if(action==='prev_section'){if(sI>0)sI--;else if(chI>0){chI--;sI=cCourse.chapters[chI].sections.length-1;}addM(chat,'Section précédente...','sys');playCurrent();return;}if(action==='next_chapter'){if(chI<cCourse.chapters.length-1){chI++;sI=0;addM(chat,'Chapitre suivant...','sys');playCurrent();}return;}if(action==='prev_chapter'){if(chI>0){chI--;sI=0;addM(chat,'Chapitre précédent...','sys');playCurrent();}return;}if(action==='goto_chapter'){const target=(Number(m.chapter_idx)||1)-1;chI=Math.max(0,Math.min((cCourse.chapters?.length||1)-1,target));sI=0;addM(chat,`Aller au chapitre ${chI+1}...`,'sys');playCurrent();return;}if(action==='repeat_current'){addM(chat,'Je répète cette section...','sys');playCurrent();return;}if(action==='pause_course'){paused=true;syncPauseBtn();stopAud();addM(chat,'Cours en pause.','sys');return;}if(action==='resume_course'){paused=false;syncPauseBtn();addM(chat,'Reprise du cours...','sys');setTimeout(()=>presentSec(),250);return;}}
+function handleNavCommand(m){const action=m.action||m.command||'';const chat=document.getElementById('cChat');if(!action)return;if(activeP!=='course')sw('course');if(!cCourse){addM(chat,`Commande reçue: ${action}`,'sys');return;}const playCurrent=()=>{paused=false;syncPauseBtn();setTimeout(()=>presentSec(),250);};if(action==='next_section'){const ch=cCourse.chapters?.[chI];if(!ch)return;if(sI<ch.sections.length-1)sI++;else if(chI<cCourse.chapters.length-1){chI++;sI=0;}else{addM(chat,'Fin du cours.','sys');return;}addM(chat,'Section suivante...','sys');playCurrent();return;}if(action==='prev_section'){if(sI>0)sI--;else if(chI>0){chI--;sI=cCourse.chapters[chI].sections.length-1;}addM(chat,'Section précédente...','sys');playCurrent();return;}if(action==='next_chapter'){if(chI<cCourse.chapters.length-1){chI++;sI=0;addM(chat,'Chapitre suivant...','sys');playCurrent();}return;}if(action==='prev_chapter'){if(chI>0){chI--;sI=0;addM(chat,'Chapitre précédent...','sys');playCurrent();}return;}if(action==='goto_chapter'){const target=(Number(m.chapter_idx)||1)-1;chI=Math.max(0,Math.min((cCourse.chapters?.length||1)-1,target));sI=0;addM(chat,`Aller au chapitre ${chI+1}...`,'sys');playCurrent();return;}if(action==='repeat_current'){addM(chat,'Je répète cette section...','sys');playCurrent();return;}if(action==='pause_course'){paused=true;syncPauseBtn();clearSlideTimers();stopAud();addM(chat,'Cours en pause.','sys');return;}if(action==='resume_course'){paused=false;syncPauseBtn();addM(chat,'Reprise du cours...','sys');setTimeout(()=>presentSec(true),250);return;}}
 
 function nextSec(interrupt=true){clearSlideTimers();if(interrupt){stopAud();send({type:'interrupt'});}paused=false;syncPauseBtn();const ch=cCourse?.chapters?.[chI];if(!ch)return;if(sI<ch.sections.length-1)sI++;else if(chI<cCourse.chapters.length-1){chI++;sI=0;}else{addM(document.getElementById('cChat'),'Fin du cours.','sys');return;}addM(document.getElementById('cChat'),'Section suivante...','sys');presentSec();}
 
 function prevSec(interrupt=true){clearSlideTimers();if(interrupt){stopAud();send({type:'interrupt'});}paused=false;syncPauseBtn();if(sI>0)sI--;else if(chI>0){chI--;sI=cCourse.chapters[chI].sections.length-1;}addM(document.getElementById('cChat'),'Section précédente...','sys');presentSec();}
 
-function togglePause(){paused=!paused;clearSlideTimers();syncPauseBtn();if(paused){stopAud();send({type:'interrupt'});animWF('off');addM(document.getElementById('cChat'),'Pause.','sys');}else{addM(document.getElementById('cChat'),'Reprise...','sys');presentSec();}}
+function togglePause(){paused=!paused;clearSlideTimers();syncPauseBtn();if(paused){stopAud();send({type:'interrupt'});animWF('off');addM(document.getElementById('cChat'),'Pause.','sys');}else{addM(document.getElementById('cChat'),'Reprise...','sys');presentSec(true);}}
 
 async function toggleMicC(){recg?stopMic('micCBtn','cChat',true):await startMic('micCBtn','cChat',true);}
 async function toggleMicQA(){recg?stopMic('qaMic','qaM',false):await startMic('qaMic','qaM',false);}
@@ -523,9 +543,11 @@ function startSilenceWatcher(stream,btnId,chatId,isCourse){
 function stopSilenceWatcher(){if(silenceTimer){clearInterval(silenceTimer);silenceTimer=null;}silenceAnalyser=null;silenceData=null;silenceTimeData=null;if(silenceCtx){try{silenceCtx.close();}catch(e){}silenceCtx=null;}}
 
 function sendCT(){const inp=document.getElementById('cInput');const q=inp.value.trim();if(!q)return;inp.value='';savedChI=chI;savedSI=sI;clearSlideTimers();stopAud();if(recg)stopMic('micCBtn','cChat',true);  // ✅ STOP MICROPHONE if recording!
+const typingEl=document.getElementById('typing-indicator');if(typingEl)typingEl.remove();teacherStreamMsg=null;lastStateMain=null;lastSubstep=null;
 send({type:'interrupt'});paused=true;syncPauseBtn();startSess(cCourse?.language||'fr');addM(document.getElementById('cChat'),q,'s','Vous');send({type:'text',content:q,course_id:cCourseId||'',chapter_index:chI,section_index:sI,chapter:cCourse?.chapters?.[chI]?.title||'',section_title:curSlideTitle||'',slide_title:curSlideTitle||'',slide_content:curSlideText||'',slide_path:curSlidePath||'',image_url:curSlidePath||'',course_title:cCourse?.title||'',in_course:true});}
 
 async function sendQA(){const inp=document.getElementById('qaIn');const q=inp.value.trim();if(!q)return;inp.value='';if(recg)stopMic('qaMic','qaM',false);  // ✅ STOP MICROPHONE if recording!
+const typingEl=document.getElementById('typing-indicator');if(typingEl)typingEl.remove();teacherStreamMsg=null;lastStateMain=null;lastSubstep=null;
 if(cCourse){savedChI=chI;savedSI=sI;clearSlideTimers();stopAud();send({type:'interrupt'});paused=true;syncPauseBtn();}startSess('fr','lycee');addM(document.getElementById('qaM'),q,'s','Vous');send({type:'text',content:q,course_id:cCourseId||'',chapter_index:chI,section_index:sI,chapter:cCourse?.chapters?.[chI]?.title||'',section_title:curSlideTitle||'',slide_title:curSlideTitle||'',slide_content:curSlideText||'',slide_path:curSlidePath||'',image_url:curSlidePath||'',course_title:cCourse?.title||'',in_course:!!cCourse});}
 
 document.addEventListener('DOMContentLoaded',()=>{document.getElementById('cInput')?.addEventListener('keypress',e=>{if(e.key==='Enter')sendCT();});document.getElementById('qaIn')?.addEventListener('keypress',e=>{if(e.key==='Enter')sendQA();});});
@@ -618,12 +640,25 @@ function resumePendingCourse(){
     savedSI=null;
   }
   addM(document.getElementById('cChat'),'Reprise du cours...','sys');
-  setTimeout(()=>presentSec(),800);
+  setTimeout(()=>presentSec(true),800);
 }
 
 function playQueuedAudio(){
   if(curAud||!audioQueue.length){
     if(!curAud&&audioQueue.length===0){
+      if(finalMetrics){
+        const metricsParts=[];
+        if(finalMetrics.stt_time!=null) metricsParts.push(`🎤 STT: ${Number(finalMetrics.stt_time).toFixed(2)}s`);
+        if(finalMetrics.retrieval_time!=null) metricsParts.push(`🔍 RAG: ${Number(finalMetrics.retrieval_time).toFixed(3)}s`);
+        if(finalMetrics.llm_time!=null) metricsParts.push(`🧠 LLM: ${Number(finalMetrics.llm_time).toFixed(2)}s`);
+        if(finalMetrics.tts_time!=null) metricsParts.push(`🎙️ TTS gen: ${Number(finalMetrics.tts_time).toFixed(2)}s`);
+        if(finalMetrics.chunks!=null) metricsParts.push(`📚 Docs: ${finalMetrics.chunks}`);
+        if(finalMetrics.tokens!=null) metricsParts.push(`🔤 Tokens: ${finalMetrics.tokens}`);
+        if(finalMetrics.total_time!=null) metricsParts.push(`⏱️ Total: ${Number(finalMetrics.total_time).toFixed(2)}s`);
+        if(finalMetrics.confidence!=null) metricsParts.push(`🎯 Conf: ${Math.round(Number(finalMetrics.confidence)*100)}%`);
+        if(metricsParts.length) addM(activeChat(), metricsParts.join('  •  '), 'sys');
+        finalMetrics=null;
+      }
       if(pendingCourseResume){
         resumePendingCourse();
       }else if(slideStreamFinished){
@@ -664,10 +699,10 @@ function playQueuedAudio(){
   }
 }
 
-function sendCurrentSlidePresentation(){
+function sendCurrentSlidePresentation(forceResume=false){
   if(!cCourse||paused)return false;
-  if(slideNarrationSent&&!slideNarrationPlayed)return false;
-  if(autoPlay&&slideNarrationPlayed&&slideAdvanceTimer)return false;
+  if(!forceResume&&slideNarrationSent&&!slideNarrationPlayed)return false;
+  if(!forceResume&&autoPlay&&slideNarrationPlayed&&slideAdvanceTimer)return false;
 
   const ch=cCourse?.chapters?.[chI];
   const sec=ch?.sections?.[sI];
@@ -723,6 +758,17 @@ function sendCurrentSlidePresentation(){
 function handleCourseAudioEnded(){
   if(curAud||audioQueue.length)return;
   slideNarrationPlayed=true;
+  if(presentationMetrics){
+    let pMetricLines=['📊 Presentation Metrics:'];
+    if(presentationMetrics.llm_time!=null) pMetricLines.push(`   🧠 LLM: ${Number(presentationMetrics.llm_time).toFixed(2)}s`);
+    if(presentationMetrics.tts_time!=null) pMetricLines.push(`   🎙️ TTS gen: ${Number(presentationMetrics.tts_time).toFixed(2)}s`);
+    if(presentationMetrics.total_time!=null) pMetricLines.push(`   ⏱️ Total: ${Number(presentationMetrics.total_time).toFixed(2)}s`);
+    if(presentationMetrics.chunks!=null) pMetricLines.push(`   📚 Chunks: ${presentationMetrics.chunks}`);
+    if(presentationMetrics.tokens!=null) pMetricLines.push(`   🔤 Tokens: ${presentationMetrics.tokens}`);
+    if(presentationMetrics.sentences!=null) pMetricLines.push(`   📝 Sentences: ${presentationMetrics.sentences}`);
+    addM(document.getElementById('cChat'), pMetricLines.join('\n'), 'sys');
+    presentationMetrics=null;
+  }
   const btn=document.getElementById('explainBtn');
   if(btn)btn.disabled=false;
   animWF('off');

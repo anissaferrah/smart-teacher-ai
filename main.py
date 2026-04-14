@@ -1025,17 +1025,18 @@ Explain naturally. MAX 4 sentences."""
                 
                 current_stream_id += 1
                 stream_id = current_stream_id
-                full_answer = ""
-                transcription_sent = False
                 
                 async def on_text_chunk(sentence: str, full_response: str):
-                    nonlocal full_answer, transcription_sent
-                    full_answer = full_response
-                    
-                    # Send transcription only once
-                    if not transcription_sent:
-                        # Note: transcription extracted from STT in run_pipeline_streaming
-                        transcription_sent = True
+                    return
+
+                async def on_transcription(text: str, lang: str, confidence: float):
+                    if not await send({
+                        "type": "transcription",
+                        "text": text,
+                        "lang": lang,
+                        "confidence": confidence,
+                    }):
+                        log.warning(f"[{session_id[:8]}] ⚠️ Transcription non envoyée")
                 
                 async def on_state_change(substep: str, details: dict = None):
                     """✅ NOUVEAU: Callback pour les mises à jour d'état de la pipeline"""
@@ -1075,10 +1076,12 @@ Explain naturally. MAX 4 sentences."""
                     result = await run_pipeline_streaming(
                         audio_np, session_id, history,
                         on_text_chunk=on_text_chunk,
+                        on_transcription=on_transcription,
                         on_audio_chunk=on_audio_chunk,
                         on_state_change=on_state_change,  # ✅ NOUVEAU: State updates
                         force_language=course_lang,
                         course_id=course_id_for_rag,  # ✅ Scoped RAG retrieval
+                        ctx=ctx,
                         # ✅ Inject dependencies
                         transcriber=transcriber,
                         rag=rag,
@@ -1098,12 +1101,6 @@ Explain naturally. MAX 4 sentences."""
                         # Puis revenir à LISTENING via set_listening_state()
                         ctx = await dialogue.get_session(session_id) or ctx  # ✅ Refresh ctx
                         await set_listening_state()
-                        continue
-
-                    # Send transcription (extracted from STT)
-                    t = result["transcription"]
-                    if not await send({"type": "transcription", "text": t["text"],
-                                "lang": t["language"], "confidence": t["confidence"]}):
                         continue
 
                     # Transition → RESPONDING (now streaming)
@@ -1288,6 +1285,7 @@ Explain naturally. MAX 4 sentences."""
                         narration_text = current_presentation_text if reuse_cached and current_presentation_text else ""
                         if not narration_text:
                             llm_start = time.time()
+                            await send_state(DialogState.PRESENTING, "llm_thinking", {"type": "presentation"}, {"progress_pct": 20})
                             try:
                                 # ✅ Déterminer si c'est une reprise (pause/resume)
                                 is_resuming = resume_offset > 0 and reuse_cached
@@ -1314,6 +1312,16 @@ Explain naturally. MAX 4 sentences."""
                             narration_text = narration_text.strip()
                             current_presentation_text = narration_text
                             llm_time = time.time() - llm_start
+                            await send_state(
+                                DialogState.PRESENTING,
+                                "tts_generating",
+                                {"engine": "presentation"},
+                                {
+                                    "llm_time": round(llm_time, 2),
+                                    "tokens": len(narration_text.split()),
+                                    "progress_pct": 55,
+                                },
+                            )
                         else:
                             llm_time = 0.0
 
@@ -1338,6 +1346,16 @@ Explain naturally. MAX 4 sentences."""
                         current_stream_id += 1
                         stream_id = current_stream_id
                         sentences = split_sentences_with_spans(remaining_text)
+                        tts_total_time = 0.0
+                        await send_state(
+                            DialogState.PRESENTING,
+                            "tts_streaming",
+                            {"chunks": len(sentences)},
+                            {
+                                "tts_chunks": len(sentences),
+                                "progress_pct": 70,
+                            },
+                        )
                         for sentence, start, end in sentences:
                             if not sentence.strip():
                                 continue
@@ -1346,16 +1364,18 @@ Explain naturally. MAX 4 sentences."""
                                 return
 
                             try:
-                                audio_chunk, _, _, _, mime = await voice.generate_audio_async(
+                                audio_chunk, tts_piece_time, _, _, mime = await voice.generate_audio_async(
                                     sentence,
                                     language_code=lang_ps,
                                     rate=rate_override,
                                 )
                             except TypeError:
-                                audio_chunk, _, _, _, mime = await voice.generate_audio_async(
+                                audio_chunk, tts_piece_time, _, _, mime = await voice.generate_audio_async(
                                     sentence,
                                     language_code=lang_ps,
                                 )
+
+                            tts_total_time += tts_piece_time or 0.0
 
                             if audio_chunk:
                                 await _stream_audio(audio_chunk, mime, stream_id)
@@ -1369,6 +1389,21 @@ Explain naturally. MAX 4 sentences."""
                         current_presentation_cursor = len(narration_text)
                         if ctx:
                             await dialogue.save_position(ctx.session_id, current_presentation_cursor)
+
+                        await send_state(
+                            DialogState.PRESENTING,
+                            "response_complete",
+                            {},
+                            {
+                                "llm_time": round(llm_time, 2),
+                                "tts_time": round(tts_total_time, 2),
+                                "total_time": round(llm_time + tts_total_time, 2),
+                                "tokens": len(narration_text.split()),
+                                "words": len(narration_text.split()),
+                                "sentences": len(sentences),
+                                "progress_pct": 95,
+                            },
+                        )
 
                         if not await send({"type": "answer_text", "text": narration_text, "subject": "course", "final": True}):
                             return
@@ -1472,6 +1507,12 @@ Explain naturally. MAX 4 sentences."""
                     await send_state(DialogState.PRESENTING)
                     await send({"type": "resume_course"})
                     continue
+
+                # ✅ Priorité à la question: stopper immédiatement la présentation en cours
+                # pour éviter que la narration du cours continue pendant la réponse.
+                if presentation_task and not presentation_task.done():
+                    await cancel_presentation_task(notify_client=True)
+                await cancel_audio_stream(notify_client=True)
 
                 lang   = detect_lang_text(content)
                 subj   = detect_subject(content)
@@ -1655,10 +1696,25 @@ Explain naturally. MAX 4 sentences."""
 
                 if ctx:
                     await dialogue.transition(ctx.session_id, DialogState.RESPONDING)
-                await send_state(DialogState.RESPONDING, "", {}, {"progress_pct": 95})
+                response_metrics = {
+                    "retrieval_time": round(rag_time / 1000.0, 3),
+                    "chunks": len(chunks_with_scores),
+                    "document_score": round(avg_score, 2),
+                    "llm_time": round(llm_time, 2),
+                    "tts_time": round(tts_time, 2),
+                    "total_time": round((rag_time / 1000.0) + llm_time + tts_time, 2),
+                    "tokens": tokens_generated,
+                    "words": len(ai_response.split()),
+                    "sentences": chunk_count,
+                    "confidence": round(llm_confidence, 2),
+                    "progress_pct": 95,
+                }
+                await send_state(DialogState.RESPONDING, "", {}, response_metrics)
 
+                log.info(f"[{session_id[:8]}] 📤 Envoi answer_text: {len(ai_response)} chars | subj={subj}")
                 await send({"type": "answer_text", "text": ai_response,
                             "subject": subj, "rag_chunks": len(chunks_with_scores)})
+                log.info(f"[{session_id[:8]}] ✅ answer_text envoyé")
 
                 if audio_bytes:
                     await send({
@@ -1671,9 +1727,6 @@ Explain naturally. MAX 4 sentences."""
                 if ctx:
                     await dialogue.transition(ctx.session_id, DialogState.LISTENING)
                 await send_state(DialogState.LISTENING)
-
-                if is_in_course:
-                    await send({"type": "resume_course"})
 
                 # ── Analytics & Recherche ─────────────────────────────────
                 try:

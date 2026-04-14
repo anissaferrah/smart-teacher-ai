@@ -19,10 +19,12 @@ async def run_pipeline_streaming(
     session_id: str,
     history: list,
     on_text_chunk=None,
+    on_transcription=None,
     on_audio_chunk=None,
     on_state_change=None,  # ✅ NOUVEAU: Callback pour les mises à jour d'état
     force_language: str = None,
     course_id: str | None = None,
+    ctx=None,
     # Injected dependencies
     transcriber=None,
     rag=None,
@@ -56,6 +58,9 @@ async def run_pipeline_streaming(
         stt_time=stt_time,
         transcription_text=text,
     )
+
+    if on_transcription:
+        await on_transcription(text, lang, round(lang_prob, 2))
 
     # ── 2. Extraction prosodique (Couche #2) ───────────────────────────
     # ✅ NOUVEAU: Extraire hésitations, vitesse parole pour détecter confusion implicite
