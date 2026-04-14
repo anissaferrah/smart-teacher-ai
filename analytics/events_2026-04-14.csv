@@ -1,0 +1,2 @@
+event_time,session_id,student_id,course_id,language,level,event_type,question,answer_length,stt_time,llm_time,tts_time,total_time,kpi_ok,subject,chapter_idx,section_idx,confidence,interruptions
+2026-04-14T16:34:43.113180,3cbab70a-64d8-49c9-8d38-f03268aeb99e,,,en,lycée,qa,what is dara mining,1207,0,88.899,3.254,92.153,False,,0,0,0.0,0

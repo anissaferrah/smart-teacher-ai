@@ -66,6 +66,7 @@ from modules.stt_logger     import STTLogger
 from modules.dialogue       import DialogueManager, DialogState, SessionContext
 from modules.student_profile import ProfileManager
 from modules.slide_sync      import SlideSynchronizer
+from modules.audio_input     import AudioInput
 from modules.dashboard       import router as dashboard_router, record_session_event
 from modules.media_storage   import get_storage
 from modules.transcript_search import get_searcher, TranscriptEntry
@@ -114,6 +115,7 @@ stt_logger  = STTLogger()
 dialogue    = DialogueManager()
 profile_mgr   = ProfileManager()
 slide_sync    = SlideSynchronizer()
+audio_input = AudioInput()  # ✅ Silero VAD for backend voice detection
 media_storage = get_storage()
 transcript_searcher = get_searcher()
 analytics_engine    = get_analytics()
@@ -968,6 +970,49 @@ Explain naturally. MAX 4 sentences."""
                     audio_np = audio_bytes_to_numpy(full_audio)
                 except RuntimeError as exc:
                     await send({"type": "error", "message": str(exc)})
+                    continue
+
+                # ═══════════════════════════════════════════════════════════════════
+                # 🎤 SILERO VAD: Filter audio with backend voice detection (PyTorch)
+                # ═══════════════════════════════════════════════════════════════════
+                log.info(f"[{session_id[:8]}] 🎤 Silero VAD: Filtering {len(audio_np)} samples...")
+                
+                # Break audio into CHUNK_SIZE chunks (512 samples @ 16kHz = 32ms)
+                chunk_size = Config.CHUNK_SIZE
+                vad_confidence_scores = []
+                filtered_chunks = []
+                
+                for i in range(0, len(audio_np), chunk_size):
+                    chunk = audio_np[i:i + chunk_size]
+                    
+                    # Pad chunk if last one is shorter
+                    if len(chunk) < chunk_size:
+                        chunk = np.pad(chunk, (0, chunk_size - len(chunk)), mode='constant', constant_values=0.0)
+                    
+                    # Get speech probability (0.0 = silence, 1.0 = definitely speech)
+                    prob = audio_input.get_speech_probability(chunk.astype(np.float32))
+                    vad_confidence_scores.append(prob)
+                    
+                    # Keep chunk if confidence > threshold (0.5 = medium confidence)
+                    if prob > Config.SPEECH_THRESHOLD:
+                        filtered_chunks.append(chunk[:len(audio_np[i:i + chunk_size])])
+                
+                # Concatenate filtered chunks
+                if filtered_chunks:
+                    audio_np = np.concatenate(filtered_chunks)
+                    avg_confidence = np.mean(vad_confidence_scores)
+                    log.info(
+                        f"[{session_id[:8]}] ✅ Silero VAD: "
+                        f"Kept {len(filtered_chunks)} / {len(vad_confidence_scores)} chunks, "
+                        f"avg_confidence={avg_confidence:.2f}, "
+                        f"audio_len {len(audio_np)} samples"
+                    )
+                else:
+                    # No speech detected - send error
+                    log.warning(f"[{session_id[:8]}] ⚠️ Silero VAD: No speech detected (all chunks < threshold)")
+                    await send({"type": "error", "message": "Aucune parole détectée (Silero VAD)"})
+                    await dialogue.transition(ctx.session_id, DialogState.LISTENING)
+                    await send_state(DialogState.LISTENING)
                     continue
 
                 # Transition → PROCESSING (sécurisée via state machine)

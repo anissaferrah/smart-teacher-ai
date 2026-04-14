@@ -278,6 +278,10 @@ const SC={IDLE:{d:'',l:'En attente',w:'off'},PRESENTING:{d:'pr',l:'Presentation'
 // 🔄 PROGRESSIVE CASCADE - ONE MESSAGE PER SUBSTEP
 let lastSubstep=null;
 let lastStateMain=null;
+
+// ━━━ CRITICAL: Define sw() early for inline onclick handlers ━━━
+let activeP='course';
+function sw(n){activeP=n;document.querySelectorAll('.nav-tab').forEach((t,i)=>t.classList.toggle('active',['course','library','qa'][i]===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');}
 let finalMetrics=null;
 let questionMetrics=null;
 let presentationMetrics=null;
@@ -355,7 +359,6 @@ function handle(m){
       }
       }
     }
-  }
   else if(m.type==='stream_end'){
     slideStreamFinished=true;
     // ✅ DISPLAY PRESENTATION METRICS WHEN STREAM ENDS
@@ -383,15 +386,21 @@ function handle(m){
       questionMetrics=null;
     }
     // ✅ PUIS AFFICHER LA TRANSCRIPTION
-    addM(activeChat(),m.text,'s',`VOICE ${(m.lang||'').toUpperCase()}`);}
-  else if(m.type==='answer_text'){pendAns={text:m.text,subject:m.subject};}
-  else if(m.type==='audio_chunk'){if(interruptedStreamId!==null&&m.stream_id===interruptedStreamId){if(m.final)interruptedStreamId=null;return;}bufAud(m.data,m.mime,m.final,m.stream_id);if(m.final&&pendAns){
+    addM(activeChat(),m.text,'s',`VOICE ${(m.lang||'').toUpperCase()}`);
+  }
+  else if(m.type==='answer_text'){
+    // ✅ CORRIGER: Afficher le texte IMMÉDIATEMENT, pas en attente de l'audio
+    pendAns={text:m.text,subject:m.subject};
+    
     // ✅ RETIRER LE TYPING INDICATOR
     const typingEl=document.getElementById('typing-indicator');
     if(typingEl)typingEl.remove();
-    // ✅ AFFICHER RÉPONSE PROFESSEUR
+    
+    // ✅ AFFICHER RÉPONSE PROFESSEUR TOUT DE SUITE
     addM(activeChat(),pendAns.text,'t','Teacher');
-    // ✅ AFFICHER METRICS EN UNE SEULE LIGNE EN DESSOUS
+  }
+  else if(m.type==='audio_chunk'){if(interruptedStreamId!==null&&m.stream_id===interruptedStreamId){if(m.final)interruptedStreamId=null;return;}bufAud(m.data,m.mime,m.final,m.stream_id);if(m.final&&pendAns){
+    // ✅ AFFICHER METRICS EN UNE SEULE LIGNE EN DESSOUS (quand audio fini)
     if(finalMetrics){
       const sttTime=finalMetrics.stt_time ? finalMetrics.stt_time.toFixed(2)+'s' : '...';
       const ragTime=finalMetrics.retrieval_time ? finalMetrics.retrieval_time.toFixed(3)+'s' : '...';
@@ -402,6 +411,7 @@ function handle(m){
       finalMetrics=null;
     }
     pendAns=null;
+  }
   }
   else if(m.type==='audio_interrupted'){
     // ✅ RETIRER LE TYPING INDICATOR
@@ -420,17 +430,13 @@ function handle(m){
   else if(m.type==='error'){addM(activeChat(),'Erreur: '+m.message,'sys');}
 }
 
-let activeP='course';
-function sw(n){activeP=n;document.querySelectorAll('.nav-tab').forEach((t,i)=>t.classList.toggle('active',['course','library','qa'][i]===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');}
-function activeChat(){return document.getElementById(activeP==='qa'?'qaM':'cChat');}
-
 function updateSlide(d){const slidePath=d.slide_path||d.image_url||'';const requestId=(d.presentation_request_id||d.request_id||'').toString();const hasIndices=Number.isFinite(Number(d.chapter_index))&&Number.isFinite(Number(d.section_index));const nextChI=hasIndices?Math.max(0,Number(d.chapter_index)):chI;const nextSI=hasIndices?Math.max(0,Number(d.section_index)):sI;const eventKey=`${d.course_id||cCourseId||''}:${nextChI}:${nextSI}`;if(activeSlideRequestId&&requestId&&requestId!==activeSlideRequestId)return;if(activeSlideKey&&eventKey!==activeSlideKey)return;if(hasIndices){chI=nextChI;sI=nextSI;}if(d.chapter)document.getElementById('sch').textContent=d.chapter;if(d.progress_pct!==undefined)document.getElementById('spf').style.width=d.progress_pct+'%';curSlideTitle=d.slide_title||'Slide';curSlideText=d.content_original||d.slide_content||'';curSlidePath=slidePath||'';curSlideDomain=d.slide_domain||cCourse?.domain||'';curSlideCourse=d.slide_course||cCourse?.subject||'';const fp=(cCourse?.file_path||'').toLowerCase();if(fp.endsWith('.pdf')){const ch=cCourse?.chapters?.[nextChI];const sec=ch?.sections?.[nextSI];if(sec)renderDefSlide(sec,ch,d.slide_index,slidePath,d.slide_type);const btn=document.getElementById('explainBtn');if(btn)btn.disabled=false;return;}const displayContent=d.content_original||d.slide_content||'';const icon=getIcon(cCourse?.subject||'');const kws=(d.keywords||[]).map(k=>`<span class="kw" id="kw${k.replace(/\s/g,'-')}">${k}</span>`).join('');const imageHtml=slidePath?`<div class="slide-media" style="margin-bottom:14px;max-width:100%;max-height:70%;display:flex;align-items:center;justify-content:center;"><img src="${slidePath}" alt="${d.slide_title||'Slide'}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.3);" onerror="this.parentElement.style.display='none'"></div>`:'';document.getElementById('sbody').innerHTML=`${imageHtml}<div class="slide-num">${d.slide_index!==undefined?d.slide_index+1:''}</div><div class="slide-icon">${icon}</div><div class="slide-title">${d.slide_title||''}</div><div class="slide-text">${displayContent}</div>${kws?`<div class="slide-kws">${kws}</div>`:''}`;const btn=document.getElementById('explainBtn');if(btn)btn.disabled=false;
 }
 
 function renderDefSlide(sec,ch,slideIndex=null,slidePathOverride='',slideType='section'){if(!sec)return;const fp=(cCourse?.file_path||'').toLowerCase();if(fp.endsWith('.pdf')){const resolvedIndex=Number.isFinite(Number(slideIndex))?Number(slideIndex):Math.max(0,Number(sec.page_index||sec.order||1)-1);const pageNum=Math.max(1,Number(sec.page_index||sec.order||resolvedIndex+1));const pngPath=slidePathOverride||sec.image_url||(cCourse?.slides||[])[resolvedIndex]||'';curSlideTitle=sec.title||`Page ${pageNum}`;curSlideText=sec.content||'Contenu PDF';curSlidePageNum=pageNum;curSlidePath=pngPath;curSlideDomain=cCourse?.domain||'';curSlideCourse=cCourse?.subject||'';document.getElementById('sbody').innerHTML=pngPath?`<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:16px;padding:14px;"><img src="${pngPath}" alt="Page ${pageNum}" style="max-width:100%;max-height:85%;object-fit:contain;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.3);" onerror="document.querySelector('[data-fallback]').style.display='block'; this.parentElement.style.display='none'"><div style="font-size:.85em;color:#888;text-align:center">📄 Page ${pageNum}</div></div><div data-fallback style="display:none;flex:1;overflow-y:auto;padding:20px;text-align:left;line-height:1.6;"><div style="font-size:.9em;color:#aaa;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border);">📄 Page ${pageNum} (image non disponible, affichage texte)</div><div style="color:#a0a8c8;font-size:.95em;white-space:pre-wrap;font-family:monospace;">${sec.content || 'Contenu non disponible'}</div></div>`:`<div style="flex:1;overflow-y:auto;padding:20px;text-align:left;line-height:1.6;"><div style="font-size:.9em;color:#aaa;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border);">📄 Page ${pageNum} (images non disponibles)</div><div style="color:#a0a8c8;font-size:.95em;white-space:pre-wrap;font-family:monospace;">${sec.content || 'Contenu non disponible'}</div></div>`;return;}const icon=getIcon(cCourse?.subject||'');const kws=(sec.concepts||[]).slice(0,4).map(c=>`<span class="kw">${c.term}</span>`).join('');const slidePath=slidePathOverride||sec.image_url||'';curSlideTitle=sec.title||'Section';curSlideText=sec.content||'';curSlidePageNum=0;curSlidePath=slidePath;curSlideDomain=cCourse?.domain||'';curSlideCourse=cCourse?.subject||'';const imageHtml=slidePath?`<div class="slide-media" style="margin-bottom:14px;max-width:100%;max-height:70%;display:flex;align-items:center;justify-content:center;"><img src="${slidePath}" alt="${sec.title||'Slide'}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.3);" onerror="this.parentElement.style.display='none'"></div>`:'';document.getElementById('sbody').innerHTML=`${imageHtml}<div class="slide-icon">${icon}</div><div class="slide-title">${sec.title}</div><div class="slide-text">${(sec.content||'').substring(0,220)}${(sec.content||'').length>220?'…':''}</div>${kws?`<div class="slide-kws">${kws}</div>`:''}`;}
 function getIcon(s){return{math:'🔢',biology:'🧬',physics:'⚛️',chemistry:'🧪',history:'🏛️',geography:'🌍',cs:'💻',economics:'📈',general:'📚'}[s]||'📖';}
 
-async function startCourse(id){try{const r=await fetch(`/course/${id}/structure`);if(!r.ok)throw new Error('Cours introuvable');cCourse=await r.json();cCourseId=id;chI=0;sI=0;paused=false;syncPauseBtn();document.getElementById('sct').textContent=cCourse.title;document.getElementById('sch').textContent=cCourse.chapters?.[0]?.title||'—';document.getElementById('spf').style.width='0%';['prevBtn','pauseBtn','nextBtn','micCBtn','autoPlayBtn','explainBtn'].forEach(i=>document.getElementById(i).disabled=false);sw('course');startSess(cCourse.language||'fr',cCourse.level||'lycée');addM(document.getElementById('cChat'),`Cours chargé : ${cCourse.title}. Présentation…`,'sys');setTimeout(()=>presentSec(),600);}catch(e){alert('Erreur : '+e.message);}}
+async function startCourse(id){try{const r=await fetch(`/course/${id}/structure`);if(!r.ok)throw new Error('Cours introuvable');cCourse=await r.json();cCourseId=id;chI=0;sI=0;paused=false;syncPauseBtn();document.getElementById('sct').textContent=cCourse.title;document.getElementById('sch').textContent=cCourse.chapters?.[0]?.title||'—';document.getElementById('spf').style.width='0%';['prevBtn','pauseBtn','nextBtn','micCBtn','autoPlayBtn','explainBtn'].forEach(i=>document.getElementById(i).disabled=false);sw('course');document.getElementById('courseSelector').style.display='none';startSess(cCourse.language||'fr',cCourse.level||'lycée');addM(document.getElementById('cChat'),`Cours chargé : ${cCourse.title}. Présentation…`,'sys');setTimeout(()=>presentSec(),600);}catch(e){alert('Erreur : '+e.message);}}
 
 function presentSec(){if(!cCourse||paused)return;const ch=cCourse.chapters?.[chI];const sec=ch?.sections?.[sI];if(!ch||!sec){addM(document.getElementById('cChat'),'🎉 Cours terminé !','sys');return;}activeSlideRequestId=crypto.randomUUID();resetSlidePresentationState();const globalIdx=(cCourse.chapters?.slice(0,chI).reduce((sum,c)=>sum+c.sections.length,0)||0)+sI;activeSlideKey=`${cCourseId||cCourse?.id||''}:${chI}:${sI}`;renderDefSlide(sec,ch,globalIdx,sec.image_url||'',sec.image_url?'image':'section');updateNav();const btn=document.getElementById('explainBtn');if(btn)btn.disabled=false;if(autoPlay)queueAutoNarration();}
 
@@ -489,7 +495,8 @@ mr.onstop=()=>{
   animWF('processing');
 };
 
-startSilenceWatcher(stream,btnId,chatId,isCourse);
+// ✅ SILERO VAD: Utiliser la détection serveur au lieu de JavaScript
+console.log('🎤 DEBUG: Using backend Silero VAD for voice detection');
 mr.start(300);
 console.log('🎤 DEBUG: MediaRecorder.start(300) called');
 recStartTs=Date.now();
@@ -497,7 +504,7 @@ recg=true;
 animWF('listening');
 const btn=document.getElementById(btnId);
 if(btn){btn.classList.add('rec');btn.textContent='⏹️ Stop';}
-addM(document.getElementById(chatId),'🔴 Enregistrement...','sys');
+addM(document.getElementById(chatId),'🔴 Enregistrement... (Serveur: Silero VAD)','sys');
 }catch(e){
 console.error('🎤 ERROR: '+e.message, e.stack);
 addM(document.getElementById(chatId),'❌ Micro: '+e.message,'sys');
@@ -507,98 +514,10 @@ addM(document.getElementById(chatId),'❌ Micro: '+e.message,'sys');
 function stopMic(btnId,chatId,isCourse){if(mr?.state!=='inactive')mr.stop();}
 
 function startSilenceWatcher(stream,btnId,chatId,isCourse){
+  // ✅ DISABLED: Silero VAD now runs on backend
+  // Frontend simply starts recording, server handles voice detection via Silero VAD (PyTorch)
+  console.log('🎤 Silero VAD: Backend will handle voice detection');
   stopSilenceWatcher();
-  try{
-    console.log('🎤 DEBUG: startSilenceWatcher begin');
-    const tracks = stream.getTracks();
-    console.log('🎤 DEBUG: Stream tracks:', tracks.length, tracks.map(t => ({label: t.label, enabled: t.enabled, state: t.readyState})));
-    
-    silenceCtx=new(window.AudioContext||window.webkitAudioContext)();
-    console.log('🎤 DEBUG: AudioContext created, state:', silenceCtx.state);
-    if(silenceCtx.state==='suspended') silenceCtx.resume();
-    
-    const src=silenceCtx.createMediaStreamSource(stream);
-    silenceAnalyser=silenceCtx.createAnalyser();
-    silenceAnalyser.fftSize=2048;
-    silenceAnalyser.smoothingTimeConstant=0.85;
-    src.connect(silenceAnalyser);
-    silenceData=new Uint8Array(silenceAnalyser.frequencyBinCount);
-    silenceTimeData=new Uint8Array(silenceAnalyser.fftSize);
-    lastVoiceTs=Date.now();
-    voiceDetected=false;
-    
-    console.log('🎤 DEBUG: Analyser ready, fftSize='+silenceAnalyser.fftSize+', freqBinCount='+silenceAnalyser.frequencyBinCount);
-    
-    const WARM_UP_TIME=700;
-    const LISTEN_TIME=1500;
-    const SILENCE_THRESHOLD=4200;
-    const NO_VOICE_TIMEOUT=7000;
-    const FREQ_THRESHOLD=22;
-    const RMS_THRESHOLD=0.015;
-    
-    let vadLogCount=0;
-    let maxRmsEver=0;
-    silenceTimer=setInterval(()=>{
-      if(!recg||!mr||mr.state==='inactive'||!silenceAnalyser)return;
-      
-      silenceAnalyser.getByteFrequencyData(silenceData);
-      silenceAnalyser.getByteTimeDomainData(silenceTimeData);
-
-      let freqSum=0;
-      for(let i=0;i<silenceData.length;i++){
-        freqSum+=silenceData[i];
-      }
-      const avg=freqSum/silenceData.length;
-
-      let energy=0;
-      for(let i=0;i<silenceTimeData.length;i++){
-        const normalized=(silenceTimeData[i]-128)/128;
-        energy+=normalized*normalized;
-      }
-      const rms=Math.sqrt(energy/silenceTimeData.length);
-      if(rms>maxRmsEver) maxRmsEver=rms;
-      
-      // Log every 500ms
-      if(++vadLogCount%3===0){
-        console.log(`🎤 VAD: freq_avg=${avg.toFixed(1)} (th=${FREQ_THRESHOLD}), rms=${rms.toFixed(6)} (th=${RMS_THRESHOLD.toFixed(3)}), voiceDetected=${voiceDetected}, maxRmsEver=${maxRmsEver.toFixed(6)}`);
-      }
-      
-      if(avg>FREQ_THRESHOLD||rms>RMS_THRESHOLD){
-        lastVoiceTs=Date.now();
-        voiceDetected=true;
-        console.log('🎤 VOICE DETECTED! Setting voiceDetected=true');
-      }
-      
-      const recElapsed=Date.now()-recStartTs;
-      const silenceElapsed=Date.now()-lastVoiceTs;
-      
-      // Phase 1: Warm-up (ignore les premiers 500ms)
-      if(recElapsed<WARM_UP_TIME){
-        return;
-      }
-      
-      // Phase 2: Listening (attend 1500ms que la voix commence)
-      if(recElapsed<LISTEN_TIME){
-        return;
-      }
-      
-      // Phase 3: Recording - ARRÊTE si:
-      // - Voix détectée ET silence prolongé, OU
-      // - Pas de voix du tout après plusieurs secondes
-      if(
-        (voiceDetected && silenceElapsed>SILENCE_THRESHOLD && ac.length>0) ||
-        (recElapsed>NO_VOICE_TIMEOUT && !voiceDetected && ac.length>0)
-      ){
-        const reason=voiceDetected?'Silence prolongé':'Aucune voix détectée';
-        console.log(`🎤 AUTO STOP: reason=${reason}, recElapsed=${recElapsed}ms, voiceDetected=${voiceDetected}, chunks=${ac.length}, maxRmsEver=${maxRmsEver.toFixed(6)}`);
-        console.log(`🎤 CRITICAL DEBUG: Is this the real reason? Check browser console above ↑`);
-        addM(document.getElementById(chatId),`⏱ ${reason}, envoi... [maxRMS=${maxRmsEver.toFixed(6)}, freq_avg=${avg.toFixed(1)}]`,'sys');
-        stopMic(btnId,chatId,isCourse);
-      }
-    },200);
-  }catch(err){
-    console.warn('Silence watcher unavailable',err);
-  }
 }
 
 function stopSilenceWatcher(){if(silenceTimer){clearInterval(silenceTimer);silenceTimer=null;}silenceAnalyser=null;silenceData=null;silenceTimeData=null;if(silenceCtx){try{silenceCtx.close();}catch(e){}silenceCtx=null;}}
