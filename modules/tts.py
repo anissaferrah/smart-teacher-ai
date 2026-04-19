@@ -16,10 +16,6 @@ EDGE_VOICES: dict = {
         "female": "fr-FR-DeniseNeural",
         "male": "fr-FR-HenriNeural",
     },
-    "ar": {
-        "female": "ar-SA-ZariyahNeural",
-        "male": "ar-SA-HamedNeural",
-    },
     "en": {
         "female": "en-US-JennyNeural",
         "male": "en-US-GuyNeural",
@@ -29,7 +25,6 @@ EDGE_VOICES: dict = {
 DEFAULT_VOICE: str = "en-US-JennyNeural"
 ELEVENLABS_VOICES: dict = {
     "fr": "pNInz6obpgDQGcFmaJgB",  # Adam (French)
-    "ar": "EXAVITQu4vr4xnSDxMaL",  # Sarah (Arabic)
     "en": "21m00Tcm4TlvDq8ikWAM",  # Rachel (English)
 }
 
@@ -116,6 +111,18 @@ class VoiceEngine:
         self.voice_name = voice_name or voice_id
         log.info(f"Voice set: {self.voice_name}")
 
+    def get_cache_signatures(self, language_code: Optional[str] = None) -> list[tuple[str, str]]:
+        """Return cache signatures for the active provider and its fallback voice."""
+        if self.provider == "elevenlabs" and self._el_client:
+            lang = (language_code or "en")[:2].lower()
+            elevenlabs_voice = ELEVENLABS_VOICES.get(lang, ELEVENLABS_VOICES["en"])
+            return [
+                ("elevenlabs", elevenlabs_voice),
+                ("edge", self._pick_edge_voice(language_code)),
+            ]
+
+        return [("edge", self._pick_edge_voice(language_code))]
+
     def get_available_voices(self) -> list:
         """
         List all available voices across all providers.
@@ -153,7 +160,7 @@ class VoiceEngine:
         text : str
             Text to synthesize
         language_code : str, optional
-            ISO 639-1 language code ("fr", "ar", "en").
+            ISO 639-1 language code ("fr", "en").
             Defaults to English if not specified.
         rate : str, optional
             Speech rate in Edge-TTS format (e.g., "-20%", "+15%").

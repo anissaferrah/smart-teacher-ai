@@ -19,6 +19,8 @@ from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Optional
 
+import requests
+
 log = logging.getLogger("SmartTeacher.Search")
 
 ES_HOST     = os.getenv("ELASTICSEARCH_HOST", "http://localhost:9200")   # ex: http://localhost:9200
@@ -53,64 +55,112 @@ class TranscriptSearcher:
 
     def __init__(self):
         self._es = None
+        self._session = requests.Session()
+        self._es_auth = (ES_USER, ES_PASSWORD) if ES_USER else None
         self._use_es = False
         self._memory_index: list[TranscriptEntry] = []  # fallback mémoire
         self._init_es()
+
+    def _es_url(self, path: str = "") -> str:
+        base = ES_HOST.rstrip("/")
+        if not path:
+            return base
+        return f"{base}/{path.lstrip('/')}"
+
+    @staticmethod
+    def _es_headers() -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
 
     def _init_es(self):
         if not ES_HOST:
             log.info("🔍 Elasticsearch non configuré → recherche en mémoire")
             return
         try:
-            from elasticsearch import Elasticsearch
-            kwargs: dict = {"hosts": [ES_HOST]}
-            if ES_USER:
-                kwargs["basic_auth"] = (ES_USER, ES_PASSWORD)
-            # ⬇️ Ajouter timeout rapide pour fallback si Elasticsearch non dispo
-            self._es = Elasticsearch(**kwargs, request_timeout=2)
-            if self._es.ping(request_timeout=2):
-                self._ensure_index()
-                self._use_es = True
-                log.info("✅ Elasticsearch connecté : %s", ES_HOST)
-            else:
-                log.info("ℹ️ Elasticsearch ping failed → recherche en mémoire")
-        except ImportError:
-            log.info("ℹ️ elasticsearch-py non installé → recherche en mémoire")
+            root = self._session.get(
+                self._es_url("/"),
+                headers=self._es_headers(),
+                timeout=2,
+                auth=self._es_auth,
+            )
+            root.raise_for_status()
+            info = root.json()
+
+            health_resp = self._session.get(
+                self._es_url("/_cluster/health"),
+                headers=self._es_headers(),
+                timeout=2,
+                auth=self._es_auth,
+            )
+            health_resp.raise_for_status()
+            health = health_resp.json()
+
+            self._ensure_index()
+            self._use_es = True
+            log.info(
+                "✅ Elasticsearch connecté : %s (cluster=%s, status=%s)",
+                ES_HOST,
+                info.get("cluster_name", "n/a"),
+                health.get("status", "n/a"),
+            )
         except Exception as e:
+            self._es = None
             log.info("ℹ️ Elasticsearch non dispo (%s) → recherche en mémoire", e)
 
     def _ensure_index(self):
         """Crée l'index avec le bon mapping si absent."""
-        if self._es.indices.exists(index=ES_INDEX):
+        if self._session is None:
+            raise RuntimeError("Elasticsearch session unavailable")
+
+        index_url = self._es_url(ES_INDEX)
+        head_resp = self._session.head(
+            index_url,
+            headers=self._es_headers(),
+            timeout=2,
+            auth=self._es_auth,
+        )
+        if head_resp.status_code == 200:
             return
-        self._es.indices.create(index=ES_INDEX, body={
-            "settings": {
-                "number_of_shards":   1,
-                "number_of_replicas": 0,
-                "analysis": {
-                    "analyzer": {
-                        "multilang": {
-                            "type": "custom",
-                            "tokenizer": "standard",
-                            "filter": ["lowercase", "asciifolding"],
+        if head_resp.status_code != 404:
+            head_resp.raise_for_status()
+
+        create_resp = self._session.put(
+            index_url,
+            headers=self._es_headers(),
+            timeout=2,
+            auth=self._es_auth,
+            json={
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "analysis": {
+                        "analyzer": {
+                            "multilang": {
+                                "type": "custom",
+                                "tokenizer": "standard",
+                                "filter": ["lowercase", "asciifolding"],
+                            }
                         }
+                    }
+                },
+                "mappings": {
+                    "properties": {
+                        "session_id":   {"type": "keyword"},
+                        "student_id":   {"type": "keyword"},
+                        "course_id":    {"type": "keyword"},
+                        "course_title": {"type": "text",    "analyzer": "multilang"},
+                        "language":     {"type": "keyword"},
+                        "role":         {"type": "keyword"},
+                        "text":         {"type": "text",    "analyzer": "multilang"},
+                        "subject":      {"type": "keyword"},
+                        "@timestamp":   {"type": "date"},
                     }
                 }
             },
-            "mappings": {
-                "properties": {
-                    "session_id":   {"type": "keyword"},
-                    "student_id":   {"type": "keyword"},
-                    "course_id":    {"type": "keyword"},
-                    "course_title": {"type": "text",    "analyzer": "multilang"},
-                    "language":     {"type": "keyword"},
-                    "role":         {"type": "keyword"},
-                    "text":         {"type": "text",    "analyzer": "multilang"},
-                    "subject":      {"type": "keyword"},
-                    "@timestamp":   {"type": "date"},
-                }
-            }
-        })
+        )
+        create_resp.raise_for_status()
         log.info("📋 Index Elasticsearch créé : %s", ES_INDEX)
 
     # ── Indexation ────────────────────────────────────────────────────────
@@ -122,7 +172,14 @@ class TranscriptSearcher:
 
         if self._use_es:
             try:
-                self._es.index(index=ES_INDEX, document=entry.to_doc())
+                resp = self._session.post(
+                    self._es_url(f"{ES_INDEX}/_doc"),
+                    headers=self._es_headers(),
+                    timeout=2,
+                    auth=self._es_auth,
+                    json=entry.to_doc(),
+                )
+                resp.raise_for_status()
                 return True
             except Exception as e:
                 log.info("ℹ️ ES index error (%s) → fallback mémoire", e)
@@ -180,7 +237,15 @@ class TranscriptSearcher:
             "highlight": {"fields": {"text": {}}},
         }
         try:
-            r = self._es.search(index=ES_INDEX, body=body)
+            resp = self._session.post(
+                self._es_url(f"{ES_INDEX}/_search"),
+                headers=self._es_headers(),
+                timeout=2,
+                auth=self._es_auth,
+                json=body,
+            )
+            resp.raise_for_status()
+            r = resp.json()
             results = []
             for hit in r["hits"]["hits"]:
                 doc = hit["_source"]
@@ -214,11 +279,19 @@ class TranscriptSearcher:
         """Retourne tout l'historique d'une session."""
         if self._use_es:
             try:
-                r = self._es.search(index=ES_INDEX, body={
-                    "query": {"term": {"session_id": session_id}},
-                    "sort":  [{"@timestamp": "asc"}],
-                    "size":  500,
-                })
+                resp = self._session.post(
+                    self._es_url(f"{ES_INDEX}/_search"),
+                    headers=self._es_headers(),
+                    timeout=2,
+                    auth=self._es_auth,
+                    json={
+                        "query": {"term": {"session_id": session_id}},
+                        "sort":  [{"@timestamp": "asc"}],
+                        "size":  500,
+                    },
+                )
+                resp.raise_for_status()
+                r = resp.json()
                 return [h["_source"] for h in r["hits"]["hits"]]
             except Exception:
                 pass
@@ -228,8 +301,15 @@ class TranscriptSearcher:
         """Statistiques globales sur les transcriptions indexées."""
         if self._use_es:
             try:
-                r = self._es.count(index=ES_INDEX)
-                return {"backend": "elasticsearch", "total": r["count"],
+                resp = self._session.get(
+                    self._es_url(f"{ES_INDEX}/_count"),
+                    headers=self._es_headers(),
+                    timeout=2,
+                    auth=self._es_auth,
+                )
+                resp.raise_for_status()
+                r = resp.json()
+                return {"backend": "elasticsearch", "total": r.get("count", 0),
                         "index": ES_INDEX, "host": ES_HOST}
             except Exception:
                 pass

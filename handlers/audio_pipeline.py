@@ -43,11 +43,13 @@ async def run_pipeline_streaming(
     llm_error = None  # ✅ Track LLM failure
 
     # ── 1. STT ────────────────────────────────────────────────────────
-    text, stt_time, lang, lang_prob, audio_duration = transcriber.transcribe(
-        audio_data, force_language=force_language
+    text, stt_time, lang, lang_prob, audio_duration = await asyncio.to_thread(
+        transcriber.transcribe,
+        audio_data,
+        force_language,
     )
     if not text or len(text.strip()) <= 2:
-        return {"error": "Aucune parole détectée"}
+        return {"no_speech": True, "message": "Aucune voix détectée"}
 
     stt_logger.log(
         session_id=session_id,
@@ -100,6 +102,8 @@ async def run_pipeline_streaming(
     # ── 4. LLM STREAMING (avec TTS en parallèle) ─────────────────────
     llm_start = time.time()
     full_response = ""
+    tts_engine = "edge_tts"
+    tts_voice = ""
 
     # Construire le prompt : normal ou reformulation si confusion
     last_slide = ctx.last_slide_explained if ctx else ""
@@ -130,7 +134,6 @@ async def run_pipeline_streaming(
     if is_confused and on_text_chunk:
         preambles = {
             "fr": "Permettez-moi de réexpliquer autrement. ",
-            "ar": "دعني أشرح ذلك بطريقة أخرى. ",
             "en": "Let me explain that differently. ",
         }
         preamble = preambles.get(lang[:2], preambles["fr"])
@@ -138,12 +141,14 @@ async def run_pipeline_streaming(
 
         # Synthétiser et envoyer le préambule audio immédiatement
         try:
-            pre_audio, _, _, _, pre_mime = await voice.generate_audio_async(
+            pre_audio, _, pre_engine, pre_voice, pre_mime = await voice.generate_audio_async(
                 preamble, language_code=lang
             )
             if pre_audio and on_audio_chunk:
                 await on_audio_chunk(pre_audio, pre_mime)
                 log.info(f"[{session_id[:8]}] 📤 Preamble audio streamed")
+            tts_engine = pre_engine
+            tts_voice = pre_voice
         except Exception as pre_exc:
             log.warning(f"[{session_id[:8]}] ⚠️  Preamble TTS failed: {pre_exc}")
 
@@ -165,7 +170,7 @@ async def run_pipeline_streaming(
                 await on_state_change("tts_generating", {"response_length": len(full_response)})
 
             try:
-                audio_bytes, _, _, _, mime = await voice.generate_audio_async(
+                audio_bytes, _, tts_engine, tts_voice, mime = await voice.generate_audio_async(
                     sentence, language_code=lang
                 )
 
@@ -183,11 +188,16 @@ async def run_pipeline_streaming(
         llm_error = type(llm_exc).__name__  # ✅ Track error type
 
         try:
-            full_response, _ = brain.ask(text, reply_language=lang, session_id=session_id)
+            full_response, _ = await asyncio.to_thread(
+                brain.ask,
+                text,
+                reply_language=lang,
+                session_id=session_id,
+            )
             full_response = brain._clean_for_speech(full_response)
 
             if full_response.strip():
-                audio_bytes, _, _, _, mime = await voice.generate_audio_async(
+                audio_bytes, _, tts_engine, tts_voice, mime = await voice.generate_audio_async(
                     full_response, language_code=lang
                 )
                 if audio_bytes and on_audio_chunk:
@@ -213,18 +223,19 @@ async def run_pipeline_streaming(
     if full_response and len(full_response.split()) > FEEDBACK_THRESHOLD_WORDS:
         feedback_phrases = {
             "fr": "C'était clair ? Dites oui, répétez, ou autrement.",
-            "ar": "هل كان واضحاً؟ قل نعم، أعد، أو بطريقة أخرى.",
             "en": "Was that clear? Say yes, repeat, or differently.",
         }
         feedback_text = feedback_phrases.get(lang[:2], feedback_phrases["fr"])
 
         try:
-            fb_audio, _, _, _, fb_mime = await voice.generate_audio_async(
+            fb_audio, _, fb_engine, fb_voice, fb_mime = await voice.generate_audio_async(
                 feedback_text, language_code=lang, rate=1.0  # Tempo normal
             )
             if fb_audio and on_audio_chunk:
                 await on_audio_chunk(fb_audio, fb_mime)
                 log.info(f"[{session_id[:8]}] ❓ Feedback vocal envoyé")
+            tts_engine = fb_engine
+            tts_voice = fb_voice
             if on_text_chunk:
                 await on_text_chunk(feedback_text, full_response + " " + feedback_text)
         except Exception as fb_exc:
@@ -243,6 +254,13 @@ async def run_pipeline_streaming(
         log.info(f"[{session_id[:8]}]    📈 KPI: ❌ FAILED (LLM unavailable)")
         return {
             "error": f"Unable to generate response: {llm_error}"
+            ,"transcription": {"text": text, "language": lang, "confidence": round(lang_prob, 2)}
+            ,"confusion": {
+                "detected": bool(is_confused),
+                "reason": confusion_reason,
+                "hash": q_hash,
+                "count": confusion_count,
+            }
         }
 
     # Mise à jour mémoire (only if we have a valid response)
@@ -289,6 +307,15 @@ async def run_pipeline_streaming(
         "answer": full_response,
         "subject": subject,
         "rag_chunks": len(chunks_with_scores),
+        "tts_engine": tts_engine,
+        "tts_voice": tts_voice,
+        "confusion": {
+            "detected": bool(is_confused),
+            "reason": confusion_reason,
+            "hash": q_hash,
+            "count": confusion_count,
+        },
+        "question_text": text,
         "performance": {
             "stt_time": round(stt_time, 2),
             "llm_time": round(llm_time, 2),
@@ -322,11 +349,13 @@ async def run_pipeline(
     utt_id = str(uuid.uuid4())[:8]
 
     # ── 1. STT ────────────────────────────────────────────────────────
-    text, stt_time, lang, lang_prob, audio_duration = transcriber.transcribe(
-        audio_data, force_language=force_language
+    text, stt_time, lang, lang_prob, audio_duration = await asyncio.to_thread(
+        transcriber.transcribe,
+        audio_data,
+        force_language,
     )
     if not text or len(text.strip()) <= 2:
-        return {"error": "Aucune parole détectée"}
+        return {"no_speech": True, "message": "Aucune voix détectée"}
 
     stt_logger.log(
         session_id=session_id,
@@ -392,6 +421,8 @@ async def run_pipeline(
         "audio_bytes": audio_bytes,
         "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else None,
         "mime": mime,
+        "tts_engine": tts_engine,
+        "tts_voice": tts_voice,
         "subject": subject,
         "rag_chunks": len(chunks_with_scores),
         "performance": {

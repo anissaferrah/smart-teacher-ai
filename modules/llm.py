@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -35,13 +36,6 @@ _FALLBACK_PROMPTS = {
         "JAMAIS de markdown, listes, ni LaTeX. "
         "Si une idée a déjà été dite, ne la répète pas avec des mots proches."
     ),
-    "ar": (
-        "أنت أستاذ جامعي خبير جداً. تعلّم طلابك بوضوح وبساطة. "
-        "اشرح الفكرة بطريقة طبيعية وسهلة الفهم، كما تتحدث في الفصل. "
-        "لا تستخدم كلمات معقدة غير ضرورية. استخدم العربية الفصحى البسيطة. "
-        "أجب بـ 3 إلى 4 جمل فقط، واضحة وقصيرة. "
-        "NO markdown. NO code. NO English. عربي فقط."
-    ),
 }
 
 
@@ -61,13 +55,6 @@ _FALLBACK_PRESENTATION_PROMPTS = {
         "- NE LIS JAMAIS le texte mot pour mot. Reformule.\n"
         "- ZÉRO markdown et LaTeX.\n"
         "- 3 à 5 phrases naturelles. Uniquement en français."
-    ),
-    "ar": (
-        "أنت أستاذ خبير. "
-        "قدّم فقط محتوى الشريحة الحالية بصوت طبيعي. "
-        "ركّز على هذه الشريحة/page وليس الشرائح القادمة. "
-        "- لا markdown ولا LaTeX.\n"
-        "- 3 إلى 5 جمل طبيعية. أجب بالعربية فقط."
     ),
 }
 
@@ -101,7 +88,6 @@ def detect_confusion(
                "peux tu répéter", "reexplique", "explique mieux", "c'est confus", "comprend rien"],
         "en": ["don't understand", "i don't get it", "what", "huh", "can you repeat", 
                "explain again", "that's confusing", "not clear"],
-        "ar": ["ما فهمت", "فهمت ما", "اشرح أكثر", "يمكن تعيد", "ايش", "غير واضح"]
     }
     
     lang_keywords = confusion_keywords.get(language.lower()[:2], confusion_keywords["fr"])
@@ -142,14 +128,6 @@ def get_clarification_prompt(language: str = "fr", domain: str = None) -> str:
             "- Explique l'idée centrale en 2-3 phrases max.\n"
             "- Puis explique la partie plus technique.\n"
             "- Demande : 'C'est plus clair?'"
-        ),
-        "ar": (
-            "الطالب لم يفهم. يجب عليك أن تشرح بطريقة أبسط.\n"
-            "- استخدم كلمات بسيطة وسهلة.\n"
-            "- أعطِ مثالاً محسوساً أولاً.\n"
-            "- شرح الفكرة الأساسية في 2-3 جمل فقط.\n"
-            "- ثم شرح الجزء الأكثر تقنية.\n"
-            "- اسأل: 'هل أصبح الأمر أوضح؟'"
         ),
     }
     
@@ -196,14 +174,6 @@ def get_system_prompt(domain: str = None, language: str = "en") -> str:
             f"JAMAIS de markdown, listes, ni LaTeX. "
             f"Si une même idée apparaît plusieurs fois, fusionne-la en une seule explication. "
             f"Les formules en clair."
-        ),
-        "ar": (
-            f"أنت Smart Teacher، أستاذ خبير في {domain_desc}. "
-            f"تدرّس مقرراً جامعياً من مستوى الماستر. "
-            f"أجب دائماً كما لو كنت تتحدث في الفصل الدراسي. "
-            f"كن موجزاً (4 جمل كحد أقصى). استخدم المصطلحات التقنية الدقيقة. "
-            f"إذا تكررت الفكرة نفسها، فادمجها في شرح واحد. "
-            f"لا markdown، لا LaTeX، لا قوائم. أجب فقط بالعربية."
         ),
     }
 
@@ -262,19 +232,27 @@ def get_presentation_prompt(domain: str = None, language: str = "en", chapter_ti
             "- Un exemple concret spécifique au domaine.\n"
             "- 3 à 5 phrases naturelles. Uniquement en français."
         ),
-        "ar": (
-            f"أنت أستاذ متخصص في {domain_desc} تقدم محاضرة لطلاب الماستر.{chapter_ctx}\n\n"
-            "قواعد مطلقة:\n"
-            "- ركز فقط على الشريحة الحالية، وليس على الشرائح القادمة.\n"
-            "- لا markdown، لا LaTeX، جمل طبيعية فقط.\n"
-            "- احتفظ بالمصطلحات التقنية من هذا التخصص.\n"
-            "- إذا كررت الشريحة الفكرة نفسها أكثر من مرة، فادمجها مرة واحدة.\n"
-            "- لا تعِد صياغة النقطة نفسها بصيغ متقاربة.\n"
-            "- 3 إلى 5 جمل طبيعية. أجب فقط بالعربية."
-        ),
     }
 
     return prompts_map.get(lang, prompts_map["en"])
+
+
+def _extract_json_payload(raw_text: str) -> dict[str, object] | None:
+    if not raw_text:
+        return None
+
+    cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        payload = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+    return payload if isinstance(payload, dict) else None
 
 
 class Brain:
@@ -291,7 +269,7 @@ class Brain:
 
         if Config.OPENAI_API_KEY:
             try:
-                self.client = OpenAI(api_key=Config.OPENAI_API_KEY)
+                self.client = OpenAI(api_key=Config.OPENAI_API_KEY, max_retries=0)
                 log.info("✅ OpenAI API clé valide")
             except Exception as exc:
                 log.error(f"❌ OpenAI erreur: {exc}")
@@ -299,6 +277,28 @@ class Brain:
             log.info("ℹ️ OpenAI non configuré (fallback Ollama utilisé)")
 
         self.fallback = LocalLLMFallback(model="mistral")
+
+    @staticmethod
+    def _should_disable_openai(exc: Exception) -> bool:
+        message = f"{exc.__class__.__module__}:{exc.__class__.__name__}:{exc}".lower()
+        return any(
+            token in message
+            for token in (
+                "insufficient_quota",
+                "quota",
+                "429",
+                "rate limit",
+                "ratelimit",
+                "authentication",
+                "unauthorized",
+                "invalid_api_key",
+            )
+        )
+
+    def _disable_openai(self, reason: str) -> None:
+        if self.client is not None:
+            self.client = None
+            log.info("ℹ️ OpenAI désactivé pour cette session (%s) → Ollama prioritaire", reason)
 
     def clear_memory(self):
         self.history = []
@@ -370,7 +370,7 @@ class Brain:
             response = requests.post(
                 f"{self.fallback.base_url}/api/generate",
                 json=payload,
-                timeout=180,
+                timeout=None,
             )
 
             if response.status_code == 200:
@@ -385,7 +385,7 @@ class Brain:
             log.error(f"❌ Ollama HTTP {response.status_code}")
             return None
         except requests.exceptions.Timeout:
-            log.error("❌ Ollama timeout (>120s=2min) — Le modèle est très lent. Vérifiez votre machine.")
+            log.error("❌ Ollama request failed or was interrupted")
             return None
         except requests.exceptions.ConnectionError:
             log.error("❌ Ollama connexion échouée — Lancez: docker-compose up -d ollama")
@@ -459,14 +459,15 @@ class Brain:
                 log.info(f"✅ OpenAI OK | {duration:.2f}s | lang={lang} | {len(answer)} chars")
                 return answer, duration
             except Exception as openai_err:
+                if self._should_disable_openai(openai_err):
+                    self._disable_openai(str(openai_err))
                 log.warning(f"⚠️  OpenAI échoué: {openai_err} → Fallback Ollama...")
 
         if self.fallback and self.fallback.available:
-            log.info("🖥️ Ollama fallback activé (timeout: 2min)...")
+            log.info("🖥️ Ollama fallback activé (sans timeout)...")
             lang_instruction = {
-                "en": "\n\n[!!!CRITICAL!!!] You MUST respond ONLY in English. Any response in French, Arabic or other languages is forbidden. ONLY English.",
-                "fr": "\n\n[!!!CRITIQUE!!!] Tu DOIS répondre UNIQUEMENT en français. Aucune réponse en anglais, arabe ou autre langue. SEULEMENT du français.",
-                "ar": "\n\n[!!!حرج!!!] يجب أن تجيب باللغة العربية فقط. أي رد بالإنجليزية أو الفرنسية أو لغات أخرى محظور. العربية فقط.",
+                "en": "\n\n[!!!CRITICAL!!!] You MUST respond ONLY in English. Any response in French or other languages is forbidden. ONLY English.",
+                "fr": "\n\n[!!!CRITIQUE!!!] Tu DOIS répondre UNIQUEMENT en français. Aucune réponse en anglais ou autre langue. SEULEMENT du français.",
             }
             fallback_prompt = f"{system_content}{lang_instruction.get(lang, lang_instruction['en'])}\n\nQuestion/Prompt: {question}"
             answer = self._call_ollama_sync(
@@ -487,7 +488,98 @@ class Brain:
                 return answer, duration
 
         log.error("❌ LLM indisponible (OpenAI + Ollama échoué) — Vérifiez: docker-compose up -d")
-        return "🤖 Assistant indisponible. Vérifiez que les services Docker sont actifs: docker-compose up -d", time.time() - start
+        return "Je n'ai pas pu générer de réponse pour le moment. Réessayez dans un instant.", time.time() - start
+
+    def label_confusion(
+        self,
+        text: str,
+        domain: str = "",
+        module: str = "",
+        language: str = "en",
+    ) -> tuple[str, float, str]:
+        """Label a student text as confused or not_confused using the LLM."""
+        text = (text or "").strip()
+        if not text:
+            return "not_confused", 0.0, "empty input"
+
+        lang = (language or "en").lower()[:2]
+        system_prompts = {
+            "en": (
+                "You are a strict annotation assistant for the Smart Teacher dataset. "
+                "Decide whether the text expresses confusion. "
+                "confused = explicit lack of understanding, request to re-explain, says lost/confused/stuck, or cannot follow the explanation. "
+                "not_confused = normal question, factual question, statement of understanding, neutral remark, or administrative text. "
+                "A question mark alone does NOT mean confused. "
+                "Return only JSON with keys label, confidence, and reason. "
+                "label must be confused or not_confused. confidence must be a number between 0 and 1."
+            ),
+            "fr": (
+                "Tu es un annotateur strict pour le dataset Smart Teacher. "
+                "Decide si le texte exprime une confusion. "
+                "confused = manque de comprehension explicite, demande de reexplication, texte perdu, confus, bloque, ou incapacite a suivre l'explication. "
+                "not_confused = question normale, question factuelle, phrase de comprehension, remarque neutre, ou texte administratif. "
+                "Un point d'interrogation seul ne veut pas dire confused. "
+                "Retourne uniquement du JSON avec les cles label, confidence et reason. "
+                "label doit etre confused ou not_confused. confidence doit etre un nombre entre 0 et 1."
+            ),
+        }
+        system_prompt = system_prompts.get(lang, system_prompts["en"])
+
+        user_prompt = (
+            f"Text: {text}\n"
+            f"Language: {lang}\n"
+            f"Domain: {domain or 'general'}\n"
+            f"Module: {module or 'general'}\n\n"
+            "Return one JSON object only."
+        )
+
+        raw_response = None
+
+        if self.client:
+            try:
+                response = self.client.chat.completions.create(
+                    model=Config.GPT_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=120,
+                )
+                raw_response = (response.choices[0].message.content or "").strip()
+            except Exception as openai_err:
+                if self._should_disable_openai(openai_err):
+                    self._disable_openai(str(openai_err))
+                log.warning(f"⚠️  LLM labeling OpenAI failed: {openai_err} → fallback Ollama...")
+
+        if not raw_response and self.fallback and self.fallback.available:
+            raw_response = self._call_ollama_sync(
+                prompt=f"{system_prompt}\n\n{user_prompt}",
+                temperature=0.0,
+                max_tokens=120,
+            )
+
+        if raw_response:
+            payload = _extract_json_payload(raw_response)
+            if payload:
+                label = str(payload.get("label", "")).strip().lower().replace(" ", "_").replace("-", "_")
+                if label in {"confused", "not_confused"}:
+                    try:
+                        confidence = float(payload.get("confidence", 0.0))
+                    except Exception:
+                        confidence = 0.0
+                    confidence = max(0.0, min(1.0, confidence))
+                    reason = str(payload.get("reason", "")).strip() or "LLM label"
+                    return label, confidence, reason
+
+            normalized = raw_response.lower()
+            if "not_confused" in normalized or "not confused" in normalized:
+                return "not_confused", 0.55, "parsed from raw LLM response"
+            if "confused" in normalized:
+                return "confused", 0.55, "parsed from raw LLM response"
+
+        is_confused, reason = detect_confusion(text, language=lang)
+        return ("confused" if is_confused else "not_confused"), 0.5, reason or "rule-based fallback"
 
     def present(
         self,
@@ -544,14 +636,15 @@ class Brain:
                 log.info(f"✅ OpenAI present OK | {duration:.2f}s | ch={chapter_idx} | {len(answer)} chars")
                 return answer, duration
             except Exception as openai_err:
+                if self._should_disable_openai(openai_err):
+                    self._disable_openai(str(openai_err))
                 log.warning(f"⚠️  OpenAI presentation failed: {openai_err} → Trying Ollama...")
 
         if self.fallback and self.fallback.available:
-            log.info("🖥️ Presentation: Ollama fallback (timeout: 2min)...")
+            log.info("🖥️ Presentation: Ollama fallback (sans timeout)...")
             lang_instruction = {
                 "en": "\n\n*** IMPORTANT: You MUST respond ONLY in English. Do NOT respond in French. ***",
                 "fr": "\n\n*** IMPORTANT: Tu DOIS répondre UNIQUEMENT en français. Ne réponds pas en anglais. ***",
-                "ar": "\n\n*** هام: يجب أن تجيب باللغة العربية فقط. لا تجب بالإنجليزية أو الفرنسية. ***",
             }
             fallback_prompt = f"{system_content}{lang_instruction.get(lang, lang_instruction['en'])}\n\nContent to present:\n\n{section_content}"
             answer = self._call_ollama_sync(

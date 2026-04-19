@@ -1,6 +1,0 @@
-event_time,session_id,student_id,course_id,language,level,event_type,question,answer_length,stt_time,llm_time,tts_time,total_time,kpi_ok,subject,chapter_idx,section_idx,confidence,interruptions
-2026-04-08T17:08:20.616672,409be112-0d73-4386-8443-9c8b371a6802,,,en,lycée,qa,can you explain what is data mining in 3 words,36,0,3.09,0.73,3.819,True,,0,0,0.0,0
-2026-04-08T17:10:12.948545,409be112-0d73-4386-8443-9c8b371a6802,,,en,lycée,qa,whAT IS DATA MINIG IN 3 WORDS,36,0,2.676,0.984,3.66,True,,0,0,0.0,0
-2026-04-08T18:10:15.963483,cc7ec985-d142-4272-9c96-a55db290522a,,,en,lycée,qa,what is,36,0,3.013,1.13,4.143,True,,0,0,0.0,0
-2026-04-08T18:10:27.939308,cc7ec985-d142-4272-9c96-a55db290522a,,,en,lycée,qa,data mining,36,0,2.766,0.672,3.438,True,,0,0,0.0,0
-2026-04-08T18:15:50.190987,0ef3708f-00e4-489d-857a-8b2abfbc5229,,,en,lycée,qa,what is data mining in 3 words,36,0,2.572,0.666,3.239,True,,0,0,0.0,0

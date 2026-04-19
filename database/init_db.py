@@ -18,6 +18,7 @@ from database.models import (
     Base, 
     Student, Course, Chapter, Section, Concept, 
     LearningSession, Interaction,
+    LearningEvent,
     StudentProfile, StudentMistake,
     RAGChunk, SystemLog, PerformanceMetric, LLMCache
 )

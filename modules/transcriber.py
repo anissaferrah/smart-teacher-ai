@@ -1,29 +1,68 @@
-"""Smart Teacher — Speech-to-Text (faster-whisper)"""
+"""Smart Teacher — Speech-to-Text (faster-whisper or WhisperLiveKit)"""
 
+import asyncio
 import time
 import logging
 import unicodedata
 
 import numpy as np
 from faster_whisper import WhisperModel
+from langdetect import DetectorFactory, detect_langs
 
 from config import Config
 
 log = logging.getLogger("SmartTeacher.STT")
+DetectorFactory.seed = 0
 
 
 class Transcriber:
-    """Convertit l'audio en texte avec faster-whisper."""
+    """Convertit l'audio en texte avec le backend STT configuré."""
 
     def __init__(self):
-        log.info(f"Loading Whisper model ({Config.WHISPER_MODEL_SIZE})…")
-        self.model = WhisperModel(
-            Config.WHISPER_MODEL_SIZE,
-            device=Config.WHISPER_DEVICE,
-            compute_type=Config.WHISPER_COMPUTE,
-            cpu_threads=Config.WHISPER_THREADS,
-        )
-        log.info("✅ Whisper model loaded")
+        self.backend = (Config.STT_BACKEND or "faster-whisper").strip().lower()
+        self.model = None
+        self._wlk_engine = None
+        self._wlk_audio_processor_cls = None
+        self._wlk_test_state_cls = None
+
+        if self.backend == "whisperlivekit":
+            try:
+                from whisperlivekit import AudioProcessor, TranscriptionEngine
+                from whisperlivekit.test_harness import TestState
+
+                self._wlk_audio_processor_cls = AudioProcessor
+                self._wlk_test_state_cls = TestState
+                self._wlk_engine = TranscriptionEngine(
+                    model_size=Config.WHISPER_MODEL_SIZE,
+                    lan="auto",
+                    backend="faster-whisper",
+                    backend_policy="localagreement",
+                    transcription=True,
+                    diarization=False,
+                    target_language="",
+                    pcm_input=True,
+                    vac=False,
+                    vad=True,
+                    min_chunk_size=0.1,
+                    buffer_trimming="segment",
+                    confidence_validation=False,
+                )
+                log.info("✅ WhisperLiveKit backend loaded")
+            except Exception as exc:
+                log.warning(
+                    "⚠️ WhisperLiveKit unavailable (%s) — fallback faster-whisper", exc
+                )
+                self.backend = "faster-whisper"
+
+        if self.backend != "whisperlivekit":
+            log.info(f"Loading Whisper model ({Config.WHISPER_MODEL_SIZE})…")
+            self.model = WhisperModel(
+                Config.WHISPER_MODEL_SIZE,
+                device=Config.WHISPER_DEVICE,
+                compute_type=Config.WHISPER_COMPUTE,
+                cpu_threads=Config.WHISPER_THREADS,
+            )
+            log.info("✅ Whisper model loaded")
 
     def validate_audio_quality(self, audio: np.ndarray) -> tuple[bool, str]:
         """Check if audio is completely empty/corrupt.
@@ -106,7 +145,6 @@ class Transcriber:
         # Mots d'hésitation en plusieurs langues
         hesitation_words = {
             "fr": ["euh", "uh", "um", "hum", "heu", "bah", "ben", "disons"],
-            "ar": ["ايه", "نعني", "يعني", "حاضر"],  # Common hesitations
             "en": ["um", "uh", "like", "you know", "i mean"],
         }
         
@@ -147,6 +185,65 @@ class Transcriber:
             "confidence": round(min(1.0, confidence_score), 2),  # 0-1 score
         }
 
+    def _detect_language_from_text(self, text: str, fallback_language: str = "unknown") -> tuple[str, float]:
+        if not text:
+            return fallback_language, 0.0
+
+        try:
+            detected = detect_langs(text)
+            if detected:
+                best = detected[0]
+                return best.lang, float(best.prob)
+        except Exception:
+            pass
+
+        return fallback_language, 0.0
+
+    async def _transcribe_with_whisperlivekit(
+        self,
+        audio: np.ndarray,
+        force_language: str | None = None,
+    ) -> tuple[str, str, float]:
+        if self._wlk_engine is None or self._wlk_audio_processor_cls is None or self._wlk_test_state_cls is None:
+            raise RuntimeError("WhisperLiveKit backend is not initialized")
+
+        processor = self._wlk_audio_processor_cls(
+            transcription_engine=self._wlk_engine,
+            language=None if not force_language or force_language == "auto" else force_language,
+        )
+        processor.is_pcm_input = True
+
+        results_gen = await processor.create_tasks()
+        final_front_data = None
+
+        async def collect_results():
+            nonlocal final_front_data
+            async for front_data in results_gen:
+                final_front_data = front_data
+
+        collect_task = asyncio.create_task(collect_results())
+
+        pcm = np.clip(audio, -1.0, 1.0)
+        pcm_bytes = (pcm * 32767.0).astype(np.int16).tobytes()
+        chunk_bytes = Config.SAMPLE_RATE * 2
+
+        try:
+            for index in range(0, len(pcm_bytes), chunk_bytes):
+                await processor.process_audio(pcm_bytes[index:index + chunk_bytes])
+
+            await processor.process_audio(b"")
+            await asyncio.wait_for(collect_task, timeout=120.0)
+        finally:
+            await processor.cleanup()
+
+        if final_front_data is None:
+            return "", "unknown", 0.0
+
+        final_state = self._wlk_test_state_cls.from_front_data(final_front_data)
+        text = getattr(final_state, "text", "") or ""
+        language, language_prob = self._detect_language_from_text(text, fallback_language="unknown")
+        return text.strip(), language, language_prob
+
     def transcribe(self, audio: np.ndarray, force_language: str = None) -> tuple[str, float, str, float, float]:
         """Transcribe audio array to text. Returns: (text, stt_time, language, lang_prob, audio_duration)
         
@@ -180,52 +277,54 @@ class Transcriber:
                 log.warning(f"❌ Audio too short: {audio_duration:.3f}s < {Config.STT_MIN_AUDIO_SEC}s min")
                 return "", 0.0, "unknown", 0.0, audio_duration
             
-            log.info(f"   ✅ Audio OK: {len(audio)} samples ({audio_duration:.3f}s) ready for Whisper")
+            log.info(f"   ✅ Audio OK: {len(audio)} samples ({audio_duration:.3f}s) ready for STT backend")
             log.debug(f"   Audio samples: min={audio.min():.8f}, max={audio.max():.8f}, mean={audio.mean():.8f}")
 
-            # 4. Transcription Whisper
-            log.info(f"   → Calling Whisper.transcribe(vad_filter=False, language={force_language})")
-            segments, info = self.model.transcribe(
-                audio,
-                language=force_language,          # ← Peut être force 'en', 'fr' si besoin
-                beam_size=Config.STT_BEAM_SIZE,
-                best_of=1,
-                temperature=0.0,                  # déterministe
-                vad_filter=False,                 # ✅ DÉSACTIVER VAD agressif (filtre toute la parole!)
-                # ✅ ALTERNATIVEMENT: VAD avec paramètres moins agressifs:
-                # vad_filter=True,
-                # vad_parameters=dict(
-                #     min_speech_duration_ms=100,   # Au minimum 100ms de parole
-                #     min_silence_duration_ms=1500, # Besoin de 1.5s de silence (par défaut 2s, très strict)
-                #     speech_pad_ms=300,            # Padding 300ms (par défaut 400ms)
-                # ),
-                condition_on_previous_text=False, # pas de mémoire → évite hallucinations
-                without_timestamps=True,
-                word_timestamps=False,
-            )
+            # 4. Transcription
+            if self.backend == "whisperlivekit":
+                log.info(f"   → Calling WhisperLiveKit pipeline (language={force_language})")
+                text, lang, lang_prob = asyncio.run(
+                    self._transcribe_with_whisperlivekit(audio, force_language=force_language)
+                )
+            else:
+                log.info(f"   → Calling Whisper.transcribe(vad_filter=False, language={force_language})")
+                segments, info = self.model.transcribe(
+                    audio,
+                    language=force_language,          # ← Peut être force 'en', 'fr' si besoin
+                    beam_size=Config.STT_BEAM_SIZE,
+                    best_of=1,
+                    temperature=0.0,                  # déterministe
+                    vad_filter=False,                 # ✅ DÉSACTIVER VAD agressif (filtre toute la parole!)
+                    # ✅ ALTERNATIVEMENT: VAD avec paramètres moins agressifs:
+                    # vad_filter=True,
+                    # vad_parameters=dict(
+                    #     min_speech_duration_ms=100,   # Au minimum 100ms de parole
+                    #     min_silence_duration_ms=1500, # Besoin de 1.5s de silence (par défaut 2s, très strict)
+                    #     speech_pad_ms=300,            # Padding 300ms (par défaut 400ms)
+                    # ),
+                    condition_on_previous_text=False, # pas de mémoire → évite hallucinations
+                    without_timestamps=True,
+                    word_timestamps=False,
+                )
 
-            # ⚠️  CRITICAL: segments is a GENERATOR, convert to list immediately!
-            segments = list(segments)
-            log.info(f"   Whisper returned {len(segments)} segments")
-            
-            # 5. Fusion des segments
-            text = " ".join(s.text.strip() for s in segments).strip()
-            log.info(f"   Whisper raw output: '{text[:100]}'... ({len(segments)} segments)")
+                # ⚠️  CRITICAL: segments is a GENERATOR, convert to list immediately!
+                segments = list(segments)
+                log.info(f"   Whisper returned {len(segments)} segments")
+                
+                # 5. Fusion des segments
+                text = " ".join(s.text.strip() for s in segments).strip()
+                log.info(f"   Whisper raw output: '{text[:100]}'... ({len(segments)} segments)")
 
-            lang      = getattr(info, "language",             "unknown")
-            lang_prob = getattr(info, "language_probability", 0.0)
+                lang      = getattr(info, "language",             "unknown")
+                lang_prob = getattr(info, "language_probability", 0.0)
+
             stt_time  = time.time() - start
 
-            # 6. REJECTION: Only detect clear Unicode corruption (language-aware)
-            # ✅ Skip corruption check for RTL languages where ALL chars are > 0x180
-            # This prevents rejecting valid Arabic, Farsi, Hebrew, etc.
-            
-            # Check if detected language is RTL (Arabic, Farsi, Hebrew, etc.)
-            rtl_languages = ['ar', 'fa', 'ps', 'ur', 'he', 'yi']  # Arabic, Farsi, Pashto, Urdu, Hebrew, Yiddish
-            is_rtl_language = lang.lower()[:2] in rtl_languages if lang and lang != "unknown" else False
-            
-            if not is_rtl_language and len(text) > 5:
-                # For non-RTL languages, check for Unicode control/format characters (actual corruption)
+            # 6. REJECTION: Only detect clear Unicode corruption.
+            rtl_languages = {"ar", "fa", "he", "ur", "ps", "yi"}
+            is_rtl_language = lang in rtl_languages or any(lang.startswith(prefix + "-") for prefix in rtl_languages)
+            if len(text) > 5:
+                # Check for Unicode control/format characters (actual corruption)
                 # These are actual invalid characters, not just non-ASCII
                 invalid_categories = {'Cc', 'Cf', 'Cn', 'Co'}  # Control, Format, Not assigned, Private use
                 invalid_char_count = sum(
@@ -237,7 +336,7 @@ class Transcriber:
                 if len(text) > 0 and invalid_char_count / len(text) > 0.3:
                     log.warning(f"🚨 STT Corruption: {invalid_char_count}/{len(text)} invalid Unicode chars, rejecting")
                     return "", stt_time, lang, lang_prob, audio_duration
-            elif is_rtl_language:
+            if len(text) <= 5 and is_rtl_language:
                 log.info(f"✅ RTL language detected ({lang}) — skipping corruption check")
             
             rtf = stt_time / audio_duration if audio_duration > 0 else 0

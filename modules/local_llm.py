@@ -33,7 +33,7 @@ class LocalLLMFallback:
         try:
             response = requests.get(
                 f"{self.base_url}/api/tags",
-                timeout=15  # ⬆️ Ollama peut être au démarrage - sans limite de timeout
+                timeout=None  # Pas de timeout pour laisser Ollama démarrer à son rythme
             )
             if response.status_code == 200:
                 models = response.json().get('models', [])
@@ -88,7 +88,7 @@ class LocalLLMFallback:
             response = requests.post(
                 self.endpoint,
                 json=payload,
-                timeout=60  # Ollama peut être lent
+                timeout=None  # Pas de timeout pour laisser Ollama répondre à son rythme
             )
             
             if response.status_code == 200:

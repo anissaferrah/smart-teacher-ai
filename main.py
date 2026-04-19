@@ -23,6 +23,7 @@
 ║    {"type": "interrupt"}                                            ║
 ║    {"type": "next_section"}                                         ║
 ║    {"type": "text",           "content": "..."}                     ║
+║    {"type": "quiz"}                                                ║
 ║                                                                      ║
 ║  Messages WebSocket (serveur → client) :                            ║
 ║    {"type": "session_ready",  "session_id": "..."}                  ║
@@ -31,14 +32,18 @@
 ║    {"type": "audio_chunk",    "data": "<base64>", "mime": "..."}    ║
 ║    {"type": "state_change",   "state": "PROCESSING"}                ║
 ║    {"type": "error",          "message": "..."}                     ║
+║    {"type": "quiz_prompt",    "quiz": {...}}                        ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import asyncio
 import base64
+import json
+import hashlib
 import io
 import logging
 import os
+import socket
 import tempfile
 import time
 import uuid
@@ -50,7 +55,7 @@ import secrets
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from langdetect import detect
 
@@ -63,19 +68,20 @@ from modules.tts            import VoiceEngine
 from modules.multimodal_rag import MultiModalRAG
 from modules.logger         import CsvLogger
 from modules.stt_logger     import STTLogger
-from modules.dialogue       import DialogueManager, DialogState, SessionContext
+from modules.dialogue       import DialogueManager, DialogState, SessionContext, get_redis
 from modules.student_profile import ProfileManager
 from modules.slide_sync      import SlideSynchronizer
 from modules.audio_input     import AudioInput
-from modules.dashboard       import router as dashboard_router, record_session_event
+from modules.dashboard       import router as dashboard_router, record_checkpoint_event, record_session_event, record_trace_event
 from modules.media_storage   import get_storage
 from modules.transcript_search import get_searcher, TranscriptEntry
 from modules.analytics       import get_analytics
 from modules.course_analyzer import get_analyzer
 from modules.ingestion_manager import IngestionManager
-from database.init_db       import check_db_connection, create_tables
+from database.init_db       import AsyncSessionLocal, check_db_connection, create_tables
 from database.crud          import (
     create_learning_session, log_interaction,
+    log_learning_event,
     update_session_state, get_session_stats,
 )
 
@@ -85,6 +91,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("SmartTeacher.Main")
+
+FAVICON_SVG = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>
+<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#7c6dfa'/><stop offset='100%' stop-color='#00e5b0'/></linearGradient></defs>
+<rect width='64' height='64' rx='16' fill='#0b0d16'/><rect x='14' y='14' width='36' height='36' rx='10' fill='url(#g)' opacity='.95'/>
+<path d='M22 24h20v4H22zm0 8h20v4H22zm0 8h14v4H22z' fill='#ffffff'/></svg>"""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -99,6 +110,8 @@ log.info("📦 Services Docker requis:")
 log.info("   • PostgreSQL (5432) — Base de données")
 log.info("   • Redis (6379) — Cache et sessions")
 log.info("   • Qdrant (6333) — RAG vectoriel")
+log.info("   • Elasticsearch (9200) — Recherche full-text historique")
+log.info("   • MinIO (9000) — Stockage média objet")
 log.info("   • Ollama (11434) — LLM local (fallback)")
 log.info("")
 log.info("💡 Lancez-les: docker-compose up -d")
@@ -109,7 +122,10 @@ Config.validate()
 transcriber = Transcriber()
 brain       = Brain()
 voice       = VoiceEngine()
-rag         = MultiModalRAG(db_dir=Config.RAG_DB_DIR)
+rag         = MultiModalRAG(
+    db_dir=Config.RAG_DB_DIR,
+    force_local_embeddings=not Config.RAG_ENABLED,
+)
 csv_logger  = CsvLogger()
 stt_logger  = STTLogger()
 dialogue    = DialogueManager()
@@ -125,6 +141,61 @@ ingestion_manager   = IngestionManager()
 # They are shared module-level dicts initialized once
 
 log.info("✅ Modules prêts")
+
+
+async def log_backend_diagnostics() -> None:
+    """Log backend connectivity at startup so the active fallback path is visible in the terminal."""
+    log.info("🔎 Diagnostic démarrage des services de données:")
+
+    try:
+        search_stats = transcript_searcher.get_stats()
+        if search_stats.get("backend") == "elasticsearch":
+            log.info("   • Elasticsearch: ✅ connecté (%s)", search_stats.get("host", "n/a"))
+        else:
+            log.info("   • Elasticsearch: ℹ️ recherche en mémoire (fallback actif)")
+    except Exception as exc:
+        log.info("   • Elasticsearch: ℹ️ recherche en mémoire (%s)", exc)
+
+    try:
+        storage_status = media_storage.get_status()
+        if storage_status.get("provider") == "minio":
+            log.info("   • MinIO: ✅ connecté (%s)", storage_status.get("endpoint", "n/a"))
+        else:
+            log.info("   • MinIO: ℹ️ stockage local (%s)", storage_status.get("local_root", "media"))
+    except Exception as exc:
+        log.info("   • MinIO: ℹ️ stockage local (%s)", exc)
+
+    try:
+        analytics_engine._init_ch()
+        report = analytics_engine.full_report()
+        if report.get("backend") == "clickhouse":
+            log.info("   • ClickHouse: ✅ connecté")
+        else:
+            log.info("   • ClickHouse: ℹ️ analytics CSV + mémoire")
+    except Exception as exc:
+        log.info("   • ClickHouse: ℹ️ analytics CSV + mémoire (%s)", exc)
+
+    try:
+        redis_client = await get_redis()
+        await asyncio.wait_for(redis_client.ping(), timeout=2.0)
+        redis_kwargs = getattr(redis_client.connection_pool, "connection_kwargs", {}) or {}
+        redis_host = redis_kwargs.get("host", Config.REDIS_HOST)
+        redis_port = redis_kwargs.get("port", Config.REDIS_PORT)
+        log.info("   • Redis: ✅ connecté (%s:%s)", redis_host, redis_port)
+    except Exception as exc:
+        log.info("   • Redis: ⚠️ indisponible (%s)", exc)
+
+
+async def save_media_bytes(object_name: str, data: bytes, content_type: str) -> None:
+    try:
+        await asyncio.to_thread(media_storage.upload_bytes, data, object_name, content_type)
+    except Exception as exc:
+        log.debug("media save skipped (%s): %s", object_name, exc)
+
+
+async def save_media_json(object_name: str, payload: dict) -> None:
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    await save_media_bytes(object_name, data, "application/json")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -158,6 +229,8 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.info(f"ℹ️ PostgreSQL non disponible au démarrage ({exc}) — mode dégradé activé")
 
+    await log_backend_diagnostics()
+
     yield
 
 
@@ -168,12 +241,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.middleware("http")
+async def disable_html_cache(request: Request, call_next):
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("text/html"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 if Path("static").exists():
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # 📸 Routes pour les PNG slides (images visuelles du cours)
 if Path("media").exists():
     app.mount("/media", StaticFiles(directory="media"), name="media")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_icon():
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml")
 
 app.include_router(dashboard_router)
 
@@ -319,13 +408,20 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     audio_stream_task: asyncio.Task | None = None
     current_stream_id: int = 0
     presentation_task: asyncio.Task | None = None
+    next_slide_prefetch_task: asyncio.Task | None = None
     current_presentation_key: tuple[str, int, int] | None = None
     current_presentation_text: str = ""
     current_presentation_cursor: int = 0
+    current_chapter_title: str = ""
+    current_section_title: str = ""
     websocket_closed = False
     student_profile: dict = {}  # ✅ Profil de l'étudiant pour timing adaptatif
     interrupt_audio: bool = False  # 🚨 Flag pour interrompre le TTS en temps réel
     presentation_start_time: float = 0.0  # ✅ NOUVEAU: Timestamp quand présentation commence
+    learning_session_db_id: uuid.UUID | None = None
+    text_question_task: asyncio.Task | None = None
+    active_text_turn_id: int = 0
+    text_turn_seq: int = 0
 
     async def send(data: dict):
         nonlocal websocket_closed
@@ -413,7 +509,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             log.error(f"❌ Error in handle_post_response: {e}")
             return False
 
-    async def send_state(state: DialogState, substep: str = "", details: dict = None, metrics: dict = None):
+    async def send_state(state: DialogState, substep: str = "", details: dict = None, metrics: dict = None, turn_id: int | None = None):
         """
         ✅ ULTIME v2: État ENRICHI COMPLET avec tous les sous-états et métriques temps réel.
         
@@ -433,7 +529,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # ═══════════════════════════════════════════════════════════════════════
         substep_full = {
             # Audio Capture
-            "stt_language_detection": {"emoji": "🌍", "step": "Language Detection", "desc": "Language identification", "detail": "(EN/FR/AR auto-detect)"},
+            "stt_language_detection": {"emoji": "🌍", "step": "Language Detection", "desc": "Language identification", "detail": "(FR/EN auto-detect)"},
             "prosody_analysis": {"emoji": "📊", "step": "Prosody Analysis", "desc": "Speech rate, hesitations, intonation", "detail": "(Emotion & confusion detection)"},
             
             # RAG Phase
@@ -503,6 +599,31 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # Additional details
         if details and details.get("reason"):
             msg_lines.append(f"   🎯 Reason: {details['reason'].replace('_', ' ').title()}")
+
+        if details:
+            detail_items = [
+                ("course_title", "📘 Course"),
+                ("chapter_title", "📚 Chapter"),
+                ("section_title", "🔖 Section"),
+                ("slide_title", "🖼️ Slide"),
+                ("question_text", "❓ Question"),
+                ("transcription", "🎤 STT"),
+                ("engine", "🛠️ Engine"),
+                ("voice", "🎙️ Voice"),
+                ("tts_engine", "🗣️ TTS Engine"),
+                ("tts_voice", "🎙️ TTS Voice"),
+                ("answer_preview", "💬 Answer"),
+            ]
+            for key, label in detail_items:
+                value = details.get(key)
+                if value is None:
+                    continue
+                value_text = str(value).strip()
+                if not value_text:
+                    continue
+                if len(value_text) > 160:
+                    value_text = value_text[:160].rstrip() + "…"
+                msg_lines.append(f"   {label}: {value_text}")
         
         # ═══════════════════════════════════════════════════════════════════════
         # REAL-TIME METRICS SECTION 📊
@@ -568,6 +689,21 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 msg_lines.append(f"   {bar} {prog:.0%}")
         
         display_message = "\n".join(msg_lines)
+
+        try:
+            record_trace_event({
+                "session_id": session_id,
+                "state": state.value,
+                "state_name": state_name,
+                "substep": substep,
+                "display_message": display_message,
+                "details": details or {},
+                "metrics": metrics or {},
+                "emoji": emoji,
+                **({"turn_id": turn_id} if turn_id is not None else {}),
+            })
+        except Exception as trace_exc:
+            log.debug(f"[{session_id[:8]}] trace event skipped: {trace_exc}")
         
         return await send({
             "type": "state_change",
@@ -580,7 +716,530 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             "metrics": metrics or {},
             "substep_full": substep_full,
             "timestamp": time.time(),
+            **({"turn_id": turn_id} if turn_id is not None else {}),
         })
+
+    async def cancel_text_question_task() -> None:
+        nonlocal text_question_task, active_text_turn_id
+        if text_question_task and not text_question_task.done():
+            task = text_question_task
+            task.cancel()
+
+            def _log_done(done_task: asyncio.Task) -> None:
+                try:
+                    done_task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    log.debug(f"[{session_id[:8]}] text question task cancel error: {exc}")
+
+            task.add_done_callback(_log_done)
+        text_question_task = None
+        active_text_turn_id = 0
+
+    async def process_text_question_turn(
+        *,
+        turn_id: int,
+        content: str,
+        lang: str,
+        subj: str,
+        chunks_with_scores: list,
+        rag_time: float,
+        avg_score: float,
+        is_confused: bool,
+        confusion_reason: str,
+        question_for_llm: str,
+        llm_start: float,
+        question_ctx: SessionContext | None,
+        presentation_cursor: int,
+        current_chapter_title: str,
+        current_section_title: str,
+        current_chapter_idx: int | None,
+        section_index_int: int | None,
+    ) -> None:
+        nonlocal text_question_task
+
+        try:
+            if turn_id != active_text_turn_id:
+                return
+
+            # ✅ STREAMING LLM WITH REAL-TIME METRICS
+            ai_response = ""
+            llm_confidence = 0.7
+            chunk_count = 0
+            tokens_generated = 0
+
+            try:
+                async for chunk_text, full_text in rag.generate_final_answer_stream(
+                    chunks_with_scores,
+                    question=question_for_llm,
+                    history=history,
+                    language=lang,
+                    current_chapter_title=current_chapter_title,
+                    current_section_title=current_section_title,
+                ):
+                    ai_response = full_text
+                    chunk_count += 1
+                    tokens_generated = len(ai_response.split())
+                    elapsed_ms = (time.time() - llm_start) * 1000
+                    tokens_per_sec = (tokens_generated / elapsed_ms * 1000) if elapsed_ms > 0 else 0
+
+                    await send_state(
+                        DialogState.PROCESSING,
+                        "streaming_llm",
+                        {"chunk": chunk_count, "text": chunk_text[:80]},
+                        {
+                            "tokens_generated": tokens_generated,
+                            "tokens_per_sec": round(tokens_per_sec, 1),
+                            "duration_ms": round(elapsed_ms, 1),
+                            "progress_pct": 55 + min(chunk_count * 5, 20),
+                        },
+                        turn_id=turn_id,
+                    )
+
+            except Exception as rag_exc:
+                log.warning(
+                    f"[{session_id[:8]}] ⚠️  RAG failed ({type(rag_exc).__name__}): {str(rag_exc)[:100]} → Fallback brain.ask()..."
+                )
+                try:
+                    ai_response, _ = await asyncio.to_thread(
+                        brain.ask,
+                        question_for_llm,
+                        reply_language=lang,
+                        session_id=session_id,
+                    )
+                    ai_response = brain._clean_for_speech(ai_response)
+                    llm_confidence = 0.5
+                except Exception as fallback_exc:
+                    log.error(f"[{session_id[:8]}] ❌ Fallback also failed: {fallback_exc}")
+                    ai_response = "Je suis désolé, j'ai rencontré une erreur technique. Veuillez réessayer."
+                    llm_confidence = 0.0
+
+            llm_time = time.time() - llm_start
+
+            if turn_id != active_text_turn_id:
+                return
+
+            history.append({"role": "user", "content": content})
+            history.append({"role": "assistant", "content": ai_response})
+
+            # ✅ UPDATE STATE: TTS Generation
+            tts_start = time.time()
+            num_chunks = max(1, len(ai_response) // 200)
+            await send_state(
+                DialogState.PROCESSING,
+                "tts_text_chunking",
+                {"chunks_total": num_chunks},
+                {"progress_pct": 78},
+                turn_id=turn_id,
+            )
+
+            audio_bytes, tts_time, tts_engine, tts_voice, mime = await voice.generate_audio_async(
+                ai_response,
+                language_code=lang,
+            )
+
+            await send_state(
+                DialogState.PROCESSING,
+                "tts_generation",
+                {"engine": tts_engine, "voice": tts_voice},
+                {
+                    "audio_bytes": len(audio_bytes) if audio_bytes else 0,
+                    "duration_ms": round(tts_time * 1000, 1),
+                    "progress_pct": 90,
+                },
+                turn_id=turn_id,
+            )
+
+            if turn_id != active_text_turn_id:
+                return
+
+            if question_ctx:
+                try:
+                    await dialogue.transition(question_ctx.session_id, DialogState.RESPONDING)
+                except ValueError:
+                    return
+            response_metrics = {
+                "retrieval_time": round(rag_time / 1000.0, 3),
+                "chunks": len(chunks_with_scores),
+                "document_score": round(avg_score, 2),
+                "llm_time": round(llm_time, 2),
+                "tts_time": round(tts_time, 2),
+                "total_time": round((rag_time / 1000.0) + llm_time + tts_time, 2),
+                "tokens": tokens_generated,
+                "words": len(ai_response.split()),
+                "sentences": chunk_count,
+                "confidence": round(llm_confidence, 2),
+                "progress_pct": 95,
+            }
+            await send_state(
+                DialogState.RESPONDING,
+                "",
+                {
+                    "question_text": content,
+                    "answer_preview": ai_response[:160],
+                    "subject": subj,
+                    "slide_title": current_section_title or current_chapter_title or "",
+                    "chapter_title": current_chapter_title or "",
+                    "section_title": current_section_title or "",
+                    "tts_engine": tts_engine,
+                    "tts_voice": tts_voice,
+                },
+                response_metrics,
+                turn_id=turn_id,
+            )
+
+            log.info(f"[{session_id[:8]}] 📤 Envoi answer_text: {len(ai_response)} chars | subj={subj}")
+            await send({
+                "type": "answer_text",
+                "text": ai_response,
+                "subject": subj,
+                "rag_chunks": len(chunks_with_scores),
+                "turn_id": turn_id,
+            })
+            log.info(f"[{session_id[:8]}] ✅ answer_text envoyé")
+
+            if audio_bytes:
+                await send({
+                    "type": "audio_chunk",
+                    "data": base64.b64encode(audio_bytes).decode(),
+                    "mime": mime,
+                    "final": True,
+                    "turn_id": turn_id,
+                })
+
+            media_stamp = int(time.time() * 1000)
+            transcript_payload = {
+                "kind": "text_question",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "question_text": content,
+                "answer_text": ai_response,
+                "language": lang,
+                "subject": subj,
+                "chapter_title": current_chapter_title or "",
+                "section_title": current_section_title or "",
+                "chapter_index": current_chapter_idx,
+                "section_index": section_index_int,
+                "char_position": presentation_cursor,
+                "audio_answer_path": f"turns/answers/{session_id}/{turn_id}_{media_stamp}.{'mp3' if audio_bytes and 'mpeg' in (mime or '') else 'webm'}" if audio_bytes else "",
+            }
+            await save_media_json(f"turns/transcripts/{session_id}/{turn_id}_{media_stamp}.json", transcript_payload)
+            if audio_bytes:
+                answer_audio_object = transcript_payload["audio_answer_path"]
+                await save_media_bytes(answer_audio_object, audio_bytes, mime or "audio/mpeg")
+
+            await send_state(
+                DialogState.RESPONDING,
+                "response_complete",
+                {
+                    "question_text": content,
+                    "answer_preview": ai_response[:160],
+                    "subject": subj,
+                    "slide_title": current_section_title or current_chapter_title or "",
+                    "chapter_title": current_chapter_title or "",
+                    "section_title": current_section_title or "",
+                    "tts_engine": tts_engine,
+                    "tts_voice": tts_voice,
+                },
+                response_metrics,
+                turn_id=turn_id,
+            )
+
+            if question_ctx:
+                try:
+                    await dialogue.transition(question_ctx.session_id, DialogState.LISTENING)
+                except ValueError:
+                    return
+            await send_state(DialogState.LISTENING)
+
+            if turn_id != active_text_turn_id:
+                return
+
+            # ── Analytics & Recherche ─────────────────────────────────
+            try:
+                transcript_searcher.index_interaction(
+                    session_id=session_id,
+                    student_q=content,
+                    teacher_a=ai_response,
+                    language=lang,
+                    course_id="",
+                    subject=subj,
+                )
+                analytics_engine.record_interaction(
+                    session_id=session_id,
+                    question=content,
+                    answer=ai_response,
+                    stt_time=0,
+                    llm_time=llm_time,
+                    tts_time=tts_time,
+                    language=lang,
+                    subject=subj,
+                )
+                try:
+                    text_profile = await profile_mgr.update_from_interaction(
+                        session_id,
+                        "qa",
+                        topic=(current_section_title or current_chapter_title or subj or ""),
+                        confused=is_confused,
+                        response_time=rag_time / 1000.0 + llm_time + tts_time,
+                        confidence=0.85 if not is_confused else 0.35,
+                        reward=1.0 if not is_confused else 0.0,
+                        action_taken="reformulate" if is_confused else "answer",
+                    )
+                    if text_profile:
+                        student_profile.update(text_profile.to_dict())
+
+                    await persist_learning_turn(
+                        event_type="qa",
+                        question_text=content,
+                        answer_text=ai_response,
+                        language=lang,
+                        subject=subj or current_section_title or current_chapter_title or "",
+                        course_id_value=course_id or (question_ctx.course_id if question_ctx and question_ctx.course_id else None),
+                        confusion_detected=is_confused,
+                        confusion_reason=confusion_reason,
+                        action_taken="reformulate" if is_confused else "answer",
+                        reward=1.0 if not is_confused else 0.0,
+                        stt_time=0.0,
+                        llm_time=llm_time,
+                        tts_time=tts_time,
+                        total_time=rag_time / 1000.0 + llm_time + tts_time,
+                        profile_snapshot=text_profile.to_dict() if text_profile else {},
+                        concept=current_section_title or current_chapter_title or subj or "",
+                        chapter_index=current_chapter_idx,
+                        section_index=section_index_int,
+                        char_position=presentation_cursor,
+                        extra_payload={
+                            "source": "text",
+                            "rag_chunks": len(chunks_with_scores),
+                            "confidence": llm_confidence,
+                        },
+                    )
+                except Exception as learning_exc:
+                    log.debug(f"[{session_id[:8]}] Text learning log skipped: {learning_exc}")
+
+                record_session_event({
+                    "session_id": session_id,
+                    "language": lang,
+                    "question": content,
+                    "stt_text": content,
+                    "answer": ai_response,
+                    "turn_id": turn_id,
+                    "stt_time": 0.0,
+                    "llm_time": round(llm_time, 2),
+                    "tts_time": round(tts_time, 2),
+                    "total_time": round(llm_time + tts_time, 2),
+                    "meets_kpi": (llm_time + tts_time) < 5.0,
+                    "subject": subj,
+                    "confusion": is_confused,
+                    "confusion_reason": confusion_reason,
+                    "source": "text",
+                    "slide_title": current_section_title or current_chapter_title or "",
+                    "chapter_title": current_chapter_title or "",
+                    "section_title": current_section_title or "",
+                    "tts_engine": tts_engine,
+                    "tts_voice": tts_voice,
+                    "chapter_index": current_chapter_idx,
+                    "section_index": section_index_int,
+                    "char_position": presentation_cursor,
+                })
+            except Exception as _ae:
+                log.debug("analytics error: %s", _ae)
+        finally:
+            if asyncio.current_task() is text_question_task:
+                text_question_task = None
+
+    async def process_quiz_request(
+        *,
+        quiz_topic: str,
+        lang: str,
+        subj: str,
+        chunks_with_scores: list,
+        question_ctx: SessionContext | None,
+        presentation_cursor: int,
+        current_chapter_title: str,
+        current_section_title: str,
+        current_chapter_idx: int | None,
+        section_index_int: int | None,
+        course_id: str,
+        course_title: str,
+        course_domain: str,
+        slide_path: str,
+    ) -> None:
+        quiz_topic = (quiz_topic or current_section_title or current_chapter_title or course_title or "Quiz").strip()
+        try:
+            await cancel_text_question_task()
+            await cancel_audio_stream(notify_client=False)
+            await cancel_presentation_task(notify_client=False)
+
+            if question_ctx:
+                try:
+                    await dialogue.transition(question_ctx.session_id, DialogState.PROCESSING)
+                except ValueError:
+                    pass
+
+            await send_state(
+                DialogState.PROCESSING,
+                "quiz_preparing",
+                {
+                    "type": "quiz",
+                    "quiz_topic": quiz_topic,
+                    "chapter_title": current_chapter_title or "",
+                    "section_title": current_section_title or "",
+                },
+                {
+                    "progress_pct": 25,
+                    "quiz_topic": quiz_topic,
+                },
+            )
+
+            quiz_llm_start = time.time()
+            quiz_payload, quiz_confidence = await asyncio.to_thread(
+                rag.generate_quiz,
+                chunks_with_scores,
+                question=quiz_topic,
+                history=[],
+                language=lang,
+                student_level=session_level,
+                current_chapter_title=current_chapter_title,
+                current_section_title=current_section_title,
+                question_count=3,
+            )
+            quiz_llm_time = time.time() - quiz_llm_start
+
+            if not isinstance(quiz_payload, dict):
+                quiz_payload = {}
+
+            quiz_payload.setdefault("title", "Quiz rapide")
+            quiz_payload.setdefault("topic", quiz_topic)
+            quiz_payload.setdefault("difficulty", session_level)
+            quiz_payload.setdefault("language", lang)
+            quiz_payload.setdefault("chapter_title", current_chapter_title or "")
+            quiz_payload.setdefault("section_title", current_section_title or "")
+            quiz_payload.setdefault("course_title", course_title or "")
+            quiz_payload.setdefault("course_domain", course_domain or "")
+            quiz_payload.setdefault("slide_title", current_section_title or current_chapter_title or "")
+            quiz_payload.setdefault("slide_path", slide_path or "")
+
+            questions = quiz_payload.get("questions") if isinstance(quiz_payload.get("questions"), list) else []
+            quiz_payload["question_count"] = len(questions)
+            quiz_payload["confidence"] = round(float(quiz_confidence or 0.0), 3)
+
+            await send({
+                "type": "quiz_prompt",
+                "question": quiz_payload.get("title") or quiz_payload.get("topic") or quiz_topic,
+                "quiz": quiz_payload,
+                "chapter_title": current_chapter_title or "",
+                "section_title": current_section_title or "",
+                "course_id": course_id or "",
+                "course_title": course_title or "",
+                "course_domain": course_domain or "",
+                "language": lang,
+                "level": session_level,
+                "confidence": quiz_payload["confidence"],
+            })
+
+            if question_ctx:
+                try:
+                    await dialogue.transition(question_ctx.session_id, DialogState.LISTENING)
+                except ValueError:
+                    return
+
+            await send_state(
+                DialogState.LISTENING,
+                details={
+                    "quiz_topic": quiz_payload.get("topic") or quiz_topic,
+                    "quiz_questions": quiz_payload.get("question_count", 0),
+                    "chapter_title": current_chapter_title or "",
+                    "section_title": current_section_title or "",
+                },
+            )
+
+            try:
+                quiz_profile = await profile_mgr.update_from_interaction(
+                    session_id,
+                    "quiz",
+                    topic=quiz_payload.get("topic") or current_section_title or current_chapter_title or subj or "",
+                    confused=False,
+                    response_time=quiz_llm_time,
+                    confidence=None,
+                    reward=0.0,
+                    action_taken="quiz",
+                )
+                if quiz_profile:
+                    student_profile.update(quiz_profile.to_dict())
+
+                await persist_learning_turn(
+                    event_type="quiz",
+                    question_text=quiz_topic,
+                    answer_text=f"{quiz_payload.get('title', 'Quiz rapide')} ({quiz_payload.get('question_count', 0)} questions)",
+                    language=lang,
+                    subject=subj or current_section_title or current_chapter_title or "",
+                    course_id_value=course_id or (question_ctx.course_id if question_ctx and question_ctx.course_id else None),
+                    confusion_detected=False,
+                    action_taken="quiz",
+                    reward=0.0,
+                    stt_time=0.0,
+                    llm_time=quiz_llm_time,
+                    tts_time=0.0,
+                    total_time=quiz_llm_time,
+                    profile_snapshot=quiz_profile.to_dict() if quiz_profile else {},
+                    concept=current_section_title or current_chapter_title or subj or "",
+                    chapter_index=current_chapter_idx,
+                    section_index=section_index_int,
+                    char_position=presentation_cursor,
+                    extra_payload={
+                        "source": "quiz",
+                        "quiz": quiz_payload,
+                        "quiz_confidence": round(float(quiz_confidence or 0.0), 3),
+                    },
+                    session_state=DialogState.LISTENING.value,
+                )
+            except Exception as quiz_log_exc:
+                log.debug(f"[{session_id[:8]}] Quiz learning log skipped: {quiz_log_exc}")
+
+            record_session_event({
+                "session_id": session_id,
+                "language": lang,
+                "question": quiz_topic,
+                "stt_text": quiz_topic,
+                "answer": quiz_payload.get("title", "Quiz rapide"),
+                "turn_id": None,
+                "stt_time": 0.0,
+                "llm_time": round(quiz_llm_time, 2),
+                "tts_time": 0.0,
+                "total_time": round(quiz_llm_time, 2),
+                "meets_kpi": quiz_llm_time < 5.0,
+                "subject": subj,
+                "confusion": False,
+                "confusion_reason": "",
+                "source": "quiz",
+                "slide_title": current_section_title or current_chapter_title or "",
+                "chapter_title": current_chapter_title or "",
+                "section_title": current_section_title or "",
+                "chapter_index": current_chapter_idx,
+                "section_index": section_index_int,
+                "char_position": presentation_cursor,
+                "quiz_questions": quiz_payload.get("question_count", 0),
+            })
+
+            try:
+                analytics_engine.record_section(
+                    session_id,
+                    course_id or "",
+                    current_chapter_idx or 0,
+                    section_index_int or 0,
+                    event_type="quiz",
+                    language=lang,
+                )
+            except Exception as analytics_exc:
+                log.debug(f"[{session_id[:8]}] Quiz analytics skipped: {analytics_exc}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Erreur quiz: {e}")
+            await send({"type": "error", "message": f"Erreur quiz: {str(e)}"})
 
     async def set_listening_state() -> None:
         """
@@ -620,6 +1279,435 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         
         await send_state(DialogState.LISTENING)
 
+    def _safe_uuid(value: str | uuid.UUID | None) -> uuid.UUID | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, uuid.UUID):
+            return value
+        try:
+            return uuid.UUID(str(value))
+        except Exception:
+            return None
+
+    async def persist_learning_turn(
+        *,
+        event_type: str,
+        question_text: str,
+        answer_text: str,
+        language: str,
+        subject: str = "",
+        course_id_value: str | uuid.UUID | None = None,
+        confusion_detected: bool = False,
+        confusion_reason: str = "",
+        action_taken: str = "answer",
+        reward: float = 0.0,
+        stt_time: float = 0.0,
+        llm_time: float = 0.0,
+        tts_time: float = 0.0,
+        total_time: float = 0.0,
+        profile_snapshot: dict | None = None,
+        concept: str = "",
+        chapter_index: int | None = None,
+        section_index: int | None = None,
+        char_position: int | None = None,
+        extra_payload: dict | None = None,
+        session_state: str = DialogState.LISTENING.value,
+    ) -> None:
+        """Persist a turn in PostgreSQL so we can train later from real usage."""
+        nonlocal learning_session_db_id
+
+        if learning_session_db_id is None:
+            return
+
+        course_uuid = _safe_uuid(course_id_value)
+        if course_uuid is None and ctx and ctx.course_id:
+            course_uuid = _safe_uuid(ctx.course_id)
+
+        try:
+            async with AsyncSessionLocal() as db:
+                await log_interaction(
+                    db=db,
+                    session_id=learning_session_db_id,
+                    student_id=session_id,
+                    course_id=course_uuid,
+                    interaction_type=event_type,
+                    question=question_text,
+                    answer=answer_text,
+                    language=language,
+                    stt_time=stt_time,
+                    llm_time=llm_time,
+                    tts_time=tts_time,
+                    total_time=total_time,
+                    kpi_ok=1 if total_time <= Config.MAX_RESPONSE_TIME else 0,
+                )
+                await log_learning_event(
+                    db=db,
+                    session_id=learning_session_db_id,
+                    student_id=session_id,
+                    course_id=course_uuid,
+                    event_type=event_type,
+                    input_text=question_text,
+                    output_text=answer_text,
+                    concept=concept or subject or None,
+                    action_taken=action_taken,
+                    confusion_score=1.0 if confusion_detected else 0.0,
+                    reward=reward,
+                    stt_time=stt_time,
+                    llm_time=llm_time,
+                    tts_time=tts_time,
+                    total_time=total_time,
+                    student_state=profile_snapshot or {},
+                    event_payload={
+                        "subject": subject,
+                        "language": language,
+                        "confusion_reason": confusion_reason,
+                        "chapter_index": chapter_index,
+                        "section_index": section_index,
+                        "char_position": char_position,
+                        **(extra_payload or {}),
+                    },
+                )
+                await update_session_state(
+                    db,
+                    learning_session_db_id,
+                    session_state,
+                    chapter_index=chapter_index,
+                    section_index=section_index,
+                    char_position=char_position,
+                )
+        except Exception as exc:
+            log.debug(f"[{session_id[:8]}] Learning event persistence skipped: {exc}")
+
+    def _format_presentation_point() -> tuple[str, str, int]:
+        chapter_no = (ctx.chapter_index + 1) if ctx else 0
+        section_no = (ctx.section_index + 1) if ctx else 0
+
+        location_bits: list[str] = []
+        if chapter_no:
+            location_bits.append(f"chapitre {chapter_no}")
+        if section_no:
+            location_bits.append(f"section {section_no}")
+
+        location_label = ", ".join(location_bits) if location_bits else "point courant"
+        total_chars = len(current_presentation_text or "")
+        cursor_label = f"{current_presentation_cursor}/{total_chars}" if total_chars else str(current_presentation_cursor)
+        return location_label, cursor_label, total_chars
+
+    async def record_pause_point(reason: str, notice_prefix: str = "⏸ Point d'arrêt mémorisé") -> str:
+        nonlocal ctx
+
+        if not ctx:
+            return ""
+
+        location_label, cursor_label, total_chars = _format_presentation_point()
+        slide_id = ":".join(str(part) for part in current_presentation_key) if current_presentation_key else None
+
+        try:
+            paused_ctx = await dialogue.pause_session(
+                ctx.session_id,
+                slide_id=slide_id,
+                char_offset=current_presentation_cursor,
+                presentation_text=current_presentation_text or None,
+                presentation_cursor=current_presentation_cursor,
+                presentation_key=slide_id,
+                slide_title=current_section_title or current_chapter_title or "",
+            )
+            if paused_ctx:
+                ctx = paused_ctx
+        except Exception as pause_exc:
+            log.debug(f"[{session_id[:8]}] pause_session skipped: {pause_exc}")
+
+        point_text = f"{notice_prefix} — {location_label}, position {cursor_label}. Narration gardée en cache."
+        record_checkpoint_event({
+            "session_id": session_id,
+            "language": session_lang,
+            "subject": (ctx.course_analysis.get("course_domain", "") if ctx and ctx.course_analysis else ""),
+            "checkpoint_type": "pause",
+            "point_text": point_text,
+            "location_label": location_label,
+            "cursor_label": cursor_label,
+            "slide_id": slide_id,
+            "slide_title": current_section_title or current_chapter_title or "",
+            "chapter_index": ctx.chapter_index if ctx else None,
+            "section_index": ctx.section_index if ctx else None,
+            "char_position": current_presentation_cursor,
+            "reason": reason,
+            "source": "checkpoint",
+        })
+        await send({"type": "system_notice", "text": point_text})
+
+        try:
+            await persist_learning_turn(
+                event_type="pause",
+                question_text="",
+                answer_text="",
+                language=session_lang,
+                subject=(ctx.course_analysis.get("course_domain", "") if ctx and ctx.course_analysis else ""),
+                course_id_value=ctx.course_id if ctx else None,
+                confusion_detected=False,
+                confusion_reason=reason,
+                action_taken="pause",
+                reward=0.0,
+                stt_time=0.0,
+                llm_time=0.0,
+                tts_time=0.0,
+                total_time=0.0,
+                profile_snapshot=student_profile.copy(),
+                concept=ctx.last_slide_explained if ctx else "",
+                chapter_index=ctx.chapter_index if ctx else None,
+                section_index=ctx.section_index if ctx else None,
+                char_position=current_presentation_cursor,
+                extra_payload={
+                    "reason": reason,
+                    "point_text": point_text,
+                    "slide_id": slide_id,
+                    "cursor_label": cursor_label,
+                    "total_chars": total_chars,
+                },
+                session_state=DialogState.WAITING.value,
+            )
+        except Exception as learning_exc:
+            log.debug(f"[{session_id[:8]}] Pause learning log skipped: {learning_exc}")
+
+        return point_text
+
+    async def cancel_next_slide_prefetch() -> None:
+        nonlocal next_slide_prefetch_task
+        if next_slide_prefetch_task and not next_slide_prefetch_task.done():
+            next_slide_prefetch_task.cancel()
+            try:
+                await next_slide_prefetch_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.debug(f"[{session_id[:8]}] next slide prefetch cancel error: {exc}")
+        next_slide_prefetch_task = None
+
+    async def warm_presentation_audio_cache(narration_text: str, language_code: str, rate: str) -> None:
+        if not narration_text.strip():
+            return
+
+        for sentence, _, _ in split_sentences_with_spans(narration_text):
+            if not sentence.strip():
+                continue
+            try:
+                await synthesize_cached_tts(
+                    sentence,
+                    language_code=language_code,
+                    rate=rate,
+                    cache_scope="prefetch",
+                )
+            except Exception as cache_exc:
+                log.debug(f"[{session_id[:8]}] Prefetch TTS skipped: {cache_exc}")
+
+    async def prefetch_next_slide(
+        current_slide_key: tuple[str, int, int],
+        course_id_value: str,
+        chapter_index_value: int,
+        section_index_value: int,
+        language_code: str,
+        student_level_value: str,
+        course_summary_value: str,
+        rate_value: str,
+        current_slide_title: str,
+    ) -> None:
+        if not course_id_value:
+            return
+
+        next_candidates = [
+            (chapter_index_value, section_index_value + 1),
+            (chapter_index_value + 1, 0),
+        ]
+
+        next_slide_ctx = None
+        next_chapter_index = None
+        next_section_index = None
+
+        for candidate_chapter, candidate_section in next_candidates:
+            if candidate_chapter < 0 or candidate_section < 0:
+                continue
+            next_slide_ctx = await load_course_slide_context(
+                course_id_value,
+                candidate_chapter,
+                candidate_section,
+            )
+            if next_slide_ctx:
+                next_chapter_index = candidate_chapter
+                next_section_index = candidate_section
+                break
+
+        if not next_slide_ctx or next_chapter_index is None or next_section_index is None:
+            return
+
+        next_slide_id = f"{course_id_value}:{next_chapter_index}:{next_section_index}"
+
+        if current_presentation_key != current_slide_key:
+            return
+
+        cached_snapshot = await dialogue.load_presentation_snapshot(session_id, next_slide_id)
+        next_narration_text = (cached_snapshot or {}).get("presentation_text") or ""
+        next_cursor = int((cached_snapshot or {}).get("presentation_cursor") or 0)
+
+        if not next_narration_text:
+            next_narration_text = await explain_slide_focused(
+                slide_content=next_slide_ctx.get("content") or "",
+                chapter_idx=next_chapter_index,
+                chapter_title=next_slide_ctx.get("chapter_title") or "",
+                section_title=next_slide_ctx.get("section_title") or "",
+                language=language_code,
+                student_level=student_level_value,
+                course_summary=course_summary_value,
+                is_resume=False,
+                session_id=session_id,
+            )
+            next_narration_text = next_narration_text.strip()
+            next_cursor = 0
+
+        if not next_narration_text or current_presentation_key != current_slide_key:
+            return
+
+        await dialogue.save_presentation_snapshot(
+            session_id,
+            next_slide_id,
+            next_narration_text,
+            presentation_cursor=next_cursor,
+            slide_title=next_slide_ctx.get("section_title") or next_slide_ctx.get("chapter_title") or current_slide_title,
+        )
+
+        await warm_presentation_audio_cache(next_narration_text, language_code, rate_value)
+
+        log.info(
+            f"[{session_id[:8]}] ✅ Next slide prefetched | key={next_slide_id} | chars={len(next_narration_text)}"
+        )
+
+    async def schedule_next_slide_prefetch(
+        *,
+        current_slide_key: tuple[str, int, int],
+        course_id_value: str,
+        chapter_index_value: int,
+        section_index_value: int,
+        language_code: str,
+        student_level_value: str,
+        course_summary_value: str,
+        rate_value: str,
+        current_slide_title: str,
+    ) -> None:
+        nonlocal next_slide_prefetch_task
+
+        await cancel_next_slide_prefetch()
+
+        async def runner() -> None:
+            nonlocal next_slide_prefetch_task
+            try:
+                await prefetch_next_slide(
+                    current_slide_key=current_slide_key,
+                    course_id_value=course_id_value,
+                    chapter_index_value=chapter_index_value,
+                    section_index_value=section_index_value,
+                    language_code=language_code,
+                    student_level_value=student_level_value,
+                    course_summary_value=course_summary_value,
+                    rate_value=rate_value,
+                    current_slide_title=current_slide_title,
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.debug(f"[{session_id[:8]}] next slide prefetch failed: {exc}")
+            finally:
+                if asyncio.current_task() is next_slide_prefetch_task:
+                    next_slide_prefetch_task = None
+
+        next_slide_prefetch_task = asyncio.create_task(runner())
+
+    async def synthesize_cached_tts(
+        text_to_speak: str,
+        *,
+        language_code: str,
+        rate: str = "+0%",
+        cache_scope: str = "presentation",
+    ) -> tuple[bytes | None, float, str, str, str | None, bool]:
+        """Generate TTS once and reuse cached audio for repeated phrases."""
+        if not text_to_speak or not text_to_speak.strip():
+            return None, 0.0, "none", "none", None, False
+
+        cache_signatures = []
+        try:
+            cache_signatures = voice.get_cache_signatures(language_code)
+        except Exception:
+            cache_signatures = []
+
+        if not cache_signatures:
+            request_provider = getattr(voice, "provider", "edge") or "edge"
+            request_voice_name = getattr(voice, "voice_name", None) or getattr(voice, "voice_id", "none") or "none"
+            cache_signatures = [(request_provider, request_voice_name)]
+
+        cached = None
+        for request_provider, request_voice_name in cache_signatures:
+            try:
+                cached = await dialogue.load_tts_phrase_cache(
+                    text_to_speak,
+                    language=language_code,
+                    rate=rate,
+                    provider=request_provider,
+                    voice_name=request_voice_name,
+                )
+            except Exception as cache_exc:
+                log.debug(f"[{session_id[:8]}] TTS cache lookup skipped: {cache_exc}")
+                cached = None
+            if cached and cached.get("audio_bytes"):
+                break
+
+        if cached and cached.get("audio_bytes"):
+            log.info(
+                f"[{session_id[:8]}] ♻️ TTS cache hit | scope={cache_scope} | "
+                f"provider={cached.get('provider')} | voice={cached.get('voice_name')}"
+            )
+            return (
+                cached.get("audio_bytes"),
+                0.0,
+                cached.get("provider") or request_provider,
+                cached.get("voice_name") or request_voice_name,
+                cached.get("mime"),
+                True,
+            )
+
+        audio_bytes, duration_s, engine_name, voice_name, mime_type = await voice.generate_audio_async(
+            text_to_speak,
+            language_code=language_code,
+            rate=rate,
+        )
+
+        if audio_bytes:
+            try:
+                cache_targets = list(cache_signatures)
+                cache_targets.append((engine_name or cache_signatures[0][0], voice_name or cache_signatures[0][1]))
+                seen_targets: set[tuple[str, str]] = set()
+                for provider_name, voice_label in cache_targets:
+                    target = (provider_name, voice_label)
+                    if target in seen_targets:
+                        continue
+                    seen_targets.add(target)
+                    await dialogue.save_tts_phrase_cache(
+                        text_to_speak,
+                        audio_bytes,
+                        language=language_code,
+                        rate=rate,
+                        provider=provider_name,
+                        voice_name=voice_label,
+                        mime=mime_type or "audio/mpeg",
+                        metadata={
+                            "scope": cache_scope,
+                            "engine": engine_name,
+                            "voice_name": voice_name,
+                            "request_signatures": cache_signatures,
+                        },
+                    )
+            except Exception as cache_exc:
+                log.debug(f"[{session_id[:8]}] TTS cache save skipped: {cache_exc}")
+
+        return audio_bytes, duration_s, engine_name, voice_name, mime_type, False
+
     async def _stream_audio(audio_bytes: bytes, mime: str | None, stream_id: int) -> None:
         chunk_size = 4096
         total_len = len(audio_bytes)
@@ -636,7 +1724,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             # Laisse la boucle événementielle respirer entre chunks
             await asyncio.sleep(0)
 
-    async def cancel_audio_stream(notify_client: bool = False) -> None:
+    async def cancel_audio_stream(notify_client: bool = False, turn_id: int | None = None) -> None:
         nonlocal audio_stream_task
         if audio_stream_task and not audio_stream_task.done():
             audio_stream_task.cancel()
@@ -646,7 +1734,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 pass
         audio_stream_task = None
         if notify_client:
-            await send({"type": "audio_interrupted", "stream_id": current_stream_id})
+            payload = {"type": "audio_interrupted", "stream_id": current_stream_id}
+            if turn_id is not None:
+                payload["turn_id"] = turn_id
+            await send(payload)
 
     async def start_audio_stream(
         audio_bytes: bytes | None,
@@ -734,7 +1825,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             chapter_idx: Index du chapitre
             chapter_title: Titre du chapitre
             section_title: Titre de la section
-            language: fr/en/ar
+            language: fr/en
             student_level: collège/lycée/licence/master/doctorat
             course_summary: Résumé du cours entier (contexte global)
             is_resume: True si pause/reprise (ne pas redémarrer depuis début)
@@ -837,7 +1928,8 @@ Continue from where you stopped or add extra details."""
 Explain naturally. MAX 4 sentences."""
 
             # ✅ LLM call direct (pas de RAG, juste la slide)
-            response, duration = brain.ask(
+            response, duration = await asyncio.to_thread(
+                brain.ask,
                 question=slide_content[:100],  # Juste première partie pour référence
                 course_context=slide_content,  # La slide EST le contexte
                 reply_language=language,
@@ -893,6 +1985,33 @@ Explain naturally. MAX 4 sentences."""
                 session_level = level
                 history.clear()
                 interrupt_audio = False  # 🟢 Réinitialiser le flag
+                await cancel_text_question_task()
+                active_text_turn_id = 0
+                text_turn_seq = 0
+
+                try:
+                    course_uuid = _safe_uuid(msg.get("course_id") or (ctx.course_id if ctx else None))
+                    async with AsyncSessionLocal() as db:
+                        learning_session = await create_learning_session(
+                            db,
+                            student_id=session_id,
+                            course_id=course_uuid,
+                            language=lang,
+                            level=level,
+                        )
+                        await update_session_state(
+                            db,
+                            learning_session.id,
+                            DialogState.LISTENING.value,
+                            chapter_index=0,
+                            section_index=0,
+                            char_position=0,
+                        )
+                        await db.commit()
+                        learning_session_db_id = learning_session.id
+                except Exception as exc:
+                    learning_session_db_id = None
+                    log.warning(f"[{session_id[:8]}] ⚠️ Learning session DB init failed: {exc}")
 
                 await send({"type": "session_ready", "session_id": ctx.session_id})
                 
@@ -904,6 +2023,7 @@ Explain naturally. MAX 4 sentences."""
             # ── audio_chunk — accumule les données audio ───────────────
             elif msg_type == "audio_chunk":
                 raw = msg.get("data", "")
+                turn_id = int(msg.get("turn_id") or 0)
                 if raw:
                     try:
                         decoded = base64.b64decode(raw)
@@ -921,16 +2041,15 @@ Explain naturally. MAX 4 sentences."""
                             if ctx.state == DialogState.PRESENTING.value and time_since_presenting < 1.0:
                                 log.info(f"[{session_id[:8]}] ⚡ TRÈS TÔT interruption ({time_since_presenting:.2f}s après PRESENTING) → annuler préparation")
                             
-                            # ✅ CRUCIAL: Sauvegarder la position AVANT d'annuler
-                            if ctx and current_presentation_cursor > 0:
-                                await dialogue.save_position(ctx.session_id, current_presentation_cursor)
-                                log.info(f"[{session_id[:8]}] 💾 Position saved: cursor={current_presentation_cursor}")
+                            # ✅ CRUCIAL: Sauvegarder le point AVANT d'annuler
+                            await record_pause_point("voice_interrupt", notice_prefix="⏸ Point d'arrêt mémorisé (voix)")
                             
                             # ✅ Annuler la présentation EN COURS pour éviter conflit
                             await cancel_presentation_task(notify_client=True)
-                            await cancel_audio_stream(notify_client=True)
+                            await cancel_audio_stream(notify_client=True, turn_id=turn_id)
+                            await cancel_text_question_task()
                             await dialogue.transition(ctx.session_id, DialogState.LISTENING)
-                            await send_state(DialogState.LISTENING)
+                            await send_state(DialogState.LISTENING, turn_id=turn_id)
                         audio_buffer.append(decoded)
                     except Exception as e:
                         log.error(f"❌ Failed to decode audio chunk: {e}")
@@ -938,6 +2057,7 @@ Explain naturally. MAX 4 sentences."""
             # ── audio_end — traite l'audio accumulé ───────────────────
             elif msg_type == "audio_end":
                 interrupt_audio = False
+                turn_id = int(msg.get("turn_id") or 0)
                 
                 # ✅ REFRESH ctx FROM REDIS (peut être modifié par run_presentation en tâche async)
                 if not ctx:
@@ -947,17 +2067,17 @@ Explain naturally. MAX 4 sentences."""
                 
                 # ✅ SÉCURITÉ: Ne jamais traiter audio_end sans session active
                 if not ctx:
-                    await send({"type": "error", "message": "Aucune session active (démarrez avec start_session)"})
+                    await send({"type": "error", "message": "Aucune session active (démarrez avec start_session)", "turn_id": turn_id})
                     continue
                 
                 # ✅ SÉCURITÉ: Bloquer transition IDLE → PROCESSING (mais LISTENING OK!)
                 if ctx.state == DialogState.IDLE.value:
                     log.warning(f"[{session_id[:8]}] ⚠️ Tentative audio_end en IDLE → ignoré (jamais IDLE → PROCESSING)")
-                    await send({"type": "error", "message": "Session en IDLE, démarrage nécessaire"})
+                    await send({"type": "error", "message": "Session en IDLE, démarrage nécessaire", "turn_id": turn_id})
                     continue
                 
                 if not audio_buffer:
-                    await send({"type": "error", "message": "Aucun audio reçu"})
+                    await send({"type": "error", "message": "Aucun audio reçu", "turn_id": turn_id})
                     continue
                 await cancel_audio_stream(notify_client=False)
 
@@ -966,10 +2086,14 @@ Explain naturally. MAX 4 sentences."""
                 log.info(f"[{session_id[:8]}] 🎙️ Audio buffer assembled: {len(audio_buffer)} chunks = {len(full_audio)} total bytes")
                 audio_buffer.clear()
 
+                media_stamp = int(time.time() * 1000)
+                question_audio_object = f"turns/questions/{session_id}/{turn_id}_{media_stamp}.webm"
+                await save_media_bytes(question_audio_object, full_audio, "audio/webm")
+
                 try:
                     audio_np = audio_bytes_to_numpy(full_audio)
                 except RuntimeError as exc:
-                    await send({"type": "error", "message": str(exc)})
+                    await send({"type": "error", "message": str(exc), "turn_id": turn_id})
                     continue
 
                 # ═══════════════════════════════════════════════════════════════════
@@ -1008,16 +2132,20 @@ Explain naturally. MAX 4 sentences."""
                         f"audio_len {len(audio_np)} samples"
                     )
                 else:
-                    # No speech detected - send error
-                    log.warning(f"[{session_id[:8]}] ⚠️ Silero VAD: No speech detected (all chunks < threshold)")
-                    await send({"type": "error", "message": "Aucune parole détectée (Silero VAD)"})
+                    # No speech detected - send a neutral notice
+                    log.info(f"[{session_id[:8]}] ℹ️ Silero VAD: No speech detected (all chunks < threshold)")
+                    await send({
+                        "type": "system_notice",
+                        "text": "Aucune voix détectée.",
+                        "turn_id": turn_id,
+                    })
                     await dialogue.transition(ctx.session_id, DialogState.LISTENING)
-                    await send_state(DialogState.LISTENING)
+                    await send_state(DialogState.LISTENING, turn_id=turn_id)
                     continue
 
                 # Transition → PROCESSING (sécurisée via state machine)
                 await dialogue.transition(ctx.session_id, DialogState.PROCESSING)
-                await send_state(DialogState.PROCESSING)
+                await send_state(DialogState.PROCESSING, turn_id=turn_id)
 
                 # ══════════════════════════════════════════════════════════════
                 # 🚀 STREAMING PIPELINE: Real-time LLM → TTS
@@ -1025,16 +2153,44 @@ Explain naturally. MAX 4 sentences."""
                 
                 current_stream_id += 1
                 stream_id = current_stream_id
+                turn_id = int(msg.get("turn_id") or 0)
+                response_audio_parts: list[bytes] = []
+                response_audio_mime = ""
                 
                 async def on_text_chunk(sentence: str, full_response: str):
-                    return
+                    chunk_text = (full_response or sentence or "").strip()
+                    if not chunk_text:
+                        return
+                    if not await send({
+                        "type": "answer_text",
+                        "text": chunk_text,
+                        "turn_id": turn_id,
+                        "partial": True,
+                        "final": False,
+                    }):
+                        return
 
                 async def on_transcription(text: str, lang: str, confidence: float):
+                    await send_state(
+                        DialogState.PROCESSING,
+                        "stt_transcription",
+                        {
+                            "transcription": text,
+                            "language": lang,
+                            "confidence": confidence,
+                            "slide_title": current_section_title or current_chapter_title or "",
+                            "chapter_title": current_chapter_title or "",
+                            "section_title": current_section_title or "",
+                        },
+                        {"progress_pct": 12, "confidence": confidence},
+                        turn_id=turn_id,
+                    )
                     if not await send({
                         "type": "transcription",
                         "text": text,
                         "lang": lang,
                         "confidence": confidence,
+                        "turn_id": turn_id,
                     }):
                         log.warning(f"[{session_id[:8]}] ⚠️ Transcription non envoyée")
                 
@@ -1043,13 +2199,17 @@ Explain naturally. MAX 4 sentences."""
                     return await send_state(
                         DialogState.PROCESSING,
                         substep=substep,
-                        details=details or {}
+                        details=details or {},
+                        turn_id=turn_id,
                     )
                 
                 async def on_audio_chunk(audio_bytes: bytes, mime: str):
                     """Stream each sentence's audio as it's generated"""
-                    nonlocal interrupt_audio
+                    nonlocal interrupt_audio, response_audio_mime
                     if audio_bytes:
+                        response_audio_parts.append(audio_bytes)
+                        if mime:
+                            response_audio_mime = mime
                         chunk_size = 4096
                         total_len = len(audio_bytes)
                         for i in range(0, total_len, chunk_size):
@@ -1062,6 +2222,7 @@ Explain naturally. MAX 4 sentences."""
                             if not await send({
                                 "type":      "audio_chunk",
                                 "stream_id": stream_id,
+                                "turn_id":   turn_id,
                                 "data":      base64.b64encode(chunk).decode(),
                                 "mime":      mime,
                                 "final":     (i + chunk_size) >= total_len,
@@ -1092,12 +2253,105 @@ Explain naturally. MAX 4 sentences."""
                         stt_logger=stt_logger,
                     )
 
+                    if result.get("no_speech"):
+                        await send({
+                            "type": "system_notice",
+                            "text": result.get("message", "Aucune voix détectée."),
+                            "turn_id": turn_id,
+                        })
+                        await save_media_json(
+                            f"turns/transcripts/{session_id}/{turn_id}_{media_stamp}.json",
+                            {
+                                "kind": "audio_question",
+                                "session_id": session_id,
+                                "turn_id": turn_id,
+                                "question_audio_path": question_audio_object,
+                                "question_text": result.get("transcription", {}).get("text", ""),
+                                "answer_text": "",
+                                "language": result.get("transcription", {}).get("language", session_lang),
+                                "subject": result.get("subject", ""),
+                                "audio_answer_path": "",
+                                "note": result.get("message", "Aucune voix détectée."),
+                            },
+                        )
+                        await dialogue.transition(ctx.session_id, DialogState.LISTENING)
+                        await send_state(DialogState.LISTENING, turn_id=turn_id)
+                        continue
+
                     if "error" in result:
                         # ✅ Quand STT échoue: passer par CLARIFICATION (transition valide depuis PROCESSING)
-                        await send({"type": "error", "message": result["error"]})
+                        await send({"type": "error", "message": result["error"], "turn_id": turn_id})
+                        await save_media_json(
+                            f"turns/transcripts/{session_id}/{turn_id}_{media_stamp}.json",
+                            {
+                                "kind": "audio_question",
+                                "session_id": session_id,
+                                "turn_id": turn_id,
+                                "question_audio_path": question_audio_object,
+                                "question_text": result.get("transcription", {}).get("text", ""),
+                                "answer_text": "",
+                                "language": result.get("transcription", {}).get("language", session_lang),
+                                "subject": result.get("subject", ""),
+                                "audio_answer_path": "",
+                                "error": result["error"],
+                            },
+                        )
+                        try:
+                            await persist_learning_turn(
+                                event_type="error",
+                                question_text=result.get("transcription", {}).get("text", ""),
+                                answer_text="",
+                                language=result.get("transcription", {}).get("language", session_lang),
+                                subject=result.get("subject", ""),
+                                course_id_value=course_id_for_rag,
+                                confusion_detected=bool(result.get("confusion", {}).get("detected", False)),
+                                confusion_reason=result.get("confusion", {}).get("reason", ""),
+                                action_taken="error",
+                                reward=0.0,
+                                stt_time=float(result.get("performance", {}).get("stt_time", 0.0)),
+                                llm_time=float(result.get("performance", {}).get("llm_time", 0.0)),
+                                tts_time=float(result.get("performance", {}).get("tts_time", 0.0)),
+                                total_time=float(result.get("performance", {}).get("total_time", 0.0)),
+                                profile_snapshot=student_profile.copy(),
+                                concept=ctx.last_slide_explained if ctx else "",
+                                chapter_index=ctx.chapter_index if ctx else None,
+                                section_index=ctx.section_index if ctx else None,
+                                char_position=current_presentation_cursor if ctx else None,
+                                extra_payload={
+                                    "source": "streaming_error",
+                                    "message": result["error"],
+                                },
+                            )
+                        except Exception as learning_exc:
+                            log.debug(f"[{session_id[:8]}] Error learning log skipped: {learning_exc}")
+                        record_session_event({
+                            "session_id": session_id,
+                            "language": result.get("transcription", {}).get("language", session_lang),
+                            "question": result.get("transcription", {}).get("text", ""),
+                            "stt_text": result.get("transcription", {}).get("text", ""),
+                            "answer": "",
+                            "turn_id": turn_id,
+                            "stt_time": float(result.get("performance", {}).get("stt_time", 0.0)),
+                            "llm_time": float(result.get("performance", {}).get("llm_time", 0.0)),
+                            "tts_time": float(result.get("performance", {}).get("tts_time", 0.0)),
+                            "total_time": float(result.get("performance", {}).get("total_time", 0.0)),
+                            "meets_kpi": False,
+                            "subject": result.get("subject", ""),
+                            "confusion": bool(result.get("confusion", {}).get("detected", False)),
+                            "confusion_reason": result.get("confusion", {}).get("reason", ""),
+                            "source": "streaming_error",
+                            "slide_title": current_section_title or current_chapter_title or "",
+                            "chapter_title": current_chapter_title or "",
+                            "section_title": current_section_title or "",
+                            "tts_engine": result.get("tts_engine", ""),
+                            "tts_voice": result.get("tts_voice", ""),
+                            "chapter_index": ctx.chapter_index if ctx else None,
+                            "section_index": ctx.section_index if ctx else None,
+                            "char_position": current_presentation_cursor if ctx else None,
+                        })
                         if ctx:
                             await dialogue.transition(ctx.session_id, DialogState.CLARIFICATION)
-                        await send_state(DialogState.CLARIFICATION)
+                        await send_state(DialogState.CLARIFICATION, turn_id=turn_id)
                         # Puis revenir à LISTENING via set_listening_state()
                         ctx = await dialogue.get_session(session_id) or ctx  # ✅ Refresh ctx
                         await set_listening_state()
@@ -1106,19 +2360,141 @@ Explain naturally. MAX 4 sentences."""
                     # Transition → RESPONDING (now streaming)
                     if ctx:
                         await dialogue.transition(ctx.session_id, DialogState.RESPONDING)
-                    await send_state(DialogState.RESPONDING)
+                    await send_state(
+                        DialogState.RESPONDING,
+                        turn_id=turn_id,
+                        details={
+                            "question_text": result.get("transcription", {}).get("text", ""),
+                            "answer_preview": result.get("answer", "")[:160],
+                            "subject": result.get("subject", ""),
+                            "slide_title": current_section_title or current_chapter_title or "",
+                            "chapter_title": current_chapter_title or "",
+                            "section_title": current_section_title or "",
+                            "tts_engine": result.get("tts_engine", ""),
+                            "tts_voice": result.get("tts_voice", ""),
+                        },
+                    )
 
                     # Send final full answer text
                     if not await send({"type": "answer_text", "text": result["answer"],
-                                "subject": result["subject"], "rag_chunks": result["rag_chunks"]}):
+                                "subject": result["subject"], "rag_chunks": result["rag_chunks"], "turn_id": turn_id,
+                                "partial": False, "final": True}):
                         continue
 
                     # Send performance metrics
-                    if not await send({"type": "performance", **result["performance"]}):
+                    if not await send({"type": "performance", "turn_id": turn_id, **result["performance"]}):
                         continue
+
+                    answer_audio_object = f"turns/answers/{session_id}/{turn_id}_{media_stamp}.{'mp3' if 'mpeg' in (response_audio_mime or '') else 'webm'}"
+                    transcript_payload = {
+                        "kind": "audio_question",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "question_audio_path": question_audio_object,
+                        "question_text": result.get("transcription", {}).get("text", ""),
+                        "answer_text": result.get("answer", ""),
+                        "language": result.get("transcription", {}).get("language", session_lang),
+                        "subject": result.get("subject", ""),
+                        "chapter_title": current_chapter_title or "",
+                        "section_title": current_section_title or "",
+                        "chapter_index": ctx.chapter_index if ctx else None,
+                        "section_index": ctx.section_index if ctx else None,
+                        "char_position": current_presentation_cursor if ctx else None,
+                        "audio_answer_path": answer_audio_object if response_audio_parts else "",
+                    }
+                    await save_media_json(f"turns/transcripts/{session_id}/{turn_id}_{media_stamp}.json", transcript_payload)
+                    if response_audio_parts:
+                        await save_media_bytes(answer_audio_object, b"".join(response_audio_parts), response_audio_mime or "audio/mpeg")
+
+                    try:
+                        confusion_detected = bool(result.get("confusion", {}).get("detected", False))
+                        total_turn_time = float(result["performance"].get("total_time", 0.0))
+                        stream_profile = await profile_mgr.update_from_interaction(
+                            session_id,
+                            "qa",
+                            topic=(result.get("subject") or ""),
+                            confused=confusion_detected,
+                            response_time=total_turn_time,
+                            confidence=0.85 if not confusion_detected else 0.35,
+                            reward=1.0 if (not confusion_detected and result["performance"].get("kpi_ok", False)) else 0.0,
+                            action_taken="reformulate" if confusion_detected else "answer",
+                        )
+                        if stream_profile:
+                            student_profile.update(stream_profile.to_dict())
+
+                        await persist_learning_turn(
+                            event_type="qa",
+                            question_text=result.get("transcription", {}).get("text", ""),
+                            answer_text=result.get("answer", ""),
+                            language=result.get("transcription", {}).get("language", session_lang),
+                            subject=result.get("subject", ""),
+                            course_id_value=course_id_for_rag,
+                            confusion_detected=confusion_detected,
+                            confusion_reason=result.get("confusion", {}).get("reason", ""),
+                            action_taken="reformulate" if confusion_detected else "answer",
+                            reward=1.0 if (not confusion_detected and result["performance"].get("kpi_ok", False)) else 0.0,
+                            stt_time=float(result["performance"].get("stt_time", 0.0)),
+                            llm_time=float(result["performance"].get("llm_time", 0.0)),
+                            tts_time=float(result["performance"].get("tts_time", 0.0)),
+                            total_time=total_turn_time,
+                            profile_snapshot=stream_profile.to_dict() if stream_profile else {},
+                            concept=result.get("subject", ""),
+                            chapter_index=ctx.chapter_index if ctx else None,
+                            section_index=ctx.section_index if ctx else None,
+                            char_position=current_presentation_cursor if ctx else None,
+                            extra_payload={
+                                "source": "streaming",
+                                "rag_chunks": result.get("rag_chunks", 0),
+                                "confusion_reason": result.get("confusion", {}).get("reason", ""),
+                            },
+                        )
+                    except Exception as learning_exc:
+                        log.debug(f"[{session_id[:8]}] Streaming learning log skipped: {learning_exc}")
+                    record_session_event({
+                        "session_id": session_id,
+                        "language": result.get("transcription", {}).get("language", session_lang),
+                        "question": result.get("transcription", {}).get("text", ""),
+                        "stt_text": result.get("transcription", {}).get("text", ""),
+                        "answer": result.get("answer", ""),
+                        "turn_id": turn_id,
+                        "stt_time": float(result["performance"].get("stt_time", 0.0)),
+                        "llm_time": float(result["performance"].get("llm_time", 0.0)),
+                        "tts_time": float(result["performance"].get("tts_time", 0.0)),
+                        "total_time": float(result["performance"].get("total_time", 0.0)),
+                        "meets_kpi": bool(result["performance"].get("kpi_ok", False)),
+                        "subject": result.get("subject", ""),
+                        "confusion": confusion_detected,
+                        "confusion_reason": result.get("confusion", {}).get("reason", ""),
+                        "source": "streaming",
+                        "slide_title": current_section_title or current_chapter_title or "",
+                        "chapter_title": current_chapter_title or "",
+                        "section_title": current_section_title or "",
+                        "tts_engine": result.get("tts_engine", ""),
+                        "tts_voice": result.get("tts_voice", ""),
+                        "chapter_index": ctx.chapter_index if ctx else None,
+                        "section_index": ctx.section_index if ctx else None,
+                        "char_position": current_presentation_cursor if ctx else None,
+                    })
+
+                    await send_state(
+                        DialogState.RESPONDING,
+                        "response_complete",
+                        {
+                            "question_text": result.get("transcription", {}).get("text", ""),
+                            "answer_preview": result.get("answer", "")[:160],
+                            "subject": result.get("subject", ""),
+                            "slide_title": current_section_title or current_chapter_title or "",
+                            "chapter_title": current_chapter_title or "",
+                            "section_title": current_section_title or "",
+                            "tts_engine": result.get("tts_engine", ""),
+                            "tts_voice": result.get("tts_voice", ""),
+                        },
+                        result.get("performance", {}),
+                        turn_id=turn_id,
+                    )
                     
                     # Signal stream completion
-                    if not await send({"type": "audio_stream_end", "stream_id": stream_id}):
+                    if not await send({"type": "audio_stream_end", "stream_id": stream_id, "turn_id": turn_id}):
                         continue
 
                     # ✅ CRITICAL: Attendre interruption ou auto-avancer
@@ -1135,23 +2511,30 @@ Explain naturally. MAX 4 sentences."""
                         log.info(f"⏭️  [{session_id[:8]}] Auto-advancing to next slide")
                         if ctx:
                             await dialogue.transition(ctx.session_id, DialogState.PRESENTING)
-                        await send({"type": "next_section"})
+                        await send({"type": "next_section", "turn_id": turn_id})
                         # Laisser le client gérer le chargement du slide suivant
 
                 except Exception as pipeline_exc:
                     log.error(f"[{session_id[:8]}] Pipeline streaming error: {pipeline_exc}", exc_info=True)
-                    await send({"type": "error", "message": f"Pipeline error: {str(pipeline_exc)[:100]}"})
-                    await send_state(DialogState.LISTENING)
+                    await send({"type": "error", "message": f"Pipeline error: {str(pipeline_exc)[:100]}", "turn_id": turn_id})
+                    await send_state(DialogState.LISTENING, turn_id=turn_id)
 
             # ── interrupt — l'étudiant coupe l'IA ─────────────────────
             elif msg_type == "interrupt":
+                interrupt_reason = str(msg.get("reason") or "question").strip().lower() or "question"
+                turn_id = int(msg.get("turn_id") or 0)
+                await record_pause_point(interrupt_reason, notice_prefix="⏸ Point d'arrêt mémorisé")
                 await cancel_presentation_task(notify_client=True)
-                if ctx:
-                    await dialogue.handle_interruption(ctx.session_id)
-                    await dialogue.save_position(ctx.session_id, current_presentation_cursor)
                 audio_buffer.clear()
-                await cancel_audio_stream(notify_client=True)
-                await set_listening_state()
+                await cancel_audio_stream(notify_client=True, turn_id=turn_id)
+                await cancel_text_question_task()
+                if ctx and interrupt_reason != "pause":
+                    await dialogue.transition(ctx.session_id, DialogState.LISTENING)
+                    await send_state(DialogState.LISTENING, turn_id=turn_id)
+                elif ctx:
+                    await send_state(DialogState.WAITING, turn_id=turn_id)
+                else:
+                    await set_listening_state()
                 log.info(f"[{session_id[:8]}] ⚡ Interruption")
 
             # ── present_section — présenter une section de cours ─────
@@ -1225,14 +2608,53 @@ Explain naturally. MAX 4 sentences."""
                         char_pos=0,
                     )
                     await dialogue.transition(ctx.session_id, DialogState.PRESENTING)
-                await send_state(DialogState.PRESENTING)
+                presentation_details = {
+                    "course_title": course_title or "",
+                    "chapter_title": chapter or "",
+                    "section_title": section_title or "",
+                    "slide_title": section_title or chapter or "",
+                    "slide_index": slide_index_int,
+                    "progress_pct": progress_pct,
+                }
+                await send_state(DialogState.PRESENTING, details=presentation_details)
 
                 requested_slide_key = (course_id or "", chapter_index_int, section_index_int)
+                requested_slide_id = ":".join(str(part) for part in requested_slide_key)
+                cached_snapshot = None
+                if ctx:
+                    try:
+                        cached_snapshot = await dialogue.load_presentation_snapshot(ctx.session_id, requested_slide_id)
+                    except Exception as cache_exc:
+                        log.debug(f"[{session_id[:8]}] Presentation cache lookup skipped: {cache_exc}")
+                cached_pause_state = ctx.paused_state if ctx else {}
+                cached_slide_id = str(
+                    cached_pause_state.get("presentation_key")
+                    or cached_pause_state.get("slide_id")
+                    or ""
+                )
+                cached_presentation_text = (cached_snapshot or {}).get("presentation_text") or cached_pause_state.get("presentation_text") or ""
+                cached_presentation_cursor = int(
+                    (cached_snapshot or {}).get("presentation_cursor")
+                    or cached_pause_state.get("presentation_cursor")
+                    or cached_pause_state.get("char_offset")
+                    or 0
+                )
+
                 reuse_cached_narration = (
                     current_presentation_key == requested_slide_key
-                    and 0 < current_presentation_cursor < len(current_presentation_text)
+                    and bool(current_presentation_text)
+                ) or (
+                    bool(cached_presentation_text) and cached_slide_id == requested_slide_id
                 )
-                if not reuse_cached_narration:
+
+                if reuse_cached_narration:
+                    if not current_presentation_text and cached_presentation_text and cached_slide_id == requested_slide_id:
+                        current_presentation_text = cached_presentation_text
+                        current_presentation_cursor = min(
+                            max(0, cached_presentation_cursor),
+                            len(current_presentation_text),
+                        )
+                else:
                     current_presentation_text = ""
                     current_presentation_cursor = 0
                 current_presentation_key = requested_slide_key
@@ -1285,14 +2707,19 @@ Explain naturally. MAX 4 sentences."""
                         narration_text = current_presentation_text if reuse_cached and current_presentation_text else ""
                         if not narration_text:
                             llm_start = time.time()
-                            await send_state(DialogState.PRESENTING, "llm_thinking", {"type": "presentation"}, {"progress_pct": 20})
+                            await send_state(
+                                DialogState.PRESENTING,
+                                "llm_thinking",
+                                {"type": "presentation", **presentation_details},
+                                {"progress_pct": 20},
+                            )
                             try:
                                 # ✅ Déterminer si c'est une reprise (pause/resume)
                                 is_resuming = resume_offset > 0 and reuse_cached
-                                
+
                                 # ✅ Récupérer le course_summary depuis le contexte session
                                 course_summary = ctx.course_summary if ctx else ""
-                                
+
                                 # ✅ NOUVEAU: Utiliser explain_slide_focused (strict + focused + level-adapted)
                                 narration_text = await explain_slide_focused(
                                     slide_content=section_text or slide_content or content_txt,
@@ -1307,15 +2734,43 @@ Explain naturally. MAX 4 sentences."""
                                 )
                             except Exception:
                                 # Fallback: brain.ask
-                                narration_text, _ = brain.ask(section_text or content_txt, reply_language=lang_ps, session_id=session_id)  # ✅ Pass session_id
+                                narration_text, _ = await asyncio.to_thread(
+                                    brain.ask,
+                                    section_text or content_txt,
+                                    reply_language=lang_ps,
+                                    session_id=session_id,
+                                )  # ✅ Pass session_id
                                 narration_text = brain._clean_for_speech(narration_text)
                             narration_text = narration_text.strip()
                             current_presentation_text = narration_text
                             llm_time = time.time() - llm_start
+                            if ctx and requested_slide_id:
+                                try:
+                                    await dialogue.save_presentation_snapshot(
+                                        ctx.session_id,
+                                        requested_slide_id,
+                                        narration_text,
+                                        presentation_cursor=resume_from,
+                                        slide_title=section_title or chapter or "",
+                                    )
+                                except Exception as cache_exc:
+                                    log.debug(f"[{session_id[:8]}] Presentation snapshot save skipped: {cache_exc}")
+
+                            await schedule_next_slide_prefetch(
+                                current_slide_key=requested_slide_key,
+                                course_id_value=course_id or "",
+                                chapter_index_value=chapter_index_int,
+                                section_index_value=section_index_int,
+                                language_code=lang_ps,
+                                student_level_value=session_level,
+                                course_summary_value=ctx.course_summary if ctx else "",
+                                rate_value=rate_override,
+                                current_slide_title=section_title or chapter or "",
+                            )
                             await send_state(
                                 DialogState.PRESENTING,
                                 "tts_generating",
-                                {"engine": "presentation"},
+                                {"engine": "presentation", **presentation_details},
                                 {
                                     "llm_time": round(llm_time, 2),
                                     "tokens": len(narration_text.split()),
@@ -1336,7 +2791,7 @@ Explain naturally. MAX 4 sentences."""
                             current_presentation_cursor = len(narration_text)
                             if ctx:
                                 await dialogue.save_position(ctx.session_id, current_presentation_cursor)
-                            if not await send({"type": "answer_text", "text": narration_text, "subject": "course", "final": True}):
+                            if not await send({"type": "answer_text", "text": narration_text, "subject": "course", "presentation_request_id": presentation_request_id, "final": True}):
                                 return
                             if not await send({"type": "stream_end", "stream_id": current_stream_id}):
                                 return
@@ -1350,7 +2805,7 @@ Explain naturally. MAX 4 sentences."""
                         await send_state(
                             DialogState.PRESENTING,
                             "tts_streaming",
-                            {"chunks": len(sentences)},
+                            {"chunks": len(sentences), **presentation_details},
                             {
                                 "tts_chunks": len(sentences),
                                 "progress_pct": 70,
@@ -1360,19 +2815,25 @@ Explain naturally. MAX 4 sentences."""
                             if not sentence.strip():
                                 continue
 
-                            if not await send({"type": "answer_text", "text": sentence, "partial": True}):
+                            if not await send({"type": "answer_text", "text": sentence, "subject": "course", "presentation_request_id": presentation_request_id, "partial": True}):
                                 return
 
+                            audio_chunk = None
+                            tts_piece_time = 0.0
+                            mime = None
                             try:
-                                audio_chunk, tts_piece_time, _, _, mime = await voice.generate_audio_async(
+                                audio_chunk, tts_piece_time, _, _, mime, _cache_hit = await synthesize_cached_tts(
                                     sentence,
                                     language_code=lang_ps,
                                     rate=rate_override,
+                                    cache_scope="presentation",
                                 )
                             except TypeError:
-                                audio_chunk, tts_piece_time, _, _, mime = await voice.generate_audio_async(
+                                audio_chunk, tts_piece_time, _, _, mime, _cache_hit = await synthesize_cached_tts(
                                     sentence,
                                     language_code=lang_ps,
+                                    rate="+0%",
+                                    cache_scope="presentation",
                                 )
 
                             tts_total_time += tts_piece_time or 0.0
@@ -1384,16 +2845,40 @@ Explain naturally. MAX 4 sentences."""
                             if ctx:
                                 await dialogue.save_position(ctx.session_id, current_presentation_cursor)
 
+                            if ctx and requested_slide_id:
+                                try:
+                                    await dialogue.save_presentation_snapshot(
+                                        ctx.session_id,
+                                        requested_slide_id,
+                                        narration_text,
+                                        presentation_cursor=current_presentation_cursor,
+                                        slide_title=section_title or chapter or "",
+                                    )
+                                except Exception as cache_exc:
+                                    log.debug(f"[{session_id[:8]}] Presentation snapshot refresh skipped: {cache_exc}")
+
                             await asyncio.sleep(0)
 
                         current_presentation_cursor = len(narration_text)
                         if ctx:
                             await dialogue.save_position(ctx.session_id, current_presentation_cursor)
 
+                        if ctx and requested_slide_id:
+                            try:
+                                await dialogue.save_presentation_snapshot(
+                                    ctx.session_id,
+                                    requested_slide_id,
+                                    narration_text,
+                                    presentation_cursor=current_presentation_cursor,
+                                    slide_title=section_title or chapter or "",
+                                )
+                            except Exception as cache_exc:
+                                log.debug(f"[{session_id[:8]}] Presentation snapshot final save skipped: {cache_exc}")
+
                         await send_state(
                             DialogState.PRESENTING,
                             "response_complete",
-                            {},
+                            presentation_details,
                             {
                                 "llm_time": round(llm_time, 2),
                                 "tts_time": round(tts_total_time, 2),
@@ -1405,7 +2890,7 @@ Explain naturally. MAX 4 sentences."""
                             },
                         )
 
-                        if not await send({"type": "answer_text", "text": narration_text, "subject": "course", "final": True}):
+                        if not await send({"type": "answer_text", "text": narration_text, "subject": "course", "presentation_request_id": presentation_request_id, "final": True}):
                             return
                         if not await send({"type": "stream_end", "stream_id": stream_id}):
                             return
@@ -1461,6 +2946,57 @@ Explain naturally. MAX 4 sentences."""
                     "on reprend",
                     "reprenons",
                 )
+                quiz_triggers = (
+                    "quiz",
+                    "quiz me",
+                    "quiz moi",
+                    "quiz-moi",
+                    "quizz",
+                    "test me",
+                    "teste-moi",
+                    "teste moi",
+                    "donne-moi un quiz",
+                    "donne moi un quiz",
+                    "fais-moi un quiz",
+                    "fais moi un quiz",
+                    "interroge-moi",
+                    "interroge moi",
+                )
+                quiz_phrase_triggers = (
+                    "can do quiz",
+                    "do a quiz",
+                    "do quiz",
+                    "make a quiz",
+                    "create a quiz",
+                    "generate a quiz",
+                    "give me a quiz",
+                    "quiz about this course",
+                    "quiz on this course",
+                    "quiz on the course",
+                    "test me on this course",
+                    "test me on the course",
+                    "can you quiz",
+                    "quiz me on",
+                    "faire un quiz",
+                    "fais un quiz",
+                    "donne moi un quiz",
+                    "donne-moi un quiz",
+                    "cree un quiz",
+                    "crée un quiz",
+                    "generer un quiz",
+                    "générer un quiz",
+                    "teste moi sur ce cours",
+                    "teste-moi sur ce cours",
+                    "interroge moi sur ce cours",
+                    "interroge-moi sur ce cours",
+                )
+
+                def is_quiz_intent(normalized_text: str) -> bool:
+                    if normalized_text in quiz_triggers:
+                        return True
+                    if any(normalized_text.startswith(trigger + " ") for trigger in quiz_triggers):
+                        return True
+                    return any(phrase in normalized_text for phrase in quiz_phrase_triggers)
 
                 course_id = str(msg.get("course_id") or (ctx.course_id if ctx and ctx.course_id else "") or "").strip()
                 chapter_index_raw = msg.get("chapter_index")
@@ -1485,34 +3021,136 @@ Explain naturally. MAX 4 sentences."""
                 current_slide_content = (msg.get("slide_content") or "").strip()
                 current_chapter_title = msg.get("chapter", "")
                 current_section_title = msg.get("section_title", msg.get("slide_title", ""))
+                course_title = msg.get("course_title", "")
+                course_domain = msg.get("course_domain", "general")
                 current_chapter_idx = chapter_index_int + 1 if chapter_index_int is not None else None
 
                 if current_slide_context:
                     current_slide_content = (current_slide_context.get("content") or current_slide_content).strip()
                     current_chapter_title = current_slide_context.get("chapter_title") or current_chapter_title
                     current_section_title = current_slide_context.get("section_title") or current_section_title
+                    course_title = current_slide_context.get("course_title") or course_title
+                    course_domain = current_slide_context.get("course_domain") or course_domain
                     current_chapter_idx = current_slide_context.get("chapter_order") or current_chapter_idx
 
                 is_in_course = msg.get("in_course", in_course or bool(course_id))
+                if is_in_course and is_quiz_intent(content_lower):
+                    await cancel_text_question_task()
+                    active_text_turn_id = 0
+                    quiz_topic = current_section_title or current_chapter_title or current_slide_content or course_title or "Quiz"
+                    quiz_query = current_slide_content or current_section_title or current_chapter_title or course_title or quiz_topic
+                    quiz_chunks = rag.retrieve_chunks(
+                        quiz_query,
+                        k=Config.RAG_NUM_RESULTS,
+                        current_chapter_idx=current_chapter_idx,
+                        strict_chapter=bool(current_chapter_idx),
+                        course_id=course_id if course_id else None,
+                    )
+                    if current_slide_content:
+                        from langchain_core.documents import Document
+
+                        slide_doc = Document(
+                            page_content=current_slide_content,
+                            metadata={
+                                "course_id": course_id,
+                                "chapter_idx": current_chapter_idx,
+                                "chapter_title": current_chapter_title,
+                                "section_title": current_section_title,
+                                "slide_idx": current_slide_context.get("slide_index") if current_slide_context else chapter_index_int,
+                                "source_file": msg.get("slide_path") or msg.get("image_url") or "",
+                            },
+                        )
+                        quiz_chunks = [(slide_doc, 1.0, f"Current slide: {current_chapter_title} / {current_section_title}")] + quiz_chunks
+
+                    lang = detect_lang_text(content)
+                    subj = detect_subject(content)
+                    await process_quiz_request(
+                        quiz_topic=quiz_topic,
+                        lang=lang,
+                        subj=subj,
+                        chunks_with_scores=quiz_chunks,
+                        question_ctx=ctx,
+                        presentation_cursor=current_presentation_cursor,
+                        current_chapter_title=current_chapter_title,
+                        current_section_title=current_section_title,
+                        current_chapter_idx=current_chapter_idx,
+                        section_index_int=section_index_int,
+                        course_id=course_id,
+                        course_title=course_title,
+                        course_domain=course_domain,
+                        slide_path=str(msg.get("slide_path") or msg.get("image_url") or (current_slide_context.get("slide_path") if current_slide_context else "") or ""),
+                    )
+                    continue
                 if is_in_course and content_lower in resume_triggers:
+                    await cancel_text_question_task()
+                    active_text_turn_id = 0
                     if ctx:
                         # ✅ BUG #4 FIX: Retrieve char_offset from paused_state
                         resumed_ctx = await dialogue.resume_session(ctx.session_id)
-                        if resumed_ctx and resumed_ctx.paused_state.get("char_offset", 0) > 0:
+                        if resumed_ctx and resumed_ctx.paused_state.get("timestamp") is not None:
                             # Restore cursor position from pause point
-                            current_presentation_cursor = resumed_ctx.paused_state.get("char_offset", 0)
+                            current_presentation_cursor = resumed_ctx.paused_state.get("presentation_cursor", resumed_ctx.paused_state.get("char_offset", 0))
+                            cached_text = resumed_ctx.paused_state.get("presentation_text") or ""
+                            cached_key = str(resumed_ctx.paused_state.get("presentation_key") or resumed_ctx.paused_state.get("slide_id") or "")
+                            resume_slide_id = ":".join(str(part) for part in (course_id, chapter_index_int, section_index_int))
+                            if cached_text and cached_key == resume_slide_id:
+                                current_presentation_text = cached_text
                             resume_offset = current_presentation_cursor
                             log.info(f"📍 [{ctx.session_id[:8]}] Resume TTS from char {current_presentation_cursor}")
-                        await dialogue.transition(ctx.session_id, DialogState.PRESENTING)
-                    await send_state(DialogState.PRESENTING)
+                            record_checkpoint_event({
+                                "session_id": ctx.session_id,
+                                "language": resumed_ctx.language if resumed_ctx else session_lang,
+                                "subject": (ctx.course_analysis.get("course_domain", "") if ctx and ctx.course_analysis else ""),
+                                "checkpoint_type": "resume",
+                                "point_text": (
+                                    f"▶ Reprise au point mémorisé — chapitre {resumed_ctx.chapter_index + 1}, "
+                                    f"section {resumed_ctx.section_index + 1}, position {current_presentation_cursor}. "
+                                    f"Narration reprise sans nouveau LLM."
+                                ),
+                                "location_label": f"chapitre {resumed_ctx.chapter_index + 1}, section {resumed_ctx.section_index + 1}",
+                                "cursor_label": f"{current_presentation_cursor}/{len(current_presentation_text or '')}",
+                                "slide_id": resume_slide_id,
+                                "slide_title": current_section_title or current_chapter_title or "",
+                                "chapter_index": resumed_ctx.chapter_index,
+                                "section_index": resumed_ctx.section_index,
+                                "char_position": current_presentation_cursor,
+                                "reason": content_lower,
+                                "source": "checkpoint",
+                            })
+                            await send({
+                                "type": "system_notice",
+                                "text": (
+                                    f"▶ Reprise au point mémorisé — chapitre {resumed_ctx.chapter_index + 1}, "
+                                    f"section {resumed_ctx.section_index + 1}, position {current_presentation_cursor}. "
+                                    f"Narration reprise sans nouveau LLM."
+                                ),
+                            })
+                        ctx = resumed_ctx or ctx
+                    await send_state(
+                        DialogState.PRESENTING,
+                        details={
+                            "course_title": course_title or "",
+                            "chapter_title": current_chapter_title or "",
+                            "section_title": current_section_title or "",
+                            "slide_title": current_section_title or current_chapter_title or "",
+                            "char_position": current_presentation_cursor,
+                        },
+                    )
                     await send({"type": "resume_course"})
                     continue
 
                 # ✅ Priorité à la question: stopper immédiatement la présentation en cours
                 # pour éviter que la narration du cours continue pendant la réponse.
+                turn_id = int(msg.get("turn_id") or 0)
+                if turn_id <= 0:
+                    text_turn_seq += 1
+                    turn_id = text_turn_seq
+                active_text_turn_id = turn_id
+
                 if presentation_task and not presentation_task.done():
                     await cancel_presentation_task(notify_client=True)
-                await cancel_audio_stream(notify_client=True)
+                await cancel_audio_stream(notify_client=True, turn_id=turn_id)
+                await cancel_text_question_task()
 
                 lang   = detect_lang_text(content)
                 subj   = detect_subject(content)
@@ -1522,14 +3160,16 @@ Explain naturally. MAX 4 sentences."""
                     DialogState.PROCESSING, 
                     "stt_language_detection", 
                     {"language": lang},
-                    {"language": lang}
+                    {"language": lang},
+                    turn_id=turn_id
                 )
                 
                 await send_state(
                     DialogState.PROCESSING,
                     "prosody_analysis",
                     {"type": "text_question"},
-                    {"speech_rate": len(content.split())}
+                    {"speech_rate": len(content.split())},
+                    turn_id=turn_id
                 )
                 
                 # ✅ S29-32: DÉTECTION DE CONFUSION AUTOMATIQUE (généralise audio_pipeline)
@@ -1546,7 +3186,7 @@ Explain naturally. MAX 4 sentences."""
                 async def emit_confusion_micro_state(state_name: str, metrics: dict):
                     """Wrapper for sending confusion micro-states with proper state"""
                     if metrics and metrics != {}:
-                        await send_state(DialogState.PROCESSING, state_name, {}, metrics)
+                        await send_state(DialogState.PROCESSING, state_name, {}, metrics, turn_id=turn_id)
                 
                 is_confused, confusion_reason, q_hash, confusion_count = await dialogue.detect_and_track_confusion(
                     session_id=session_id,
@@ -1560,7 +3200,7 @@ Explain naturally. MAX 4 sentences."""
                 
                 # ✅ UPDATE STATE: RAG Search
                 rag_start = time.time()
-                await send_state(DialogState.PROCESSING, "rag_search", {}, {})
+                await send_state(DialogState.PROCESSING, "rag_search", {}, {}, turn_id=turn_id)
                 
                 chunks_with_scores = rag.retrieve_chunks(
                     content,
@@ -1598,20 +3238,22 @@ Explain naturally. MAX 4 sentences."""
                     "avg_score": round(avg_score, 3),
                     "duration_ms": round(rag_time, 1),
                     "progress_pct": 35
-                })
+                }, turn_id=turn_id)
 
                 # ✅ UPDATE STATE: Confusion Detection (if any)
                 if is_confused:
                     await send_state(DialogState.PROCESSING, "confusion_detected", 
                                    {"reason": confusion_reason}, 
-                                   {"confidence": 0.85 if is_confused else 0.1})
+                                   {"confidence": 0.85 if is_confused else 0.1},
+                                   turn_id=turn_id)
 
                 llm_start   = time.time()
                 
                 # ✅ UPDATE STATE: LLM Thinking
                 await send_state(DialogState.PROCESSING, "llm_thinking", 
                                {"chunks": len(chunks_with_scores)},
-                               {"chunks_processed": len(chunks_with_scores), "progress_pct": 50})
+                               {"chunks_processed": len(chunks_with_scores), "progress_pct": 50},
+                               turn_id=turn_id)
                 
                 # ✅ TRY RAG + FALLBACK pour les questions texte (comme le streaming)
                 # Construire le prompt : normal ou reformulation si confusion
@@ -1629,129 +3271,118 @@ Explain naturally. MAX 4 sentences."""
                 else:
                     question_for_llm = content
                 
-                # ✅ STREAMING LLM WITH REAL-TIME METRICS
-                ai_response = ""
-                llm_confidence = 0.7
-                chunk_count = 0
-                tokens_generated = 0
-                
-                try:
-                    # Use streaming version for real-time token metrics
-                    async for chunk_text, full_text in rag.generate_final_answer_stream(
-                        chunks_with_scores, question=question_for_llm, history=history, language=lang,
+                text_question_task = asyncio.create_task(
+                    process_text_question_turn(
+                        turn_id=turn_id,
+                        content=content,
+                        lang=lang,
+                        subj=subj,
+                        chunks_with_scores=chunks_with_scores,
+                        rag_time=rag_time,
+                        avg_score=avg_score,
+                        is_confused=is_confused,
+                        confusion_reason=confusion_reason,
+                        question_for_llm=question_for_llm,
+                        llm_start=llm_start,
+                        question_ctx=ctx,
+                        presentation_cursor=current_presentation_cursor,
                         current_chapter_title=current_chapter_title,
                         current_section_title=current_section_title,
-                    ):
-                        ai_response = full_text
-                        chunk_count += 1
-                        tokens_generated = len(ai_response.split())  # Approximate token count
-                        elapsed_ms = (time.time() - llm_start) * 1000
-                        tokens_per_sec = (tokens_generated / elapsed_ms * 1000) if elapsed_ms > 0 else 0
-                        
-                        # ✅ UPDATE STATE: LLM Streaming with Real-Time Metrics
-                        await send_state(DialogState.PROCESSING, "streaming_llm", 
-                                       {"chunk": chunk_count, "text": chunk_text[:80]},
-                                       {
-                                           "tokens_generated": tokens_generated,
-                                           "tokens_per_sec": round(tokens_per_sec, 1),
-                                           "duration_ms": round(elapsed_ms, 1),
-                                           "progress_pct": 55 + min(chunk_count * 5, 20)  # 55-75%
-                                       })
-                        
-                except Exception as rag_exc:
-                    # ✅ FALLBACK: Si OpenAI échoue (429, quota, etc), utiliser brain.ask() avec Ollama
-                    log.warning(f"[{session_id[:8]}] ⚠️  RAG failed ({type(rag_exc).__name__}): {str(rag_exc)[:100]} → Fallback brain.ask()...")
-                    try:
-                        ai_response, _ = brain.ask(question_for_llm, reply_language=lang, session_id=session_id)
-                        ai_response = brain._clean_for_speech(ai_response)
-                        llm_confidence = 0.5  # Fallback confidence
-                    except Exception as fallback_exc:
-                        log.error(f"[{session_id[:8]}] ❌ Fallback also failed: {fallback_exc}")
-                        ai_response = f"Je suis désolé, j'ai rencontré une erreur technique. Veuillez réessayer."
-                        llm_confidence = 0.0
-                
-                llm_time = time.time() - llm_start
+                        current_chapter_idx=current_chapter_idx,
+                        section_index_int=section_index_int,
+                    )
+                )
+                continue
 
-                history.append({"role": "user",      "content": content})
-                history.append({"role": "assistant",  "content": ai_response})
-
-                # ✅ UPDATE STATE: TTS Generation
-                tts_start = time.time()
-                num_chunks = max(1, len(ai_response) // 200)  # Estimate chunks
-                await send_state(DialogState.PROCESSING, "tts_text_chunking", 
-                               {"chunks_total": num_chunks},
-                               {"progress_pct": 78})
-                
-                audio_bytes, tts_time, tts_engine, tts_voice, mime = \
-                    await voice.generate_audio_async(ai_response, language_code=lang)
-                
-                # ✅ UPDATE STATE: TTS Generation Complete
-                await send_state(DialogState.PROCESSING, "tts_generation", 
-                               {"engine": tts_engine, "voice": tts_voice},
-                               {
-                                   "audio_bytes": len(audio_bytes) if audio_bytes else 0,
-                                   "duration_ms": round(tts_time * 1000, 1),
-                                   "progress_pct": 90
-                               })
-
+            # ── quiz — générer un quiz structuré ─────────────────────
+            elif msg_type == "quiz":
                 if ctx:
-                    await dialogue.transition(ctx.session_id, DialogState.RESPONDING)
-                response_metrics = {
-                    "retrieval_time": round(rag_time / 1000.0, 3),
-                    "chunks": len(chunks_with_scores),
-                    "document_score": round(avg_score, 2),
-                    "llm_time": round(llm_time, 2),
-                    "tts_time": round(tts_time, 2),
-                    "total_time": round((rag_time / 1000.0) + llm_time + tts_time, 2),
-                    "tokens": tokens_generated,
-                    "words": len(ai_response.split()),
-                    "sentences": chunk_count,
-                    "confidence": round(llm_confidence, 2),
-                    "progress_pct": 95,
-                }
-                await send_state(DialogState.RESPONDING, "", {}, response_metrics)
+                    ctx = await dialogue.get_session(session_id) or ctx
 
-                log.info(f"[{session_id[:8]}] 📤 Envoi answer_text: {len(ai_response)} chars | subj={subj}")
-                await send({"type": "answer_text", "text": ai_response,
-                            "subject": subj, "rag_chunks": len(chunks_with_scores)})
-                log.info(f"[{session_id[:8]}] ✅ answer_text envoyé")
-
-                if audio_bytes:
-                    await send({
-                        "type":  "audio_chunk",
-                        "data":  base64.b64encode(audio_bytes).decode(),
-                        "mime":  mime,
-                        "final": True,
-                    })
-
-                if ctx:
-                    await dialogue.transition(ctx.session_id, DialogState.LISTENING)
-                await send_state(DialogState.LISTENING)
-
-                # ── Analytics & Recherche ─────────────────────────────────
+                course_id = str(msg.get("course_id") or (ctx.course_id if ctx and ctx.course_id else "") or "").strip()
+                chapter_index_raw = msg.get("chapter_index")
+                section_index_raw = msg.get("section_index")
                 try:
-                    transcript_searcher.index_interaction(
-                        session_id=session_id, student_q=content,
-                        teacher_a=ai_response, language=lang,
-                        course_id="", subject=subj,
+                    chapter_index_int = int(chapter_index_raw) if chapter_index_raw is not None else None
+                except (TypeError, ValueError):
+                    chapter_index_int = None
+                try:
+                    section_index_int = int(section_index_raw) if section_index_raw is not None else None
+                except (TypeError, ValueError):
+                    section_index_int = None
+
+                current_slide_context = None
+                if course_id and chapter_index_int is not None and section_index_int is not None:
+                    current_slide_context = await load_course_slide_context(
+                        course_id,
+                        chapter_index_int,
+                        section_index_int,
                     )
-                    analytics_engine.record_interaction(
-                        session_id=session_id, question=content,
-                        answer=ai_response, stt_time=0,
-                        llm_time=llm_time, tts_time=tts_time,
-                        language=lang, subject=subj,
+
+                current_slide_content = (msg.get("slide_content") or msg.get("content") or "").strip()
+                current_chapter_title = msg.get("chapter", "")
+                current_section_title = msg.get("section_title", msg.get("slide_title", ""))
+                course_title = msg.get("course_title", "")
+                course_domain = msg.get("course_domain", "general")
+                current_chapter_idx = chapter_index_int + 1 if chapter_index_int is not None else None
+
+                if current_slide_context:
+                    current_slide_content = (current_slide_context.get("content") or current_slide_content).strip()
+                    current_chapter_title = current_slide_context.get("chapter_title") or current_chapter_title
+                    current_section_title = current_slide_context.get("section_title") or current_section_title
+                    course_title = current_slide_context.get("course_title") or course_title
+                    course_domain = current_slide_context.get("course_domain") or course_domain
+                    current_chapter_idx = current_slide_context.get("chapter_order") or current_chapter_idx
+
+                if not current_slide_content:
+                    current_slide_content = current_section_title or current_chapter_title or course_title or ""
+
+                quiz_topic = current_section_title or current_chapter_title or current_slide_content or course_title or "Quiz"
+                quiz_query = current_slide_content or current_section_title or current_chapter_title or course_title or quiz_topic
+
+                quiz_chunks = rag.retrieve_chunks(
+                    quiz_query,
+                    k=Config.RAG_NUM_RESULTS,
+                    current_chapter_idx=current_chapter_idx,
+                    strict_chapter=bool(current_chapter_idx),
+                    course_id=course_id if course_id else None,
+                )
+
+                if current_slide_content:
+                    from langchain_core.documents import Document
+
+                    slide_doc = Document(
+                        page_content=current_slide_content,
+                        metadata={
+                            "course_id": course_id,
+                            "chapter_idx": current_chapter_idx,
+                            "chapter_title": current_chapter_title,
+                            "section_title": current_section_title,
+                            "slide_idx": current_slide_context.get("slide_index") if current_slide_context else chapter_index_int,
+                            "source_file": msg.get("slide_path") or msg.get("image_url") or "",
+                        },
                     )
-                    await profile_mgr.update_from_session(session_id, "qa")
-                    record_session_event({
-                        "session_id": session_id, "language": lang,
-                        "llm_time":   round(llm_time, 2),
-                        "tts_time":   round(tts_time, 2),
-                        "total_time": round(llm_time + tts_time, 2),
-                        "meets_kpi":  (llm_time + tts_time) < 5.0,
-                        "subject":    subj,
-                    })
-                except Exception as _ae:
-                    log.debug("analytics error: %s", _ae)
+                    quiz_chunks = [(slide_doc, 1.0, f"Current slide: {current_chapter_title} / {current_section_title}")] + quiz_chunks
+
+                lang = detect_lang_text(quiz_query)
+                subj = detect_subject(quiz_query)
+                await process_quiz_request(
+                    quiz_topic=quiz_topic,
+                    lang=lang,
+                    subj=subj,
+                    chunks_with_scores=quiz_chunks,
+                    question_ctx=ctx,
+                    presentation_cursor=current_presentation_cursor,
+                    current_chapter_title=current_chapter_title,
+                    current_section_title=current_section_title,
+                    current_chapter_idx=current_chapter_idx,
+                    section_index_int=section_index_int,
+                    course_id=course_id,
+                    course_title=course_title,
+                    course_domain=course_domain,
+                    slide_path=str(msg.get("slide_path") or msg.get("image_url") or (current_slide_context.get("slide_path") if current_slide_context else "") or ""),
+                )
+                continue
 
             # ── next_section — avancer dans le cours ──────────────────
             elif msg_type == "next_section":
@@ -1777,8 +3408,10 @@ Explain naturally. MAX 4 sentences."""
             except Exception:
                 pass
     finally:
+        await cancel_next_slide_prefetch()
         await cancel_presentation_task(notify_client=False)
         await cancel_audio_stream(notify_client=False)
+        await cancel_text_question_task()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1826,6 +3459,171 @@ async def health():
         "llm":      Config.GPT_MODEL,
         "tts":      Config.TTS_PROVIDER,
         "sessions": len(HTTP_SESSIONS),
+    }
+
+
+@app.get("/dashboard/services")
+async def dashboard_services():
+    from sqlalchemy import text
+
+    services: dict[str, dict] = {}
+
+    rag_status = rag.get_status()
+    rag_stats = rag.get_stats()
+    storage_status = media_storage.get_status()
+    services["rag"] = {
+        "healthy": bool(rag_status.get("rag_ready")),
+        "ready": bool(rag_status.get("rag_ready")),
+        "embedding_source": rag_status.get("embedding_source"),
+        "embedding_model": rag_status.get("embedding_model"),
+        "docs_loaded": rag_status.get("docs_loaded"),
+        "bm25_ready": rag_status.get("bm25_available"),
+        "qdrant_connected": rag_status.get("qdrant_connected"),
+        "vectorstore_available": rag_status.get("vectorstore_available"),
+        "collection": rag_stats.get("collection"),
+        "backend": rag_stats.get("backend"),
+        "role": "Orchestre la recherche hybride et la génération de réponses",
+        "retrieves": "Chunks vectoriels Qdrant, scores BM25 et cache d'embeddings",
+        "used_in": "modules/multimodal_rag.py, main.py /ask, /course/build, /rag/stats, /debug/rag_test",
+    }
+
+    redis_status = {
+        "connected": False,
+        "endpoint": f"{Config.REDIS_HOST}:{Config.REDIS_PORT}/{Config.REDIS_DB}",
+        "latency_ms": None,
+    }
+    try:
+        redis_client = await get_redis()
+        redis_kwargs = getattr(redis_client.connection_pool, "connection_kwargs", {}) or {}
+        redis_host = redis_kwargs.get("host", Config.REDIS_HOST)
+        redis_port = redis_kwargs.get("port", Config.REDIS_PORT)
+        redis_db = redis_kwargs.get("db", Config.REDIS_DB)
+        start = time.time()
+        await asyncio.wait_for(redis_client.ping(), timeout=2.0)
+        redis_status.update({
+            "connected": True,
+            "endpoint": f"{redis_host}:{redis_port}/{redis_db}",
+            "latency_ms": round((time.time() - start) * 1000, 1),
+        })
+    except Exception as exc:
+        redis_status["error"] = str(exc)
+    redis_status.update({
+        "role": "Cache et état temps réel",
+        "retrieves": "Sessions WebSocket, état temporaire et latence de traitement",
+        "used_in": "handlers/session_manager.py, modules/llm.py, main.py get_redis",
+    })
+    services["redis"] = redis_status
+
+    postgres_status = {
+        "connected": False,
+        "endpoint": f"{Config.POSTGRES_HOST}:{Config.POSTGRES_PORT}/{Config.POSTGRES_DB}",
+        "latency_ms": None,
+    }
+    try:
+        start = time.time()
+        async with AsyncSessionLocal() as db:
+            await db.execute(text("SELECT 1"))
+        postgres_status.update({
+            "connected": True,
+            "latency_ms": round((time.time() - start) * 1000, 1),
+        })
+    except Exception as exc:
+        postgres_status["error"] = str(exc)
+    postgres_status.update({
+        "role": "Persistance transactionnelle",
+        "retrieves": "Sessions, interactions, profils étudiants et événements d'apprentissage",
+        "used_in": "database/models.py, database/init_db.py, main.py /course/build, /session, /dashboard/stats",
+    })
+    services["postgres"] = postgres_status
+
+    def _probe_ollama() -> dict:
+        import requests
+
+        fallback = brain.fallback
+        base_url = getattr(fallback, "base_url", "http://localhost:11434")
+        model_name = getattr(fallback, "model", "mistral")
+        endpoint = f"{base_url}/api/tags"
+        try:
+            response = requests.get(endpoint, timeout=2)
+            if response.status_code == 200:
+                models = response.json().get("models", [])
+                model_names = [str(m.get("name", "")).split(":")[0] for m in models]
+                available = any(model_name in name for name in model_names)
+                return {
+                    "available": available,
+                    "model": model_name,
+                    "endpoint": endpoint,
+                    "status": "✅ Ready" if available else "⚠️ Model missing",
+                    "models": model_names,
+                }
+            return {
+                "available": False,
+                "model": model_name,
+                "endpoint": endpoint,
+                "status": f"❌ HTTP {response.status_code}",
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "model": model_name,
+                "endpoint": endpoint,
+                "status": "❌ Unavailable",
+                "error": str(exc),
+            }
+
+    try:
+        ollama_status = await asyncio.to_thread(_probe_ollama)
+    except Exception as exc:
+        ollama_status = {
+            "available": False,
+            "model": getattr(brain.fallback, "model", "mistral") if brain.fallback else "mistral",
+            "endpoint": getattr(brain.fallback, "base_url", "http://localhost:11434") + "/api/tags" if brain.fallback else "http://localhost:11434/api/tags",
+            "status": "❌ Unavailable",
+            "error": str(exc),
+        }
+    ollama_status.update({
+        "role": "LLM local de secours",
+        "retrieves": "Modèles disponibles via /api/tags et réponses locales via Ollama",
+        "used_in": "modules/llm.py, main.py /ask, quiz fallback",
+    })
+    services["ollama"] = ollama_status
+
+    try:
+        search_stats = get_searcher().get_stats()
+    except Exception as exc:
+        search_stats = {
+            "backend": "memory",
+            "total": 0,
+            "error": str(exc),
+        }
+    services["elasticsearch"] = {
+        "available": search_stats.get("backend") == "elasticsearch",
+        "backend": search_stats.get("backend"),
+        "total": search_stats.get("total"),
+        "host": search_stats.get("host"),
+        "index": search_stats.get("index"),
+        "note": search_stats.get("note"),
+        "role": "Recherche full-text historique",
+        "retrieves": "Questions, réponses et index texte des transcriptions",
+        "used_in": "modules/transcript_search.py, main.py /dashboard/services",
+    }
+
+    services["minio"] = {
+        "configured": storage_status.get("configured"),
+        "active": storage_status.get("active"),
+        "provider": storage_status.get("provider"),
+        "endpoint": storage_status.get("endpoint"),
+        "bucket": storage_status.get("bucket"),
+        "secure": storage_status.get("secure"),
+        "local_root": storage_status.get("local_root"),
+        "role": "Stockage objet des médias",
+        "retrieves": "PDF, slides, audio et objets listés via /media-list",
+        "used_in": "modules/media_storage.py, main.py /media/{path}, /media-list, modules/course_builder.py",
+    }
+
+    return {
+        "updated_at": time.time(),
+        "services": services,
     }
 
 
@@ -1877,8 +3675,8 @@ async def ingest_files(
     """
     Upload et indexe des fichiers de cours dans la base vectorielle.
     
-    - Utilise OpenAI embeddings (meilleure qualité)
-    - Fallback HuggingFace si OpenAI indisponible
+    - Utilise BAAI/bge-m3 par défaut pour l'ingestion locale
+    - OpenAI reste disponible uniquement si configuré explicitement
     - Ingestion asynchrone trackée par IngestionManager
     - course_id: UUID du cours (optionnel, pour filtrage strict par course)
     - Retour immédiat avec status
@@ -1891,11 +3689,11 @@ async def ingest_files(
     saved_paths = []
 
     for f in files:
-        dest = upload_dir / f.filename
+        dest = upload_dir / Path(f.filename).name
         dest.write_bytes(await f.read())
-        saved_paths.append(str(dest))
+        saved_paths.append(str(dest.resolve()))
 
-    log.info(f"📤 Ingestion lancée ({len(saved_paths)} fichier(s)) — OpenAI embeddings avec fallback HuggingFace")
+    log.info(f"📤 Ingestion lancée ({len(saved_paths)} fichier(s)) — embeddings locaux BAAI/bge-m3")
     if course_id:
         log.info(f"   📚 course_id={course_id}")
 
@@ -1931,7 +3729,7 @@ async def _run_ingestion_background(
     try:
         await ingestion_manager.start_ingestion(len(file_paths))
         
-        # ✨ Utilise la RAG principale (OpenAI + fallback HuggingFace)
+        # ✨ Utilise la RAG principale (BAAI/bge-m3 par défaut en ingestion)
         # run_ingestion_pipeline_for_files n'est pas async, donc run en executor
         loop = asyncio.get_event_loop()
         
@@ -2165,25 +3963,61 @@ async def build_course(
     """
     from modules.course_builder import CourseBuilder
     from database.init_db import AsyncSessionLocal
+    from domains_config import auto_detect_course
+    import tempfile
 
     if not files:
         raise HTTPException(status_code=400, detail="Aucun fichier fourni")
 
-    upload_dir = Path("courses")
-    upload_dir.mkdir(exist_ok=True)
-
     results = []
-    files_to_index: list[tuple[str, str | None]] = []  # ✅ Store (file_path, course_id) tuples
+    files_to_index: list[dict] = []
     builder = CourseBuilder()
 
     for f in files:
-        dest = upload_dir / f.filename
-        dest.write_bytes(await f.read())
+        raw_upload_name = (f.filename or "upload.pdf").replace("\\", "/")
+        upload_filename = Path(raw_upload_name).name or f"upload_{uuid.uuid4().hex[:8]}.pdf"
+        payload = await f.read()
+        temp_path: Path | None = None
 
         try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(upload_filename).suffix or ".pdf") as tmp:
+                tmp.write(payload)
+                temp_path = Path(tmp.name)
+
+            detected_domain, detected_course = auto_detect_course(str(temp_path))
+            target_domain = detected_domain if detected_domain != "general" else domain
+            fallback_course = (
+                detected_course
+                if detected_course != "generic"
+                else None
+            )
+            if fallback_course is None and upload_filename:
+                stem_hint = Path(upload_filename).stem
+                if not builder._looks_like_chapter(stem_hint):
+                    fallback_course = stem_hint
+
+            target_domain, target_course, target_chapter = builder.infer_upload_context(
+                raw_upload_name,
+                fallback_domain=target_domain,
+                fallback_course=fallback_course,
+                fallback_chapter="chapter_1",
+            )
+
+            target_dir = Path("courses") / target_domain / target_course / target_chapter
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dest = target_dir / upload_filename
+            temp_path.replace(dest)
+
+            log.info(f"📁 Sauvegarde cours : {dest}")
+
             # 1. Construire le cours de façon directe, page par page
             course_data = await builder.build_from_file_direct(
-                str(dest), language=language, level=level, domain=domain
+                str(dest),
+                language=language,
+                level=level,
+                domain=target_domain,
+                subject=target_course,
+                chapter=target_chapter,
             )
 
             course_id = None
@@ -2191,24 +4025,34 @@ async def build_course(
             try:
                 # 2. Sauvegarder dans PostgreSQL si disponible
                 async with AsyncSessionLocal() as db:
-                    course_id = await builder.save_to_database(course_data, db, domain=domain)
+                    course_id = await builder.save_to_database(course_data, db, domain=target_domain)
             except Exception as exc:
                 db_error = str(exc)
                 log.info(f"ℹ️ PostgreSQL indisponible pour {f.filename}: {exc}")
 
-            # ✅ Store (file_path, course_id) for indexing
-            files_to_index.append((str(dest), course_id))
+            # ✅ Store structured course data for indexing
+            files_to_index.append({
+                "course_data": course_data,
+                "course_id": course_id,
+                "domain": target_domain,
+                "course": target_course,
+                "chapter": target_chapter,
+                "storage_path": str(dest.resolve()),
+            })
 
             chapters  = len(course_data.get("chapters", []))
             sections  = sum(len(ch.get("sections", [])) for ch in course_data.get("chapters", []))
 
             results.append({
-                "file":      f.filename,
+                "file":      upload_filename,
                 "course_id": course_id,
                 "title":     course_data.get("title"),
                 "chapters":  chapters,
                 "sections":  sections,
-                "domain":    domain,
+                "domain":    target_domain,
+                "course":    target_course,
+                "chapter":   target_chapter,
+                "storage_path": str(dest),
                 "status":    "ok" if db_error is None else "partial",
                 "db_error":  db_error,
             })
@@ -2216,21 +4060,31 @@ async def build_course(
         except Exception as exc:
             log.error(f"❌ Build course failed for {f.filename}: {exc}")
             results.append({"file": f.filename, "status": "error", "error": str(exc)})
+        finally:
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
 
     if files_to_index:
         log.info(f"📤 Ingestion RAG batch lancée pour {len(files_to_index)} fichier(s)")
-        # ✅ Ingest each file with its corresponding course_id
-        for file_path, course_id in files_to_index:
-            log.info(f"   📚 Indexing {Path(file_path).name} with course_id={course_id}")
-            rag_ok = rag.run_ingestion_pipeline_for_files(
-                [file_path],
-                domain=domain,
-                course="uploaded_course",
+        for item in files_to_index:
+            course_data = item["course_data"]
+            course_id = item["course_id"]
+            target_domain = item["domain"]
+            target_course = item["course"]
+            target_chapter = item.get("chapter", "chapter_1")
+            log.info(f"   📚 Structured indexing {Path(course_data.get('file_path', 'unknown')).name} ({target_domain}/{target_course}/{target_chapter}) with course_id={course_id}")
+            rag_ok = rag.run_ingestion_pipeline_from_course_data(
+                course_data,
+                domain=target_domain,
+                course=target_course,
                 course_id=course_id,
                 incremental=True,
             )
             if not rag_ok:
-                log.info(f"ℹ️ Ingestion RAG terminée sans indexation vectorielle pour {file_path}")
+                log.info(f"ℹ️ Ingestion RAG terminée sans indexation vectorielle pour {item['storage_path']}")
 
     return {"results": results, "rag_stats": rag.get_stats()}
 
@@ -2320,6 +4174,20 @@ async def get_course_structure(course_id: str):
 
 if __name__ == "__main__":
     import uvicorn
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+            probe_socket.bind((Config.SERVER_HOST, Config.SERVER_PORT))
+    except OSError as exc:
+        log.error(
+            "🚫 Port %s déjà utilisé sur %s:%s (%s) → arrêtez l'autre instance ou changez SERVER_PORT",
+            Config.SERVER_PORT,
+            Config.SERVER_HOST,
+            Config.SERVER_PORT,
+            exc,
+        )
+        raise SystemExit(1)
+
     log.info("")
     log.info("🌐 Interface UI       : http://localhost:" + str(Config.SERVER_PORT) + "/static/index.html")
     log.info("📚 Swagger Docs       : http://localhost:" + str(Config.SERVER_PORT) + "/docs")

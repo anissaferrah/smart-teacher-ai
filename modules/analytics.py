@@ -17,10 +17,13 @@ import os
 import csv
 import time
 import logging
+import base64
 from datetime import datetime, date
 from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 log = logging.getLogger("SmartTeacher.Analytics")
 
@@ -106,6 +109,28 @@ class AnalyticsEngine:
         if not CH_HOST:
             log.info("📊 ClickHouse non configuré → analytics CSV + mémoire")
             return
+
+        try:
+            probe_url = f"http://{CH_HOST}:{CH_PORT}/?query=SELECT%201"
+            request = Request(probe_url)
+            if CH_PASSWORD:
+                credentials = f"{CH_USER}:{CH_PASSWORD}".encode("utf-8")
+                request.add_header("Authorization", f"Basic {base64.b64encode(credentials).decode('ascii')}")
+
+            with urlopen(request, timeout=1.5) as response:
+                body = response.read().decode("utf-8", errors="ignore").strip().lower()
+                if response.status != 200 or body not in {"1", "1\n"}:
+                    raise RuntimeError(f"unexpected ping response: {response.status} {body!r}")
+        except HTTPError as exc:
+            log.info("📊 ClickHouse indisponible sur %s:%s (%s) → analytics CSV + mémoire", CH_HOST, CH_PORT, exc)
+            return
+        except URLError as exc:
+            log.info("📊 ClickHouse indisponible sur %s:%s (%s) → analytics CSV + mémoire", CH_HOST, CH_PORT, exc.reason)
+            return
+        except Exception as exc:
+            log.info("📊 ClickHouse indisponible sur %s:%s (%s) → analytics CSV + mémoire", CH_HOST, CH_PORT, exc)
+            return
+
         try:
             import clickhouse_connect
             self._ch = clickhouse_connect.get_client(
@@ -118,9 +143,9 @@ class AnalyticsEngine:
             self._use_ch = True
             log.info("✅ ClickHouse connecté : %s:%s/%s", CH_HOST, CH_PORT, CH_DB)
         except ImportError:
-            log.warning("⚠️  clickhouse-connect non installé → analytics CSV")
+            log.info("📊 clickhouse-connect non installé → analytics CSV + mémoire")
         except Exception as e:
-            log.warning("⚠️  ClickHouse non dispo (%s) → analytics CSV", e)
+            log.info("📊 ClickHouse non dispo (%s) → analytics CSV + mémoire", e)
 
     # ── Enregistrement ────────────────────────────────────────────────────
 

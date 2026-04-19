@@ -21,12 +21,67 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 # ── Stats en mémoire (complétées par PostgreSQL si dispo) ─────────────
 _SESSIONS_CACHE: list[dict] = []
+_CHECKPOINTS_CACHE: list[dict] = []
+_TRACE_CACHE: list[dict] = []
 
 def record_session_event(event: dict):
     """Appelé depuis main.py à chaque interaction."""
     _SESSIONS_CACHE.append({**event, "ts": time.time()})
     if len(_SESSIONS_CACHE) > 1000:
         _SESSIONS_CACHE.pop(0)
+
+
+def record_checkpoint_event(event: dict):
+    """Enregistre un point de pause/reprise pour le dashboard."""
+    _CHECKPOINTS_CACHE.append({**event, "ts": time.time()})
+    if len(_CHECKPOINTS_CACHE) > 1000:
+        _CHECKPOINTS_CACHE.pop(0)
+
+
+def record_trace_event(event: dict):
+  """Enregistre une étape backend courte pour la vue opérationnelle."""
+  _TRACE_CACHE.append({**event, "ts": time.time()})
+  if len(_TRACE_CACHE) > 1000:
+    _TRACE_CACHE.pop(0)
+
+
+def _safe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_pointer_short(event: dict) -> str:
+    chapter_index = _safe_int(event.get("chapter_index"))
+    section_index = _safe_int(event.get("section_index"))
+    char_position = event.get("char_position")
+
+    parts = []
+    if chapter_index is not None:
+        parts.append(f"C{chapter_index + 1}")
+    if section_index is not None:
+        parts.append(f"S{section_index + 1}")
+    if char_position is not None:
+        parts.append(f"@{char_position}")
+
+    return " / ".join(parts) if parts else "—"
+
+
+def _format_pointer_detail(event: dict) -> str:
+    point_text = str(event.get("point_text") or event.get("pointer_text") or "").strip()
+    if point_text:
+        return point_text
+
+    location_label = str(event.get("location_label") or "").strip()
+    cursor_label = str(event.get("cursor_label") or "").strip()
+    if location_label and cursor_label:
+        return f"{location_label}, position {cursor_label}"
+    if location_label:
+        return location_label
+    if cursor_label:
+        return cursor_label
+    return _format_pointer_short(event)
 
 
 @router.get("/stats")
@@ -76,24 +131,45 @@ async def get_stats():
 async def get_active_sessions():
     """Sessions récentes (dernières 24h)."""
     cutoff = time.time() - 86400
-    recent = [e for e in _SESSIONS_CACHE if e.get("ts", 0) > cutoff]
+    recent_questions = [e for e in _SESSIONS_CACHE if e.get("ts", 0) > cutoff]
+    recent_checkpoints = [e for e in _CHECKPOINTS_CACHE if e.get("ts", 0) > cutoff]
 
-    # Grouper par session_id
     by_session: dict[str, list] = {}
-    for e in recent:
-        sid = e.get("session_id", "unknown")
+    for e in recent_questions:
+        sid = str(e.get("session_id", "unknown"))
         by_session.setdefault(sid, []).append(e)
 
+    checkpoints_by_session: dict[str, list] = {}
+    for e in recent_checkpoints:
+        sid = str(e.get("session_id", "unknown"))
+        checkpoints_by_session.setdefault(sid, []).append(e)
+
     sessions = []
-    for sid, events in list(by_session.items())[-20:]:
+    for sid in sorted(set(by_session) | set(checkpoints_by_session)):
+        question_events = by_session.get(sid, [])
+        checkpoint_events = checkpoints_by_session.get(sid, [])
+        latest_question = question_events[-1] if question_events else None
+        latest_checkpoint = checkpoint_events[-1] if checkpoint_events else None
+        combined_events = question_events + checkpoint_events
+        latest_event = max(combined_events, key=lambda x: x.get("ts", 0)) if combined_events else None
+        pointer_source = latest_event or latest_checkpoint or latest_question or {}
+
+        checkpoint_type = (latest_checkpoint or {}).get("checkpoint_type")
+        is_paused = checkpoint_type == "pause"
         sessions.append({
-            "session_id":   sid[:8],
-            "language":     events[-1].get("language", "?"),
-            "turns":        len(events),
-            "avg_time":     round(sum(e.get("total_time",0) for e in events) / len(events), 2),
-            "kpi_rate":     round(sum(1 for e in events if e.get("meets_kpi")) / len(events) * 100, 1),
-            "last_activity": events[-1].get("ts", 0),
+            "session_id": sid[:8],
+            "language": (pointer_source or {}).get("language", "?"),
+            "turns": len(question_events),
+            "avg_time": round(sum(e.get("total_time", 0) for e in question_events) / len(question_events), 2) if question_events else 0,
+            "kpi_rate": round(sum(1 for e in question_events if e.get("meets_kpi")) / len(question_events) * 100, 1) if question_events else 0,
+            "pointer": _format_pointer_short(pointer_source),
+            "pointer_detail": _format_pointer_detail(pointer_source),
+          "checkpoint_state": "pause" if is_paused else "active",
+          "checkpoint_label": "Pause" if is_paused else "Actif",
+          "paused": is_paused,
+            "last_activity": (latest_event or pointer_source).get("ts", 0),
         })
+
     return {"sessions": sorted(sessions, key=lambda x: -x["last_activity"])}
 
 
@@ -121,6 +197,105 @@ async def get_analytics():
         "kpi_threshold_s": 5.0,
         "kpi_rate_pct": round(sum(1 for e in _SESSIONS_CACHE if e.get("meets_kpi")) / len(_SESSIONS_CACHE) * 100, 1),
     }
+
+@router.get("/checkpoints")
+async def get_recent_checkpoints():
+    """Retourne les derniers points de pause et de reprise."""
+    cutoff = time.time() - 86400
+    recent = [e for e in _CHECKPOINTS_CACHE if e.get("ts", 0) > cutoff]
+
+    checkpoints = []
+    for e in reversed(recent):
+        checkpoint_type = str(e.get("checkpoint_type") or "checkpoint")
+        checkpoints.append({
+            "session_id": str(e.get("session_id", "unknown"))[:8],
+            "checkpoint_type": checkpoint_type,
+            "checkpoint_label": "Pause" if checkpoint_type == "pause" else "Reprise" if checkpoint_type == "resume" else checkpoint_type,
+            "pointer": _format_pointer_short(e),
+            "pointer_detail": _format_pointer_detail(e),
+            "reason": e.get("reason") or "",
+            "language": e.get("language") or "?",
+            "subject": e.get("subject") or "unknown",
+            "slide_title": e.get("slide_title") or "",
+            "ts": e.get("ts", 0),
+        })
+        if len(checkpoints) >= 20:
+            break
+
+    return {"checkpoints": checkpoints}
+
+
+@router.get("/trace")
+async def get_recent_trace():
+  """Retourne les dernières étapes backend visibles brièvement."""
+  cutoff = time.time() - 120
+  recent = [e for e in _TRACE_CACHE if e.get("ts", 0) > cutoff]
+
+  traces = []
+  for e in reversed(recent):
+    ts = e.get("ts", 0)
+    traces.append({
+      "session_id": str(e.get("session_id", "unknown"))[:8],
+      "turn_id": e.get("turn_id"),
+      "state": e.get("state") or "",
+      "state_name": e.get("state_name") or e.get("state") or "",
+      "substep": e.get("substep") or "",
+      "display_message": e.get("display_message") or "",
+      "details": e.get("details") or {},
+      "metrics": e.get("metrics") or {},
+      "emoji": e.get("emoji") or "",
+      "age_sec": round(max(time.time() - ts, 0), 1),
+      "ts": ts,
+    })
+    if len(traces) >= 30:
+      break
+
+  return {"traces": traces}
+
+
+@router.get("/questions")
+async def get_recent_questions():
+    """Retourne les questions récentes avec leurs métriques par tour."""
+    cutoff = time.time() - 86400
+    recent = [e for e in _SESSIONS_CACHE if e.get("ts", 0) > cutoff]
+
+    questions = []
+    for e in reversed(recent):
+        question_text = (e.get("question") or e.get("input_text") or e.get("question_text") or "").strip()
+        if not question_text:
+            continue
+        questions.append({
+            "session_id": str(e.get("session_id", "unknown"))[:8],
+            "turn_id": e.get("turn_id"),
+            "language": e.get("language", "?"),
+            "subject": e.get("subject") or "unknown",
+            "question": question_text,
+            "stt_text": (e.get("stt_text") or question_text).strip(),
+            "answer": (e.get("answer") or e.get("output_text") or "").strip(),
+            "slide_title": e.get("slide_title") or "",
+            "chapter_title": e.get("chapter_title") or "",
+            "section_title": e.get("section_title") or "",
+            "tts_engine": e.get("tts_engine") or "",
+            "tts_voice": e.get("tts_voice") or "",
+          "chapter_index": e.get("chapter_index"),
+          "section_index": e.get("section_index"),
+          "char_position": e.get("char_position"),
+          "pointer": _format_pointer_short(e),
+          "pointer_detail": _format_pointer_detail(e),
+            "llm_time": round(float(e.get("llm_time") or 0.0), 2),
+          "stt_time": round(float(e.get("stt_time") or 0.0), 2),
+            "tts_time": round(float(e.get("tts_time") or 0.0), 2),
+            "total_time": round(float(e.get("total_time") or 0.0), 2),
+            "kpi_ok": bool(e.get("meets_kpi")),
+          "confusion": bool(e.get("confusion")),
+          "confusion_reason": e.get("confusion_reason") or "",
+          "source": e.get("source") or "",
+            "ts": e.get("ts", 0),
+        })
+        if len(questions) >= 20:
+            break
+
+    return {"questions": questions}
 
 
 @router.get("", response_class=HTMLResponse)
@@ -166,12 +341,13 @@ h1{font-size:1.6em;font-weight:700;background:linear-gradient(135deg,var(--accen
 /* Sessions table */
 table{width:100%;border-collapse:collapse;font-size:.83em}
 th{color:var(--muted);font-weight:600;text-align:left;padding:8px 12px;border-bottom:1px solid var(--border)}
-td{padding:8px 12px;border-bottom:1px solid var(--border)10}
+td{padding:8px 12px;border-bottom:1px solid var(--border)}
 tr:hover td{background:rgba(108,99,255,.06)}
 .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:.75em;font-weight:600}
 .badge-green{background:rgba(0,212,170,.12);color:var(--success)}
 .badge-red{background:rgba(255,107,107,.12);color:var(--accent3)}
 .badge-yellow{background:rgba(245,158,11,.12);color:var(--warn)}
+.badge-purple{background:rgba(108,99,255,.12);color:var(--accent)}
 
 /* Chart bars */
 .bar-group{display:flex;flex-direction:column;gap:8px}
@@ -180,6 +356,27 @@ tr:hover td{background:rgba(108,99,255,.06)}
 .bar-track{flex:1;background:var(--border);border-radius:4px;height:8px;overflow:hidden}
 .bar-fill{height:100%;border-radius:4px;transition:width 1s ease}
 .bar-val{width:50px;color:var(--text);font-family:'DM Mono',monospace;font-size:.85em}
+
+/* Services + trace */
+.service-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.service-card{padding:16px;border:1px solid var(--border);border-radius:14px;background:rgba(255,255,255,.02);display:flex;flex-direction:column;gap:10px;min-height:180px}
+.service-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.service-title{font-weight:700;font-size:.9em}
+.service-state{font-size:.72em;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.06em}
+.service-state.ok{background:rgba(0,212,170,.12);color:var(--success)}
+.service-state.warn{background:rgba(245,158,11,.12);color:var(--warn)}
+.service-state.bad{background:rgba(255,107,107,.12);color:var(--accent3)}
+.service-meta{font-size:.75em;color:var(--muted);line-height:1.5}
+.service-detail{padding-top:8px;border-top:1px solid rgba(255,255,255,.05);display:flex;flex-direction:column;gap:3px}
+.service-detail-label{font-size:.68em;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.service-detail-value{font-size:.8em;color:var(--text);line-height:1.45}
+.trace-list{display:flex;flex-direction:column;gap:10px;max-height:280px;overflow-y:auto}
+.trace-item{display:flex;flex-direction:column;gap:6px;padding:12px;border:1px solid var(--border);border-radius:14px;background:rgba(255,255,255,.02)}
+.trace-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.trace-title{font-size:.88em;font-weight:700}
+.trace-sub{font-size:.78em;color:var(--muted);line-height:1.5;white-space:pre-wrap}
+.trace-badges{display:flex;flex-wrap:wrap;gap:6px}
+.trace-age{font-size:.72em;color:var(--muted);font-family:'DM Mono',monospace}
 
 /* Timeline */
 .timeline{display:flex;flex-direction:column;gap:8px;max-height:280px;overflow-y:auto}
@@ -236,6 +433,31 @@ tr:hover td{background:rgba(108,99,255,.06)}
   </div>
 
   <div class="grid grid-2" style="margin-bottom:16px">
+    <div class="card">
+      <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+        <span>🩺 Services en direct</span>
+        <span id="services-count" style="font-size:.85em;color:var(--accent)"></span>
+      </div>
+      <div style="color:var(--muted);font-size:.8em;line-height:1.45;margin-bottom:10px">
+        Chaque carte indique le statut, le rôle réel, ce qui est récupéré et le chemin principal du code.
+      </div>
+      <div class="service-grid" id="serviceGrid">
+        <div style="color:var(--muted);font-size:.85em">Chargement…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+        <span>⚡ Trace backend récente</span>
+        <span id="trace-count" style="font-size:.85em;color:var(--accent)"></span>
+      </div>
+      <div class="trace-list" id="traceTimeline">
+        <div style="color:var(--muted);font-size:.85em">Chargement…</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-2" style="margin-bottom:16px">
     <!-- Répartition par composant -->
     <div class="card">
       <div class="card-title">⏱ Temps par composant</div>
@@ -267,11 +489,65 @@ tr:hover td{background:rgba(108,99,255,.06)}
           <th>Tours</th>
           <th>Temps moyen</th>
           <th>KPI</th>
+          <th>Pointeur</th>
+          <th>État</th>
           <th>Dernière activité</th>
         </tr>
       </thead>
       <tbody id="sessionsTable">
+        <tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">Chargement…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Repères pause / reprise -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>📍 Pointeur, pause et reprise</span>
+      <span id="checkpoints-count" style="font-size:.85em;color:var(--accent)"></span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Session</th>
+          <th>Type</th>
+          <th>Pointeur</th>
+          <th>Détail</th>
+          <th>Raison</th>
+          <th>Horodatage</th>
+        </tr>
+      </thead>
+      <tbody id="checkpointsTable">
         <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:20px">Chargement…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Questions récentes -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>❓ Questions récentes (24h)</span>
+      <span id="questions-count" style="font-size:.85em;color:var(--accent)"></span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Session</th>
+          <th>Tour</th>
+          <th>Question</th>
+          <th>Sujet</th>
+          <th>Pointeur</th>
+          <th>Langue</th>
+          <th>STT</th>
+          <th>LLM</th>
+          <th>TTS</th>
+          <th>Temps total</th>
+          <th>KPI</th>
+          <th>Confusion</th>
+        </tr>
+      </thead>
+      <tbody id="questionsTable">
+        <tr><td colspan="12" style="color:var(--muted);text-align:center;padding:20px">Chargement…</td></tr>
       </tbody>
     </table>
   </div>
@@ -290,7 +566,7 @@ tr:hover td{background:rgba(108,99,255,.06)}
 
 <script>
 async function loadAll() {
-  await Promise.all([loadStats(), loadSessions(), loadAnalytics()]);
+  await Promise.all([loadStats(), loadServices(), loadSessions(), loadAnalytics(), loadCheckpoints(), loadTrace(), loadQuestions()]);
   document.getElementById('lastUpdate').textContent = 'Mis à jour : ' + new Date().toLocaleTimeString();
 }
 
@@ -309,7 +585,7 @@ async function loadStats() {
     // Graphe langues
     const langs = d.by_language || {};
     const total = Object.values(langs).reduce((a,b)=>a+b, 0) || 1;
-    const colors = {fr:'#6c63ff',ar:'#00d4aa',en:'#f59e0b',tr:'#ff6b6b'};
+    const colors = {fr:'#6c63ff',en:'#f59e0b'};
     document.getElementById('langChart').innerHTML = Object.entries(langs)
       .sort((a,b) => b[1]-a[1])
       .map(([lang, cnt]) => `
@@ -343,6 +619,131 @@ async function loadAnalytics() {
   } catch(e) { console.error(e); }
 }
 
+async function loadServices() {
+  try {
+    const d = await fetch('/dashboard/services').then(r => r.json());
+    const services = d.services || {};
+
+    const cards = [
+      {
+        key: 'rag',
+        title: 'Qdrant / RAG',
+        icon: '🔍',
+        ok: !!services.rag?.healthy || !!services.rag?.bm25_ready,
+        stateLabel: services.rag?.healthy ? 'Actif' : (services.rag?.bm25_ready ? 'BM25' : 'HS'),
+        stateClass: services.rag?.healthy ? 'ok' : (services.rag?.bm25_ready ? 'warn' : 'bad'),
+        meta: [
+          services.rag?.embedding_source ? `Embeddings ${services.rag.embedding_source}` : '',
+          services.rag?.embedding_model || '',
+          services.rag?.qdrant_connected ? 'Qdrant connecté' : 'Qdrant indisponible',
+          services.rag?.vectorstore_available ? 'Vectorstore OK' : 'Vectorstore KO',
+          services.rag?.collection ? `Collection ${services.rag.collection}` : '',
+          services.rag?.docs_loaded != null ? `${services.rag.docs_loaded} docs` : '',
+        ].filter(Boolean),
+        details: [
+          { label: 'Rôle', value: services.rag?.role || 'Orchestre la recherche hybride et la génération de réponses' },
+          { label: 'Récupère', value: services.rag?.retrieves || "Chunks vectoriels Qdrant, scores BM25 et cache d'embeddings" },
+          { label: 'Code', value: services.rag?.used_in || 'modules/multimodal_rag.py' },
+        ],
+      },
+      {
+        key: 'redis',
+        title: 'Redis',
+        icon: '🧠',
+        ok: !!services.redis?.connected,
+        stateLabel: services.redis?.connected ? 'Actif' : 'HS',
+        stateClass: services.redis?.connected ? 'ok' : 'bad',
+        meta: [services.redis?.endpoint || '', services.redis?.latency_ms != null ? `${services.redis.latency_ms} ms` : ''].filter(Boolean),
+        details: [
+          { label: 'Rôle', value: services.redis?.role || 'Cache et état temps réel' },
+          { label: 'Récupère', value: services.redis?.retrieves || 'Sessions WebSocket, état temporaire et latence de traitement' },
+          { label: 'Code', value: services.redis?.used_in || 'handlers/session_manager.py, modules/llm.py, main.py get_redis' },
+        ],
+      },
+      {
+        key: 'postgres',
+        title: 'PostgreSQL',
+        icon: '🗄️',
+        ok: !!services.postgres?.connected,
+        stateLabel: services.postgres?.connected ? 'Actif' : 'HS',
+        stateClass: services.postgres?.connected ? 'ok' : 'bad',
+        meta: [services.postgres?.endpoint || '', services.postgres?.latency_ms != null ? `${services.postgres.latency_ms} ms` : ''].filter(Boolean),
+        details: [
+          { label: 'Rôle', value: services.postgres?.role || 'Persistance transactionnelle' },
+          { label: 'Récupère', value: services.postgres?.retrieves || "Sessions, interactions, profils étudiants et événements d'apprentissage" },
+          { label: 'Code', value: services.postgres?.used_in || 'database/models.py, database/init_db.py, main.py /course/build, /session, /dashboard/stats' },
+        ],
+      },
+      {
+        key: 'ollama',
+        title: 'Ollama',
+        icon: '🖥️',
+        ok: !!services.ollama?.available,
+        stateLabel: services.ollama?.available ? 'Actif' : 'HS',
+        stateClass: services.ollama?.available ? 'ok' : 'bad',
+        meta: [services.ollama?.model ? `Model ${services.ollama.model}` : '', services.ollama?.endpoint || ''].filter(Boolean),
+        details: [
+          { label: 'Rôle', value: services.ollama?.role || 'LLM local de secours' },
+          { label: 'Récupère', value: services.ollama?.retrieves || 'Modèles disponibles via /api/tags et réponses locales via Ollama' },
+          { label: 'Code', value: services.ollama?.used_in || 'modules/llm.py, main.py /ask, quiz fallback' },
+        ],
+      },
+      {
+        key: 'elasticsearch',
+        title: 'Elasticsearch',
+        icon: '🧭',
+        ok: !!services.elasticsearch?.available,
+        stateLabel: services.elasticsearch?.available ? 'Actif' : 'Mémoire',
+        stateClass: services.elasticsearch?.available ? 'ok' : 'warn',
+        meta: [services.elasticsearch?.backend ? `Backend ${services.elasticsearch.backend}` : '', services.elasticsearch?.host || '', services.elasticsearch?.index ? `Index ${services.elasticsearch.index}` : ''].filter(Boolean),
+        details: [
+          { label: 'Rôle', value: services.elasticsearch?.role || 'Recherche full-text historique' },
+          { label: 'Récupère', value: services.elasticsearch?.retrieves || 'Questions, réponses et index texte des transcriptions' },
+          { label: 'Code', value: services.elasticsearch?.used_in || 'modules/transcript_search.py, main.py /dashboard/services' },
+        ],
+      },
+      {
+        key: 'minio',
+        title: 'MinIO',
+        icon: '🪣',
+        ok: true,
+        stateLabel: services.minio?.provider === 'minio' ? 'MinIO' : 'Local',
+        stateClass: services.minio?.provider === 'minio' ? 'ok' : 'warn',
+        meta: [
+          services.minio?.provider ? `Provider ${services.minio.provider}` : '',
+          services.minio?.endpoint && services.minio.provider === 'minio' ? services.minio.endpoint : '',
+          services.minio?.bucket ? `Bucket ${services.minio.bucket}` : '',
+          services.minio?.local_root ? `Local ${services.minio.local_root}` : '',
+        ].filter(Boolean),
+        details: [
+          { label: 'Rôle', value: services.minio?.role || 'Stockage objet des médias' },
+          { label: 'Récupère', value: services.minio?.retrieves || 'PDF, slides, audio et objets listés via /media-list' },
+          { label: 'Code', value: services.minio?.used_in || 'modules/media_storage.py, main.py /media/{path}, /media-list, modules/course_builder.py' },
+        ],
+      },
+    ];
+
+    const healthyCount = cards.filter(card => card.ok).length;
+    document.getElementById('services-count').textContent = `${healthyCount}/${cards.length} actifs`;
+
+    document.getElementById('serviceGrid').innerHTML = cards.map(card => `
+      <div class="service-card">
+        <div class="service-head">
+          <div class="service-title">${card.icon} ${card.title}</div>
+          <span class="service-state ${card.stateClass}">${esc(card.stateLabel)}</span>
+        </div>
+        <div class="service-meta">${card.meta.length ? card.meta.map(esc).join('<br>') : 'Aucune donnée'}</div>
+        ${card.details.map(detail => detail.value ? `
+          <div class="service-detail">
+            <div class="service-detail-label">${esc(detail.label)}</div>
+            <div class="service-detail-value">${esc(detail.value)}</div>
+          </div>
+        ` : '').join('')}
+      </div>
+    `).join('');
+  } catch(e) { console.error(e); }
+}
+
 async function loadSessions() {
   try {
     const d = await fetch('/dashboard/sessions').then(r => r.json());
@@ -351,21 +752,164 @@ async function loadSessions() {
 
     if (!sessions.length) {
       document.getElementById('sessionsTable').innerHTML =
-        '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:20px">Aucune session récente</td></tr>';
+        '<tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">Aucune session récente</td></tr>';
       return;
     }
 
     document.getElementById('sessionsTable').innerHTML = sessions.map(s => {
       const kpiClass = s.kpi_rate >= 80 ? 'badge-green' : s.kpi_rate >= 60 ? 'badge-yellow' : 'badge-red';
+      const stateLabel = s.checkpoint_label || (s.paused ? 'Pause' : 'Actif');
+      const stateClass = s.paused ? 'badge-yellow' : 'badge-purple';
       const ago = Math.round((Date.now()/1000 - s.last_activity) / 60);
       const agoStr = ago < 60 ? `il y a ${ago}min` : `il y a ${Math.round(ago/60)}h`;
       return `<tr>
-        <td style="font-family:'DM Mono',monospace;color:var(--accent)">${s.session_id}…</td>
+        <td style="font-family:'DM Mono',monospace;color:var(--accent)">${esc(s.session_id)}…</td>
         <td><span class="badge badge-green">${(s.language||'?').toUpperCase()}</span></td>
         <td>${s.turns}</td>
         <td style="font-family:'DM Mono',monospace">${s.avg_time}s</td>
         <td><span class="badge ${kpiClass}">${s.kpi_rate}%</span></td>
+        <td style="font-family:'DM Mono',monospace;color:var(--text)" title="${esc(s.pointer_detail || s.pointer || '—')}">${esc(s.pointer || '—')}</td>
+        <td><span class="badge ${stateClass}">${esc(stateLabel)}</span></td>
         <td style="color:var(--muted)">${agoStr}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+async function loadCheckpoints() {
+  try {
+    const d = await fetch('/dashboard/checkpoints').then(r => r.json());
+    const checkpoints = d.checkpoints || [];
+    document.getElementById('checkpoints-count').textContent = checkpoints.length + ' repères';
+
+    if (!checkpoints.length) {
+      document.getElementById('checkpointsTable').innerHTML =
+        '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:20px">Aucun repère récent</td></tr>';
+      return;
+    }
+
+    document.getElementById('checkpointsTable').innerHTML = checkpoints.map(c => {
+      const kindClass = c.checkpoint_type === 'pause' ? 'badge-yellow' : 'badge-green';
+      const kindLabel = c.checkpoint_label || (c.checkpoint_type === 'pause' ? 'Pause' : 'Reprise');
+      const detail = c.pointer_detail || c.pointer || '—';
+      const detailShort = detail.length > 90 ? detail.slice(0, 90) + '…' : detail;
+      const stamp = new Date((c.ts || 0) * 1000).toLocaleString();
+      return `<tr>
+        <td style="font-family:'DM Mono',monospace;color:var(--accent)">${esc(c.session_id)}…</td>
+        <td><span class="badge ${kindClass}">${esc(kindLabel)}</span></td>
+        <td style="font-family:'DM Mono',monospace" title="${esc(detail)}">${esc(c.pointer || '—')}</td>
+        <td title="${esc(detail)}">${esc(detailShort)}</td>
+        <td style="color:var(--muted)" title="${esc(c.slide_title || '')}">${esc(c.reason || '—')}</td>
+        <td style="font-family:'DM Mono',monospace">${stamp}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+async function loadTrace() {
+  try {
+    const d = await fetch('/dashboard/trace').then(r => r.json());
+    const traces = d.traces || [];
+    document.getElementById('trace-count').textContent = `${traces.length} étapes`;
+
+    if (!traces.length) {
+      document.getElementById('traceTimeline').innerHTML =
+        '<div style="color:var(--muted);font-size:.85em">Aucune étape récente</div>';
+      return;
+    }
+
+    document.getElementById('traceTimeline').innerHTML = traces.map(t => {
+      const state = (t.state || '').toUpperCase();
+      const stateClass = state === 'RESPONDING' ? 'badge-green' : state === 'PROCESSING' ? 'badge-yellow' : state === 'PRESENTING' ? 'badge-purple' : 'badge-red';
+      const rawSummary = (t.display_message || t.substep || t.state_name || '').replace(/\\n+/g, ' • ');
+      const summary = rawSummary.length > 180 ? rawSummary.slice(0, 180) + '…' : rawSummary;
+      const details = t.details || {};
+      const detailParts = [];
+      if (details.course_title) detailParts.push(`Course: ${details.course_title}`);
+      if (details.chapter_title) detailParts.push(`Chapter: ${details.chapter_title}`);
+      if (details.section_title) detailParts.push(`Section: ${details.section_title}`);
+      if (details.slide_title) detailParts.push(`Slide: ${details.slide_title}`);
+      if (details.question_text) detailParts.push(`Question: ${details.question_text}`);
+      if (details.transcription) detailParts.push(`STT: ${details.transcription}`);
+      if (details.tts_engine || details.tts_voice) detailParts.push(`TTS: ${details.tts_engine || 'unknown'}${details.tts_voice ? ` / ${details.tts_voice}` : ''}`);
+      if (details.answer_preview) detailParts.push(`Answer: ${details.answer_preview}`);
+      const detailLine = detailParts.join(' • ');
+      const age = typeof t.age_sec === 'number' ? `${t.age_sec.toFixed(1)}s` : '—';
+      const metrics = t.metrics || {};
+      const badges = [];
+      if (t.turn_id != null) badges.push(`<span class="badge badge-purple">Tour ${esc(t.turn_id)}</span>`);
+      if (metrics.stt_time != null) badges.push(`<span class="badge badge-yellow">STT ${Number(metrics.stt_time).toFixed(2)}s</span>`);
+      if (metrics.retrieval_time != null) badges.push(`<span class="badge badge-yellow">RAG ${Number(metrics.retrieval_time).toFixed(2)}s</span>`);
+      if (metrics.llm_time != null) badges.push(`<span class="badge badge-green">LLM ${Number(metrics.llm_time).toFixed(2)}s</span>`);
+      if (metrics.tts_time != null) badges.push(`<span class="badge badge-green">TTS ${Number(metrics.tts_time).toFixed(2)}s</span>`);
+      if (metrics.total_time != null) badges.push(`<span class="badge badge-red">Total ${Number(metrics.total_time).toFixed(2)}s</span>`);
+      if (metrics.chunks != null) badges.push(`<span class="badge badge-yellow">Docs ${metrics.chunks}</span>`);
+      return `
+        <div class="trace-item">
+          <div class="trace-top">
+            <div>
+              <div class="trace-title">${esc(t.emoji || '•')} ${esc(t.state_name || t.state || 'Trace')}</div>
+                <div class="trace-sub">${esc(summary || '—')}${detailLine ? `\\n${esc(detailLine)}` : ''}</div>
+            </div>
+            <div class="trace-age">${age}</div>
+          </div>
+          <div class="trace-badges">
+            <span class="badge ${stateClass}">${esc(state || 'STEP')}</span>
+            ${badges.join('')}
+          </div>
+        </div>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+function esc(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+async function loadQuestions() {
+  try {
+    const d = await fetch('/dashboard/questions').then(r => r.json());
+    const questions = d.questions || [];
+    document.getElementById('questions-count').textContent = questions.length + ' questions';
+
+    if (!questions.length) {
+      document.getElementById('questionsTable').innerHTML =
+        '<tr><td colspan="12" style="color:var(--muted);text-align:center;padding:20px">Aucune question récente</td></tr>';
+      return;
+    }
+
+    document.getElementById('questionsTable').innerHTML = questions.map(q => {
+      const kpiClass = q.kpi_ok ? 'badge-green' : 'badge-red';
+      const confusionClass = q.confusion ? 'badge-yellow' : 'badge-green';
+      const question = (q.question || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      const answer = (q.answer || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      const slideTitle = (q.slide_title || q.section_title || q.chapter_title || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      const pointer = q.pointer || '—';
+      const pointerDetail = q.pointer_detail || pointer;
+      const turnLabel = q.turn_id != null ? q.turn_id : '—';
+      const sttTime = Number(q.stt_time || 0).toFixed(2);
+      const llmTime = Number(q.llm_time || 0).toFixed(2);
+      const ttsTime = Number(q.tts_time || 0).toFixed(2);
+      const totalTime = Number(q.total_time || 0).toFixed(2);
+      const ttsVoice = (q.tts_voice || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      const ttsEngine = (q.tts_engine || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      return `<tr>
+        <td style="font-family:'DM Mono',monospace;color:var(--accent)">${esc(q.session_id)}…</td>
+        <td style="font-family:'DM Mono',monospace">${esc(turnLabel)}</td>
+        <td title="${question}">${question.length > 82 ? question.slice(0, 82) + '…' : question}${slideTitle ? `<div style="margin-top:6px;color:var(--muted);font-size:.78em;line-height:1.45" title="${slideTitle}">🖼️ ${slideTitle}</div>` : ''}${answer ? `<div style="margin-top:6px;color:var(--muted);font-size:.78em;line-height:1.45" title="${answer}">${answer.length > 110 ? answer.slice(0, 110) + '…' : answer}</div>` : ''}</td>
+        <td><span class="badge badge-green">${esc(q.subject || 'unknown')}</span></td>
+        <td style="font-family:'DM Mono',monospace" title="${esc(pointerDetail)}">${esc(pointer)}</td>
+        <td><span class="badge badge-yellow">${(q.language || '?').toUpperCase()}</span></td>
+        <td style="font-family:'DM Mono',monospace">${sttTime}s</td>
+        <td style="font-family:'DM Mono',monospace">${llmTime}s</td>
+        <td style="font-family:'DM Mono',monospace">${ttsTime}s${ttsVoice ? `<div style="margin-top:4px;color:var(--muted);font-size:.76em;line-height:1.35" title="${ttsEngine || ttsVoice}">${ttsEngine ? `${ttsEngine} / ` : ''}${ttsVoice}</div>` : ''}</td>
+        <td style="font-family:'DM Mono',monospace">${totalTime}s</td>
+        <td><span class="badge ${kpiClass}">${q.kpi_ok ? 'OK' : 'SLOW'}</span></td>
+        <td><span class="badge ${confusionClass}">${q.confusion ? 'Oui' : 'Non'}</span></td>
       </tr>`;
     }).join('');
   } catch(e) { console.error(e); }

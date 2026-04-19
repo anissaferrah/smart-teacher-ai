@@ -53,7 +53,7 @@ class Student(Base):
     last_name : str
         Student's last name
     preferred_language : str
-        ISO 639-1 language code (e.g., "fr", "en", "ar")
+        ISO 639-1 language code (e.g., "fr", "en")
     account_level : str
         Account level (e.g., "student", "teacher", "admin")
     is_active : bool
@@ -96,7 +96,7 @@ class Course(Base):
     subject : str
         Subject area (e.g., "data_science", "mathematics", "general")
     language : str
-        ISO 639-1 language code (e.g., "fr", "en", "ar")
+        ISO 639-1 language code (e.g., "fr", "en")
     level : str
         Course level (e.g., "lycée", "master", "phd")
     description : str, optional
@@ -300,7 +300,7 @@ class LearningSession(Base):
     course_id : UUID, optional
         Foreign key to enrolled Course
     language : str
-        ISO 639-1 language code (e.g., "fr", "en", "ar")
+        ISO 639-1 language code (e.g., "fr", "en")
     level : str
         Student level (e.g., "lycée", "master")
     state : str
@@ -399,6 +399,40 @@ class Interaction(Base):
     tts_time = Column(Float, nullable=False, default=0.0)
     total_time = Column(Float, nullable=False, default=0.0)
     kpi_ok = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class LearningEvent(Base):
+    """Detailed pedagogical event log for model readiness and offline training."""
+
+    __tablename__ = "learning_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("learning_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    student_id = Column(String(100), nullable=False, index=True)
+    course_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id", ondelete="SET NULL"),
+        index=True,
+    )
+    event_type = Column(String(30), nullable=False, default="qa", index=True)
+    input_text = Column(Text)
+    output_text = Column(Text)
+    concept = Column(String(255), index=True)
+    action_taken = Column(String(100), index=True)
+    confusion_score = Column(Float, nullable=False, default=0.0)
+    reward = Column(Float, nullable=False, default=0.0)
+    stt_time = Column(Float, nullable=False, default=0.0)
+    llm_time = Column(Float, nullable=False, default=0.0)
+    tts_time = Column(Float, nullable=False, default=0.0)
+    total_time = Column(Float, nullable=False, default=0.0)
+    student_state = Column(JSON, nullable=False, default=dict)
+    event_payload = Column(JSON, nullable=False, default=dict)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 

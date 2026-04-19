@@ -102,13 +102,18 @@ class MediaStorage:
 
         try:
             from minio import Minio
+            import urllib3
+
+            http_client = urllib3.PoolManager(
+                timeout=urllib3.Timeout(connect=2.0, read=5.0),
+            )
 
             self._minio = Minio(
                 MINIO_ENDPOINT,
                 access_key=MINIO_ACCESS_KEY,
                 secret_key=MINIO_SECRET_KEY,
                 secure=MINIO_SECURE,
-                connect_timeout=2,  # Short timeout
+                http_client=http_client,
                 region="us-east-1",
             )
 
@@ -320,6 +325,21 @@ class MediaStorage:
             return []
         return [str(p.relative_to(LOCAL_MEDIA_DIR)) for p in base.rglob("*") if p.is_file()]
 
+    def get_status(self) -> dict:
+        """Return a compact status snapshot for dashboards and diagnostics."""
+        self._init_storage()
+        provider = "minio" if self._use_minio else "local"
+        endpoint = f"{MINIO_ENDPOINT}/{MINIO_BUCKET}" if MINIO_ENDPOINT else "local"
+        return {
+            "configured": bool(MINIO_ENDPOINT),
+            "active": self._use_minio,
+            "provider": provider,
+            "endpoint": endpoint,
+            "bucket": MINIO_BUCKET,
+            "secure": MINIO_SECURE,
+            "local_root": str(LOCAL_MEDIA_DIR),
+        }
+
     # ── MinIO internals ──────────────────────────────────────────────────
 
     def _minio_upload_bytes(self, data: bytes, object_name: str, content_type: str) -> str:
@@ -372,9 +392,21 @@ class MediaStorage:
         obj = f"audio/{session_id}/{ts}.{ext}"
         return self.upload_bytes(data, obj, mime)
 
-    def save_slide_image(self, course_id: str, slide_idx: int, data: bytes) -> str:
+    def save_slide_image(
+        self,
+        course_id: str,
+        slide_idx: int,
+        data: bytes,
+        *,
+        domain: str | None = None,
+        course: str | None = None,
+        chapter: str | None = None,
+    ) -> str:
         """Sauvegarde une image de slide."""
-        obj = f"slides/{course_id}/slide_{slide_idx:04d}.png"
+        if domain and course and chapter:
+            obj = f"slides/{domain}/{course}/{chapter}/page_{slide_idx:03d}.png"
+        else:
+            obj = f"slides/{course_id}/slide_{slide_idx:04d}.png"
         return self.upload_bytes(data, obj, "image/png")
 
 

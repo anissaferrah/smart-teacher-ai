@@ -27,6 +27,7 @@ class SmartTeacher {
     this.onStateChange     = options.onStateChange     || (() => {});
     this.onSlideUpdate     = options.onSlideUpdate     || (() => {});
     this.onPerformance     = options.onPerformance     || (() => {});
+    this.onSystemNotice    = options.onSystemNotice    || (() => {});
     this.onError           = options.onError           || ((e) => console.error(e));
 
     // Interne
@@ -105,6 +106,9 @@ class SmartTeacher {
         break;
       case 'performance':
         this.onPerformance(msg);
+        break;
+      case 'system_notice':
+        this.onSystemNotice(msg.text, msg);
         break;
       case 'error':
         this.onError(msg.message);

@@ -22,10 +22,6 @@ def detect_lang_text(text: str) -> str:
         code = detect(text)
         if code.startswith("fr"):
             return "fr"
-        if code.startswith("ar"):
-            return "ar"
-        if code.startswith("tr"):
-            return "tr"
         return "en"
     except Exception:
         return "en"

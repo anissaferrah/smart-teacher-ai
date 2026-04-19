@@ -26,7 +26,7 @@ from typing import Optional
 # Import configuration domaines & cours
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from domains_config import DEFAULT_DOMAIN, DEFAULT_COURSE, get_chapters, get_courses
+from domains_config import DEFAULT_DOMAIN, DEFAULT_COURSE, get_chapters, get_courses, get_domains
 
 log = logging.getLogger("SmartTeacher.CourseBuilder")
 
@@ -70,11 +70,16 @@ class TextExtractor:
                     if not hasattr(shape, "text") or not shape.text.strip():
                         continue
                     text = shape.text.strip()
+                    is_title_placeholder = shape.shape_type == 13
+                    if not is_title_placeholder:
+                        try:
+                            placeholder_format = shape.placeholder_format
+                        except (AttributeError, ValueError):
+                            placeholder_format = None
+                        is_title_placeholder = bool(placeholder_format and placeholder_format.idx == 0)
+
                     # Le premier texte grand = titre (souvent placeholder title)
-                    if (shape.shape_type == 13 or
-                        (hasattr(shape, "placeholder_format") and
-                         shape.placeholder_format and
-                         shape.placeholder_format.idx == 0)):
+                    if is_title_placeholder:
                         title_text = text
                     else:
                         bullet_texts.append(text)
@@ -342,11 +347,130 @@ class CourseBuilder:
         self.structurer = LocalStructurer()
 
     @staticmethod
-    def _course_slug(value: str | None, fallback: str = DEFAULT_COURSE) -> str:
-        candidate = (value or fallback).strip().lower()
+    def _course_slug(value: str | None, fallback: str = DEFAULT_COURSE, domain: str | None = None) -> str:
+        candidate = (value or fallback).strip()
+
+        if domain:
+            try:
+                for existing_course in get_courses(domain):
+                    if candidate == existing_course or candidate.lower() == existing_course.lower():
+                        return existing_course
+            except Exception:
+                pass
+
+        candidate = candidate.lower()
         candidate = re.sub(r"[^a-z0-9]+", "_", candidate)
         candidate = candidate.strip("_")
         return candidate or fallback
+
+    @staticmethod
+    def _looks_like_chapter(value: str | None) -> bool:
+        if not value:
+            return False
+
+        normalized = value.strip().lower().replace("\\", "/").split("/")[-1]
+        return bool(
+            re.search(r"(?:chapter|chapitre|chap)\s*[_\-\s]*\d+", normalized)
+            or re.fullmatch(r"chapter[_\-\s]*\d+", normalized)
+            or re.fullmatch(r"chapitre[_\-\s]*\d+", normalized)
+            or re.fullmatch(r"ch\d+", normalized)
+        )
+
+    @staticmethod
+    def _chapter_slug(value: str | None, fallback: str = "chapter_1") -> str:
+        candidate = (value or fallback).strip().replace("\\", "/").split("/")[-1]
+        candidate = candidate.lower()
+        candidate = re.sub(r"[^a-z0-9]+", "_", candidate)
+        candidate = candidate.strip("_")
+        return candidate or fallback
+
+    @staticmethod
+    def _display_label(value: str | None, fallback: str) -> str:
+        candidate = (value or "").replace("_", " ").replace("-", " ").strip()
+        return candidate.title() if candidate else fallback
+
+    def infer_upload_context(
+        self,
+        upload_name: str | None,
+        fallback_domain: str = DEFAULT_DOMAIN,
+        fallback_course: str | None = None,
+        fallback_chapter: str = "chapter_1",
+    ) -> tuple[str, str, str]:
+        """Déduit domaine / cours / chapitre depuis le chemin uploadé."""
+        raw_path = (upload_name or "").replace("\\", "/").strip()
+        parts = [part for part in Path(raw_path).parts if part not in ("", ".", "..")]
+        if parts and len(parts[0]) == 2 and parts[0][1] == ":":
+            parts = parts[1:]
+
+        folders = parts[:-1]
+        file_stem = Path(parts[-1]).stem if parts else ""
+        known_domains = {name.lower(): name for name in get_domains()}
+
+        domain = fallback_domain or DEFAULT_DOMAIN
+        course = fallback_course if fallback_course and not self._looks_like_chapter(fallback_course) else None
+        if course is None and file_stem and not self._looks_like_chapter(file_stem):
+            course = file_stem
+        if course is None:
+            course = DEFAULT_COURSE
+        chapter = fallback_chapter or "chapter_1"
+        chapter_from_folder = False
+
+        if folders:
+            first_folder = folders[0]
+            matched_domain = known_domains.get(first_folder.lower())
+            if matched_domain:
+                domain = matched_domain
+
+            chapter_idx = next(
+                (idx for idx in range(len(folders) - 1, -1, -1) if self._looks_like_chapter(folders[idx])),
+                None,
+            )
+            if chapter_idx is not None:
+                chapter = folders[chapter_idx]
+                chapter_from_folder = True
+                if chapter_idx >= 1:
+                    course = folders[chapter_idx - 1]
+                if chapter_idx >= 2:
+                    domain = folders[chapter_idx - 2]
+            elif len(folders) >= 3:
+                domain, course, chapter = folders[-3], folders[-2], folders[-1]
+                chapter_from_folder = True
+            elif len(folders) == 2:
+                first, second = folders
+                if self._looks_like_chapter(second):
+                    if not matched_domain:
+                        course = first
+                    chapter = second
+                    chapter_from_folder = True
+                else:
+                    domain, course = first, second
+            elif len(folders) == 1:
+                if matched_domain:
+                    domain = matched_domain
+                elif self._looks_like_chapter(folders[0]):
+                    chapter = folders[0]
+                    chapter_from_folder = True
+                else:
+                    course = folders[0]
+
+        if file_stem and self._looks_like_chapter(file_stem) and not chapter_from_folder:
+            chapter = file_stem
+
+        if not domain:
+            domain = fallback_domain or DEFAULT_DOMAIN
+        if not course or self._looks_like_chapter(course):
+            if fallback_course and not self._looks_like_chapter(fallback_course):
+                course = fallback_course
+            elif file_stem and not self._looks_like_chapter(file_stem):
+                course = file_stem
+            else:
+                course = DEFAULT_COURSE
+
+        return (
+            domain,
+            self._course_slug(course, fallback_course or course or DEFAULT_COURSE, domain=domain),
+            self._chapter_slug(chapter, fallback_chapter),
+        )
 
     # ── Pipeline de cours complet ─────────────────────────────────────
     async def build_course_chapters(
@@ -364,7 +488,7 @@ class CourseBuilder:
         Args:
             domain: Nom du domaine (ex: "informatique")
             course: Nom du cours (ex: "mathematiques")
-            language: Langue (ex: "fr", "en", "ar")
+            language: Langue (ex: "fr", "en")
             auto_detect: Si True, détecte automatiquement le domaine/cours depuis sample_file
             sample_file: Chemin vers un fichier PDF pour auto-détection
 
@@ -378,15 +502,14 @@ class CourseBuilder:
         Exemples :
             # Spécifique
             chapters = await builder.build_course_chapters("informatique", "mathematiques", "fr")
-            
+
             # Auto-détection depuis un PDF
             chapters = await builder.build_course_chapters(
-                auto_detect=True, 
+                auto_detect=True,
                 sample_file="Chapter 1.pdf",
                 language="fr"
             )
         """
-        # Auto-détection si activée
         if auto_detect and sample_file:
             log.info(f"🔍 Auto-détection du domaine/cours depuis : {sample_file}")
             try:
@@ -397,8 +520,7 @@ class CourseBuilder:
                 log.info(f"ℹ️  Auto-détection échouée : {e}. Utilisation valeurs par défaut.")
                 domain = DEFAULT_DOMAIN
                 course = DEFAULT_COURSE
-        
-        # Vérifier que le cours existe vraiment dans le dossier du domaine
+
         available_courses = get_courses(domain)
         if course not in available_courses:
             raise ValueError(
@@ -406,7 +528,6 @@ class CourseBuilder:
                 f"Disponibles : {available_courses}"
             )
 
-        # Construire le chemin
         course_path = Path("courses") / domain / course
         if not course_path.exists():
             raise FileNotFoundError(f"Dossier introuvable : {course_path}")
@@ -417,8 +538,6 @@ class CourseBuilder:
         log.info(f"{'='*60}")
 
         results: dict[int, dict] = {}
-
-        # Récupérer les chapitres configurés pour ce cours
         chapters = get_chapters(domain, course)
 
         for ch_idx, ch_title in chapters.items():
@@ -430,7 +549,12 @@ class CourseBuilder:
             log.info(f"\n📖 Ch{ch_idx} — {ch_title} : {file_path.name}")
             try:
                 course_data = await self._build_chapter(
-                    file_path, ch_idx, ch_title, language, domain=domain, subject=course
+                    file_path,
+                    ch_idx,
+                    ch_title,
+                    language,
+                    domain=domain,
+                    subject=course,
                 )
                 results[ch_idx] = course_data
                 log.info(f"  ✅ Ch{ch_idx} structuré")
@@ -440,6 +564,21 @@ class CourseBuilder:
         log.info(f"\n✅ Cours {course} prêt : {len(results)}/{len(chapters)} chapitres chargés")
         return results
 
+    def _infer_context_from_file(
+        self,
+        file_path: str,
+        fallback_domain: str = DEFAULT_DOMAIN,
+        fallback_course: str | None = None,
+        fallback_chapter: str = "chapter_1",
+    ) -> tuple[str, str, str]:
+        """Infère la hiérarchie à partir du chemin local sauvegardé."""
+        return self.infer_upload_context(
+            file_path,
+            fallback_domain=fallback_domain,
+            fallback_course=fallback_course,
+            fallback_chapter=fallback_chapter,
+        )
+
     async def _build_chapter(
         self,
         file_path: Path,
@@ -448,12 +587,14 @@ class CourseBuilder:
         language: str,
         domain: str = DEFAULT_DOMAIN,
         subject: str = DEFAULT_COURSE,
+        chapter: str | None = None,
     ) -> dict:
         """Construit un chapitre depuis un fichier."""
         
         # 🎨 Générer les PNG (images visuelles du cours)
+        chapter_slug = self._chapter_slug(chapter or f"chapter_{chapter_idx}", f"chapter_{chapter_idx}")
         course_dir = Path("media/slides") / domain / subject
-        chapter_dir = course_dir / f"chapter_{chapter_idx}"
+        chapter_dir = course_dir / chapter_slug
         chapter_dir.mkdir(parents=True, exist_ok=True)
         
         png_paths = self.structurer._pdf_to_images(
@@ -485,8 +626,9 @@ class CourseBuilder:
         )
         course_data["chapter_idx"]   = chapter_idx
         course_data["chapter_title"] = chapter_title
+        course_data["chapter_slug"]  = chapter_slug
         course_data["file_path"]     = str(file_path)
-        course_data["slides"]        = [f"/media/slides/{domain}/{subject}/chapter_{chapter_idx}/page_{i+1:03d}.png" for i in range(len(png_paths))]
+        course_data["slides"]        = [f"/media/slides/{domain}/{subject}/{chapter_slug}/page_{i+1:03d}.png" for i in range(len(png_paths))]
         return course_data
 
     def _find_chapter_file(self, course_path: Path, ch_idx: int) -> Path | None:
@@ -531,6 +673,7 @@ class CourseBuilder:
         level:     str = "université",
         subject:   str = "",
         domain:    str = DEFAULT_DOMAIN,  # 🎯 Domaine (général, informatique, etc.)
+        chapter:   str = "chapter_1",
     ) -> dict:
         path = Path(file_path)
         if not path.exists():
@@ -540,11 +683,17 @@ class CourseBuilder:
         log.info(f"📚 Construction : {path.name}")
         log.info(f"{'='*60}")
 
-        course_slug = self._course_slug(subject, path.stem)
+        inferred_domain, course_slug, chapter_slug = self._infer_context_from_file(
+            str(path),
+            fallback_domain=domain,
+            fallback_course=subject or None,
+            fallback_chapter=chapter,
+        )
+        domain = inferred_domain or domain
 
         # 🎨 Générer les PNG (images visuelles du cours)
         course_dir = Path("media/slides") / domain / course_slug
-        chapter_dir = course_dir / "chapter_1"
+        chapter_dir = course_dir / chapter_slug
         chapter_dir.mkdir(parents=True, exist_ok=True)
         
         png_paths = self.structurer._pdf_to_images(
@@ -568,7 +717,9 @@ class CourseBuilder:
         )
         course_data["file_path"] = str(file_path)
         course_data["subject"] = course_slug
-        course_data["slides"] = [f"/media/slides/{domain}/{course_slug}/chapter_1/page_{i+1:03d}.png" for i in range(len(png_paths))]
+        course_data["chapter_slug"] = chapter_slug
+        course_data["chapters"][0]["title"] = self._display_label(chapter_slug, "Chapter 1")
+        course_data["slides"] = [f"/media/slides/{domain}/{course_slug}/{chapter_slug}/page_{i+1:03d}.png" for i in range(len(png_paths))]
         self._print_summary(course_data)
         return course_data
 
@@ -579,6 +730,7 @@ class CourseBuilder:
         level: str = "université",
         subject: str = "",
         domain: str = DEFAULT_DOMAIN,
+        chapter: str = "chapter_1",
     ) -> dict:
         """
         Construit un cours directement depuis le fichier, sans génération IA.
@@ -590,7 +742,14 @@ class CourseBuilder:
         if not path.exists():
             raise FileNotFoundError(f"Fichier introuvable : {file_path}")
 
-        course_slug = self._course_slug(subject, path.stem)
+        inferred_domain, course_slug, chapter_slug = self._infer_context_from_file(
+            str(path),
+            fallback_domain=domain,
+            fallback_course=subject or None,
+            fallback_chapter=chapter,
+        )
+        domain = inferred_domain or domain
+        chapter_title = self._display_label(chapter_slug, "Chapter 1")
 
         log.info(f"\n{'='*60}")
         log.info(f"📚 Construction directe (sans IA) : {path.name}")
@@ -602,12 +761,12 @@ class CourseBuilder:
 
         if ext == ".pdf":
             course_dir = Path("media/slides") / domain / course_slug
-            chapter_dir = course_dir / "chapter_1"
+            chapter_dir = course_dir / chapter_slug
             chapter_dir.mkdir(parents=True, exist_ok=True)
 
             png_paths = self.structurer._pdf_to_images(str(path), str(chapter_dir))
             slides = [
-                f"/media/slides/{domain}/{course_slug}/chapter_1/page_{i+1:03d}.png"
+                f"/media/slides/{domain}/{course_slug}/{chapter_slug}/page_{i+1:03d}.png"
                 for i in range(len(png_paths))
             ]
 
@@ -675,7 +834,7 @@ class CourseBuilder:
             "description": "Cours importé directement (sans génération IA)",
             "chapters": [
                 {
-                    "title": "Chapitre 1",
+                    "title": chapter_title,
                     "order": 1,
                     "summary": "Import direct du document original",
                     "sections": sections,
@@ -683,6 +842,7 @@ class CourseBuilder:
             ],
             "file_path": str(path),
             "slides": slides,
+            "chapter_slug": chapter_slug,
         }
 
         self._print_summary(course_data)

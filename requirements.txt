@@ -1,0 +1,53 @@
+# Smart Teacher main project dependencies
+# Core API / server
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+python-dotenv
+requests
+
+# Data / storage / DB
+numpy
+pandas
+sqlalchemy
+redis
+minio
+clickhouse-connect
+
+# ML / NLP / RAG
+openai
+torch
+transformers
+scikit-learn
+qdrant-client
+langchain-core
+langchain-openai
+langchain-community
+langchain-huggingface
+langchain-qdrant
+elasticsearch
+langdetect
+unstructured
+faster-whisper
+
+# Audio / speech / TTS
+soundfile
+sounddevice
+librosa
+pydub
+edge-tts
+elevenlabs
+whisperlivekit
+
+# Document / OCR utilities
+python-pptx
+pypdf
+pdfminer.six
+python-docx
+pytesseract
+pdf2image
+
+# Visualization / analysis
+matplotlib
+seaborn

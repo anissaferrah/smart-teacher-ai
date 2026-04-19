@@ -15,11 +15,11 @@ import uuid
 from datetime import datetime
 from typing import Optional, List
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from database.models import Course, Chapter, Section, Concept, LearningSession, Interaction, Student
+from database.models import Course, Chapter, Section, Concept, LearningSession, Interaction, LearningEvent, Student
 
 log = logging.getLogger("SmartTeacher.CRUD")
 
@@ -622,6 +622,56 @@ async def get_session_stats(
         "kpi_met_count": kpi_count,
         "kpi_percentage": kpi_pct,
     }
+
+
+async def log_learning_event(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    student_id: str,
+    course_id: Optional[uuid.UUID],
+    event_type: str = "qa",
+    input_text: Optional[str] = None,
+    output_text: Optional[str] = None,
+    concept: Optional[str] = None,
+    action_taken: Optional[str] = None,
+    confusion_score: float = 0.0,
+    reward: float = 0.0,
+    stt_time: float = 0.0,
+    llm_time: float = 0.0,
+    tts_time: float = 0.0,
+    total_time: float = 0.0,
+    student_state: Optional[dict] = None,
+    event_payload: Optional[dict] = None,
+) -> LearningEvent:
+    """Persist a rich learning event for later student modeling and analytics."""
+    event = LearningEvent(
+        session_id=session_id,
+        student_id=student_id,
+        course_id=course_id,
+        event_type=event_type,
+        input_text=input_text,
+        output_text=output_text,
+        concept=concept,
+        action_taken=action_taken,
+        confusion_score=float(confusion_score or 0.0),
+        reward=float(reward or 0.0),
+        stt_time=float(stt_time or 0.0),
+        llm_time=float(llm_time or 0.0),
+        tts_time=float(tts_time or 0.0),
+        total_time=float(total_time or 0.0),
+        student_state=dict(student_state or {}),
+        event_payload=dict(event_payload or {}),
+    )
+    db.add(event)
+    await db.flush()
+    log.debug(
+        "Logged learning event: %s (confusion=%.2f, reward=%.2f, total=%.2fs)",
+        event_type,
+        event.confusion_score,
+        event.reward,
+        event.total_time,
+    )
+    return event
 
 
 # ══════════════════════════════════════════════════════════════════════

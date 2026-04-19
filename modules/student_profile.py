@@ -27,7 +27,7 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import redis.asyncio as aioredis
 
@@ -126,6 +126,10 @@ class StudentProfile:
     # Topic tracking
     difficult_topics: List[str] = field(default_factory=list)
     mastered_topics: List[str] = field(default_factory=list)
+    concept_mastery: Dict[str, float] = field(default_factory=dict)
+    recent_confusion_score: float = 0.0
+    last_response_time: float = 0.0
+    last_action: str = ""
 
     # Behavior tracking (auto-detected)
     asks_examples: int = 0
@@ -146,6 +150,10 @@ class StudentProfile:
             JSON representation of profile
         """
         return json.dumps(asdict(self))
+
+    def to_dict(self) -> dict:
+        """Return the profile as a plain dictionary."""
+        return asdict(self)
 
     @classmethod
     def from_json(cls, data: str) -> "StudentProfile":
@@ -178,6 +186,10 @@ class StudentProfile:
         self.confusion_count += 1
         if topic and topic not in self.difficult_topics:
             self.difficult_topics.append(topic)
+        if topic:
+            current = self.concept_mastery.get(topic, 0.45)
+            self.concept_mastery[topic] = round(max(0.0, current - 0.15), 3)
+        self.recent_confusion_score = min(1.0, max(self.recent_confusion_score, 0.75))
         self.updated_at = time.time()
 
     def record_mastery(self, topic: str) -> None:
@@ -195,6 +207,9 @@ class StudentProfile:
             self.mastered_topics.append(topic)
         if topic in self.difficult_topics:
             self.difficult_topics.remove(topic)
+        current = self.concept_mastery.get(topic, 0.55)
+        self.concept_mastery[topic] = round(min(1.0, current + 0.2), 3)
+        self.recent_confusion_score = max(0.0, self.recent_confusion_score - 0.1)
         self.updated_at = time.time()
 
     def record_interaction(self) -> None:
@@ -217,9 +232,9 @@ class StudentProfile:
         float
             Recommended speech rate multiplier (0.7 to 1.3)
         """
-        if self.confusion_count > 5:
+        if self.recent_confusion_score >= 0.7 or self.confusion_count > 5:
             return max(0.75, self.speech_rate - 0.1)
-        elif self.asks_repeat > 3:
+        elif self.last_response_time > 10 or self.asks_repeat > 3:
             return max(0.8, self.speech_rate - 0.05)
         return self.speech_rate
 
@@ -362,7 +377,12 @@ class ProfileManager:
         self,
         student_id: str,
         interaction_type: str,
-        topic: str = ""
+        topic: str = "",
+        confused: bool = False,
+        response_time: float | None = None,
+        confidence: float | None = None,
+        reward: float | None = None,
+        action_taken: str = "",
     ) -> Optional[StudentProfile]:
         """
         Update profile based on student interaction type.
@@ -386,6 +406,7 @@ class ProfileManager:
             Updated profile, or None if save fails
         """
         profile = await self.get_or_create(student_id)
+        profile.last_action = action_taken or interaction_type
         
         if interaction_type == "repeat":
             profile.asks_repeat += 1
@@ -395,9 +416,54 @@ class ProfileManager:
             profile.record_confusion(topic)
         elif interaction_type == "interrupt":
             profile.interruptions += 1
+
+        if response_time is not None:
+            response_time = max(0.0, float(response_time))
+            profile.last_response_time = response_time
+            if profile.avg_response_time <= 0:
+                profile.avg_response_time = response_time
+            else:
+                profile.avg_response_time = round(profile.avg_response_time * 0.85 + response_time * 0.15, 3)
+
+        low_confidence = confidence is not None and float(confidence) < 0.5
+        if confused or low_confidence:
+            profile.record_confusion(topic)
+        elif topic:
+            current = profile.concept_mastery.get(topic, 0.5)
+            boost = 0.15 if reward is None or float(reward) > 0 else 0.05
+            profile.concept_mastery[topic] = round(min(1.0, current + boost), 3)
+            if topic not in profile.mastered_topics and profile.concept_mastery[topic] >= 0.85:
+                profile.mastered_topics.append(topic)
+            profile.recent_confusion_score = max(0.0, profile.recent_confusion_score - 0.05)
         
         # Always record as interaction
         profile.record_interaction()
+
+        if reward is not None and float(reward) >= 0.7 and topic:
+            profile.record_mastery(topic)
         
         await self.save(profile)
         return profile
+
+    async def update_from_session(
+        self,
+        student_id: str,
+        interaction_type: str,
+        topic: str = "",
+        confused: bool = False,
+        response_time: float | None = None,
+        confidence: float | None = None,
+        reward: float | None = None,
+        action_taken: str = "",
+    ) -> Optional[StudentProfile]:
+        """Backward-compatible alias used by older call sites."""
+        return await self.update_from_interaction(
+            student_id=student_id,
+            interaction_type=interaction_type,
+            topic=topic,
+            confused=confused,
+            response_time=response_time,
+            confidence=confidence,
+            reward=reward,
+            action_taken=action_taken,
+        )

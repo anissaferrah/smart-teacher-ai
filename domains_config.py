@@ -26,6 +26,15 @@
 """
 
 from typing import Dict
+import sys
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
 
 # ═══════════════════════════════════════════════════════════════════════
 #  CONFIGURATION DOMAINES & COURS (ACTUELS)
@@ -163,37 +172,43 @@ def discover_chapters(domain: str, course: str) -> Dict[int, str]:
     
     if not course_path.exists():
         return {}
+
+    def _extract_chapter_num(name: str) -> int | None:
+        patterns = [
+            r"[Cc]hapter\s+(\d+)",
+            r"[Cc]hapitre\s+(\d+)",
+            r"[Cc]h(\d+)",
+            r"(\d+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, name)
+            if match:
+                for group in match.groups():
+                    if group:
+                        return int(group)
+        return None
     
     # Patterns de fichiers acceptés
-    patterns = [
-        r"[Cc]hapter\s+(\d+)\.pdf",
-        r"[Cc]h(\d+)\.pdf",
-        r"(\d+)\.pdf",
-    ]
-    
     chapters = {}
-    
+
+    # Chapitres au niveau racine
     for pdf_file in sorted(course_path.glob("*.pdf")):
-        filename = pdf_file.stem
-        chapter_num = None
-        
-        # Chercher le numéro du chapitre
-        for pattern in patterns:
-            match = re.search(pattern, pdf_file.name)
-            if match:
-                chapter_num = int(match.group(1))
-                break
-        
+        chapter_num = _extract_chapter_num(pdf_file.stem) or _extract_chapter_num(pdf_file.name)
         if chapter_num is None:
-            continue  # Skip si pas de numéro trouvé
-        
-        # Nom par défaut = "Chapter N"
-        chapter_title = f"Chapter {chapter_num}"
-        
-        # TODO: Extraire le titre depuis le PDF plus tard
-        # chapter_title = extract_pdf_title(pdf_file) or chapter_title
-        
-        chapters[chapter_num] = chapter_title
+            continue
+        chapters[chapter_num] = f"Chapter {chapter_num}"
+
+    # Chapitres dans des sous-dossiers chapter_*/
+    for subdir in sorted(course_path.iterdir()):
+        if not subdir.is_dir():
+            continue
+        chapter_num = _extract_chapter_num(subdir.name)
+        pdfs = sorted(list(subdir.glob("*.pdf")))
+        if chapter_num is None and pdfs:
+            chapter_num = _extract_chapter_num(pdfs[0].stem) or _extract_chapter_num(pdfs[0].name)
+        if chapter_num is None:
+            continue
+        chapters[chapter_num] = f"Chapter {chapter_num}"
     
     return chapters
 

@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -49,6 +50,7 @@ class Config:
     MAX_AUDIO_DURATION: float = 30.0
 
     # STT (Whisper)
+    STT_BACKEND: str = os.getenv("STT_BACKEND", "faster-whisper")
     WHISPER_MODEL_SIZE: str = os.getenv("WHISPER_MODEL_SIZE", "base")
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cpu")
     WHISPER_COMPUTE: str = os.getenv("WHISPER_COMPUTE", "int8")
@@ -65,8 +67,14 @@ class Config:
     # RAG (Retrieval-Augmented Generation)
     RAG_ENABLED: bool = os.getenv("RAG_ENABLED", "false").lower() == "true"  # Disabled temporarily (OpenAI quota)
     RAG_NUM_RESULTS: int = int(os.getenv("RAG_NUM_RESULTS", "5"))
-    RAG_EMBEDDING_MODEL: str = os.getenv("RAG_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    RAG_EMBEDDING_MODEL: str = os.getenv("RAG_EMBEDDING_MODEL", "BAAI/bge-m3")
     RAG_DB_DIR: str = os.getenv("RAG_DB_DIR", "data/multimodal_db")
+
+    # Confusion detection (SIGHT)
+    CONFUSION_MODEL_PATH: str = os.getenv(
+        "CONFUSION_MODEL_PATH",
+        str(Path(__file__).resolve().parent / "dataset" / "sight-main" / "data" / "processed" / "confusion_model_final.pth"),
+    )
 
     # Qdrant
     QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
@@ -81,7 +89,6 @@ class Config:
 
     EDGE_VOICES = {
         "fr": "fr-FR-DeniseNeural",
-        "ar": "ar-SA-ZariyahNeural",
         "en": "en-US-JennyNeural",
     }
 
@@ -100,7 +107,6 @@ class Config:
     MAX_RESPONSE_TIME: float = 5.0
     # MAX_INTERRUPTION_LATENCY: float = 0.5  # [UNUSED v1.0]
     # TARGET_WER_FR: float = 0.10  # [UNUSED v1.0]
-    # TARGET_WER_AR: float = 0.20  # [UNUSED v1.0]
     # TARGET_WER_EN: float = 0.10  # [UNUSED v1.0]
     TARGET_RTF: float = 0.50
 
@@ -204,7 +210,7 @@ class Config:
         print("⚙️  SMART TEACHER — CONFIGURATION")
         print("=" * 60)
         print(f"\n🎙️  AUDIO:  {cls.SAMPLE_RATE}Hz | chunk={cls.CHUNK_SIZE} | silence={cls.SILENCE_DURATION}s")
-        print(f"🧠 STT:    Whisper {cls.WHISPER_MODEL_SIZE} | {cls.WHISPER_DEVICE} | {cls.WHISPER_COMPUTE}")
+        print(f"🧠 STT:    {cls.STT_BACKEND} | Whisper {cls.WHISPER_MODEL_SIZE} | {cls.WHISPER_DEVICE} | {cls.WHISPER_COMPUTE}")
         print(f"💬 LLM:    {cls.GPT_MODEL} | max_tokens={cls.GPT_MAX_TOKENS} | history={cls.MAX_HISTORY_TURNS}")
         print(f"🔊 TTS:    {cls.TTS_PROVIDER}")
         print(f"📚 RAG:    {cls.RAG_DB_DIR} | top-k={cls.RAG_NUM_RESULTS}")
