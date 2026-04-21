@@ -1,87 +1,138 @@
-"""Retriever Agent - Multi-query retrieval with confidence scoring."""
+"""
+Stage 3: Retriever Agent
+Performs dual retrieval (dense embeddings + sparse BM25) with RRF fusion.
+Based on Repo 1 (agentic-rag-for-dummies) hybrid retrieval pattern.
+"""
 
 import logging
-import asyncio
-from typing import Dict, Any, List
-from infrastructure.logging import get_logger
+import time
+from typing import List, Optional, Dict, Any
+from collections import defaultdict
 
-log = get_logger(__name__)
+log = logging.getLogger("SmartTeacher.RetrieverAgent")
 
 
-async def retriever_agent_node(
-    state: "AgenticRAGState",
-    rag,
-) -> Dict[str, Any]:
-    """Multi-query retrieval with quality scoring and fallback.
-    
-    Args:
-        state: Current workflow state
-        rag: RAG retrieval engine
-        
-    Returns:
-        Dict with retrieved_chunks, retrieval_confidence, and strategy
+class RetrieverAgent:
     """
-    query = state.rewritten_query or state.query
-    
-    log.info(f"🔍 Retrieving context for: '{query}'")
-    
-    try:
-        # Primary retrieval: vector search
-        chunks = await asyncio.to_thread(
-            rag.retrieve_chunks,
-            query,
-            course_id=state.course_id,
-            top_k=8,
-        )
-        
-        if not chunks or len(chunks) == 0:
-            log.warning(f"⚠️  No results from primary retrieval - trying keyword search")
-            # Fallback: keyword search
-            chunks = await asyncio.to_thread(
-                rag.retrieve_chunks,
+    Stage 3 of the agentic RAG pipeline.
+    Hybrid retrieval using embeddings + BM25 with Reciprocal Rank Fusion.
+
+    Pattern from Repo 1: Combines dense and sparse retrieval for better coverage.
+    """
+
+    def __init__(self, rag_system, hybrid_retriever=None):
+        """
+        Initialize retriever.
+
+        Args:
+            rag_system: Existing RAG system for embedding-based retrieval
+            hybrid_retriever: Optional hybrid retriever module for RRF fusion
+        """
+        self.rag_system = rag_system
+        self.hybrid_retriever = hybrid_retriever
+
+    async def retrieve(
+        self,
+        query: str,
+        course_id: Optional[str] = None,
+        k: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve relevant chunks using hybrid approach.
+
+        Args:
+            query: Search query
+            course_id: Optional course context
+            k: Number of results to return
+
+        Returns:
+            List of top-k chunks with metadata and scores
+        """
+        start_time = time.time()
+
+        try:
+            if self.hybrid_retriever:
+                # Use hybrid retriever with RRF fusion
+                results = await self.hybrid_retriever.hybrid_retrieve(
+                    query,
+                    course_id=course_id,
+                    k=k
+                )
+                log.info(f"Hybrid retrieval found {len(results)} chunks for '{query}'")
+            else:
+                # Fallback to dense retrieval only
+                results = await self._dense_retrieval_only(query, course_id, k)
+                log.info(f"Dense-only retrieval found {len(results)} chunks for '{query}'")
+
+            duration_ms = (time.time() - start_time) * 1000
+            log.debug(f"Retrieval completed in {duration_ms:.1f}ms")
+
+            return results
+
+        except Exception as e:
+            log.error(f"Retrieval failed: {e}")
+            return []
+
+    async def _dense_retrieval_only(
+        self,
+        query: str,
+        course_id: Optional[str],
+        k: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Fallback to dense retrieval (embeddings) only.
+
+        Args:
+            query: Search query
+            course_id: Course context
+            k: Number of results
+
+        Returns:
+            Retrieved chunks with scores
+        """
+        try:
+            chunks = await self.rag_system.retrieve_chunks(
                 query,
-                course_id=state.course_id,
-                top_k=5,
-                use_bm25=True,  # Fallback to BM25
+                k=k,
+                course_id=course_id
             )
-            retrieval_strategy = "bm25_fallback"
-        else:
-            retrieval_strategy = "vector_primary"
-        
-        # Calculate average confidence score
-        if chunks:
-            scores = [chunk.get("score", 0.0) for chunk in chunks]
-            avg_confidence = sum(scores) / len(scores) if scores else 0.0
-        else:
-            avg_confidence = 0.0
-        
-        state.retrieved_chunks = chunks
-        state.retrieval_confidence = avg_confidence
-        state.retrieval_strategy = retrieval_strategy
-        
-        log.info(f"✅ Retrieved {len(chunks)} chunks (confidence: {avg_confidence:.2f}) using {retrieval_strategy}")
-        
-        # Record in metadata
-        state.agent_metadata["retriever"] = {
-            "chunk_count": len(chunks),
-            "confidence": avg_confidence,
-            "strategy": retrieval_strategy,
+
+            results = []
+            for chunk in chunks:
+                results.append({
+                    "content": chunk.page_content if hasattr(chunk, 'page_content') else str(chunk),
+                    "source": getattr(chunk, 'metadata', {}).get('source', 'unknown'),
+                    "score": 0.8,  # Default score for fallback
+                    "method": "dense"
+                })
+
+            return results
+
+        except Exception as e:
+            log.error(f"Dense retrieval fallback failed: {e}")
+            return []
+
+    async def retrieve_with_trace(
+        self,
+        query: str,
+        course_id: Optional[str] = None,
+        k: int = 5
+    ) -> dict:
+        """
+        Retrieve chunks and return detailed trace.
+
+        Returns:
+            Dictionary with retrieval results and metadata
+        """
+        start_time = time.time()
+        chunks = await self.retrieve(query, course_id, k)
+        duration_ms = (time.time() - start_time) * 1000
+
+        return {
+            "query": query,
+            "chunks_retrieved": len(chunks),
+            "chunks": chunks,
+            "duration_ms": duration_ms,
+            "course_id": course_id,
+            "method": "hybrid" if self.hybrid_retriever else "dense"
         }
-    
-    except Exception as e:
-        log.error(f"Retrieval failed: {e}")
-        state.retrieved_chunks = []
-        state.retrieval_confidence = 0.0
-        state.retrieval_strategy = "failed"
-    
-    return {
-        "retrieved_chunks": state.retrieved_chunks,
-        "retrieval_confidence": state.retrieval_confidence,
-        "retrieval_strategy": state.retrieval_strategy,
-        "agent_metadata": state.agent_metadata,
-    }
-
-
-__all__ = [
-    "retriever_agent_node",
-]

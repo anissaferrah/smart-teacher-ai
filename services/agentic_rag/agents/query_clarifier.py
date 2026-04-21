@@ -1,103 +1,110 @@
-"""Query Clarifier Agent - Detects vague/ambiguous questions."""
+"""
+Stage 2: Query Clarifier Agent
+Detects ambiguous questions and requests clarification from students.
+Adapted from Repo 1 (agentic-rag-for-dummies) clarification pattern.
+"""
 
 import logging
-from typing import Dict, Any, Optional
-from infrastructure.logging import get_logger
+import time
+from typing import Tuple, Optional
+from services.agentic_rag.prompts import CLARIFICATION_PROMPT
 
-log = get_logger(__name__)
+log = logging.getLogger("SmartTeacher.QueryClarifier")
 
 
-async def query_clarifier_node(
-    state: "AgenticRAGState",
-    llm,
-) -> Dict[str, Any]:
-    """Detect if question needs clarification.
-    
-    Args:
-        state: Current workflow state
-        llm: Language model instance
-        
-    Returns:
-        Dict with needs_clarification flag and clarification_question
+class QueryClarifier:
     """
-    query = state.rewritten_query or state.query
-    
-    # Check for duplicate of recent questions
-    if state.history and len(state.history) > 0:
-        recent_questions = [
-            turn.get("content", "")
-            for turn in state.history[-5:]
-            if turn.get("role") == "user"
-        ]
-        
-        # Simple similarity check
-        from difflib import SequenceMatcher
-        
-        for recent_q in recent_questions:
-            similarity = SequenceMatcher(None, query.lower(), recent_q.lower()).ratio()
-            if similarity > 0.75:
-                log.info(f"⚠️  Duplicate question detected (similarity: {similarity:.2f})")
-                state.needs_clarification = True
-                state.clarification_question = "You asked something very similar recently. Are you trying to clarify a previous concept?"
-                return {
-                    "needs_clarification": True,
-                    "clarification_question": state.clarification_question,
+    Stage 2 of the agentic RAG pipeline.
+    Detects query ambiguity and asks for clarification when needed.
+
+    Returns:
+        (needs_clarification: bool, clarification_question: str)
+    """
+
+    def __init__(self, llm):
+        """Initialize clarifier with LLM."""
+        self.llm = llm
+        self.system_prompt = CLARIFICATION_PROMPT
+
+    async def check_clarity(
+        self,
+        query: str,
+        course_context: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """
+        Check if query is clear or needs clarification.
+
+        Args:
+            query: Student's query
+            course_context: Optional course context
+
+        Returns:
+            (needs_clarification, clarification_question_or_empty_string)
+        """
+        start_time = time.time()
+
+        try:
+            context = ""
+            if course_context:
+                context = f"\nCourse context: {course_context}"
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": f"Analyze this query for clarity:{context}\n\nQuery: {query}"
                 }
-    
-    # Check for extremely short or vague queries (even after rewrite)
-    if len(query) < 5:
-        log.info(f"⚠️  Query too short: '{query}'")
-        state.needs_clarification = True
-        state.clarification_question = "Could you provide more details about what you'd like to learn?"
+            ]
+
+            response = await self.llm.agenerate(
+                messages,
+                temperature=0.2,
+                max_tokens=200
+            )
+
+            result = response.content.strip()
+
+            # Check if response indicates clarity
+            if "CLEAR_TO_PROCEED" in result.upper():
+                log.info(f"Query is clear: '{query}'")
+                return False, ""
+
+            # Extract clarification question
+            needs_clarif = True
+            log.info(f"Query needs clarification: '{query}'")
+
+            duration_ms = (time.time() - start_time) * 1000
+            log.debug(f"Clarity check completed in {duration_ms:.1f}ms")
+
+            return needs_clarif, result
+
+        except Exception as e:
+            log.error(f"Clarity check failed: {e}")
+            # On error, assume clear to proceed
+            return False, ""
+
+    async def check_clarity_with_trace(
+        self,
+        query: str,
+        course_context: Optional[str] = None
+    ) -> dict:
+        """
+        Check clarity and return detailed trace.
+
+        Returns:
+            Dictionary with clarity assessment
+        """
+        start_time = time.time()
+        needs_clarif, clarif_question = await self.check_clarity(query, course_context)
+        duration_ms = (time.time() - start_time) * 1000
+
         return {
-            "needs_clarification": True,
-            "clarification_question": state.clarification_question,
+            "query": query,
+            "needs_clarification": needs_clarif,
+            "clarification_question": clarif_question if needs_clarif else None,
+            "duration_ms": duration_ms,
+            "course_context": course_context
         }
-    
-    # Use LLM to detect ambiguity
-    try:
-        ambiguity_check_prompt = f"""Is this student question clear and unambiguous? Answer only "yes" or "no".
-
-Question: "{query}"
-
-Answer:"""
-        
-        response = await llm.generate(ambiguity_check_prompt, max_tokens=5, temperature=0.0)
-        response_lower = response.lower().strip()
-        
-        if "no" in response_lower:
-            log.info(f"🤔 Ambiguous question detected: '{query}'")
-            state.needs_clarification = True
-            
-            # Generate clarification question
-            clarify_prompt = f"""The student asked a somewhat ambiguous question. Generate a brief clarification question.
-
-Original question: "{query}"
-
-Clarification question (be brief, max 20 words):"""
-            
-            state.clarification_question = await llm.generate(clarify_prompt, max_tokens=30, temperature=0.6)
-        else:
-            state.needs_clarification = False
-            log.debug(f"✓ Query is clear: '{query}'")
-    
-    except Exception as e:
-        log.error(f"Clarity check failed: {e} - assuming query is clear")
-        state.needs_clarification = False
-    
-    # Record metadata
-    state.agent_metadata["query_clarifier"] = {
-        "needs_clarification": state.needs_clarification,
-        "clarification_question": state.clarification_question,
-    }
-    
-    return {
-        "needs_clarification": state.needs_clarification,
-        "clarification_question": state.clarification_question,
-        "agent_metadata": state.agent_metadata,
-    }
-
-
-__all__ = [
-    "query_clarifier_node",
-]

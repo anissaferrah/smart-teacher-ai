@@ -16,6 +16,14 @@ from typing import Optional
 from dataclasses import dataclass, field
 
 from config import Config
+from services.agentic_rag.agents.query_rewriter import QueryRewriter
+from services.agentic_rag.agents.query_clarifier import QueryClarifier
+from services.agentic_rag.agents.retriever_agent import RetrieverAgent
+from services.agentic_rag.agents.reasoner_agent import ReasonerAgent
+from services.agentic_rag.agents.reflection_agent import ReflectionAgent
+from services.agentic_rag.memory.short_term import ShortTermMemory
+from services.agentic_rag.memory.long_term import LongTermMemory
+from services.agentic_rag.retrieval.hybrid_retriever import HybridRetriever
 
 log = logging.getLogger("SmartTeacher.AgenticRAG")
 
@@ -45,15 +53,19 @@ class AgenticRAGOrchestrator:
         """Initialize orchestrator with services."""
         self.llm = llm
         self.rag = rag
-        self.short_term_memory = short_term_memory
-        self.long_term_memory = long_term_memory
+        self.short_term_memory = short_term_memory or ShortTermMemory()
+        self.long_term_memory = long_term_memory or LongTermMemory()
         self.max_loops = Config.AGENTIC_MAX_LOOPS
 
-        self.query_rewriter = None
-        self.query_clarifier = None
-        self.retriever = None
-        self.reasoner = None
-        self.reflection = None
+        # Initialize hybrid retriever
+        self.hybrid_retriever = HybridRetriever()
+
+        # Initialize agents
+        self.query_rewriter = QueryRewriter(llm)
+        self.query_clarifier = QueryClarifier(llm)
+        self.retriever = RetrieverAgent(rag, self.hybrid_retriever)
+        self.reasoner = ReasonerAgent(llm, self.short_term_memory, self.long_term_memory)
+        self.reflection = ReflectionAgent(llm)
 
         log.info("✅ AgenticRAGOrchestrator initialized (max_loops=%d)" % self.max_loops)
 
@@ -148,31 +160,20 @@ class AgenticRAGOrchestrator:
 
     async def _stage_rewrite(self, query: str) -> str:
         """Stage 1: Query Rewriter"""
-        if self.query_rewriter:
-            return await self.query_rewriter.rewrite(query)
-        return query
+        return await self.query_rewriter.rewrite(query)
 
     async def _stage_clarify(self, query: str) -> tuple:
         """Stage 2: Query Clarifier"""
-        if self.query_clarifier:
-            return await self.query_clarifier.check_clarity(query)
-        return False, ""
+        return await self.query_clarifier.check_clarity(query)
 
     async def _stage_retrieve(self, query: str, course_id: Optional[str]) -> list:
         """Stage 3: Retriever Agent"""
-        if self.retriever:
-            return await self.retriever.retrieve(query, course_id)
-        return self.rag.retrieve_chunks(query, k=5, course_id=course_id)
+        return await self.retriever.retrieve(query, course_id)
 
     async def _stage_reason(self, query: str, chunks: list, history: list, profile: dict) -> str:
         """Stage 4: Reasoner Agent"""
-        if self.reasoner:
-            return await self.reasoner.reason(query, chunks, history, profile)
-        answer, _ = self.rag.generate_final_answer(chunks, question=query, history=history)
-        return answer
+        return await self.reasoner.reason(query, chunks, history, profile)
 
     async def _stage_reflect(self, draft: str, chunks: list, query: str) -> tuple:
         """Stage 5: Reflection Agent"""
-        if self.reflection:
-            return await self.reflection.reflect_and_refine(draft, chunks, query, self.max_loops)
-        return draft, 0.7, 0
+        return await self.reflection.reflect_and_refine(draft, chunks, query, self.max_loops)

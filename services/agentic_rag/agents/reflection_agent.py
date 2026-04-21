@@ -1,122 +1,198 @@
-"""Reflection Agent - Validate answer quality and self-correct."""
+"""
+Stage 5: Reflection Agent
+Self-correction loop with answer quality validation.
+Based on Repo 1 (agentic-rag-for-dummies) reflection pattern.
+"""
 
 import logging
-import asyncio
-from typing import Dict, Any
-from infrastructure.logging import get_logger
+import time
+from typing import Tuple, Optional, List, Dict, Any
+from services.agentic_rag.prompts import REFLECTION_SYSTEM_PROMPT
+from config import Config
 
-log = get_logger(__name__)
+log = logging.getLogger("SmartTeacher.ReflectionAgent")
 
 
-async def reflection_agent_node(
-    state: "AgenticRAGState",
-    llm,
-) -> Dict[str, Any]:
-    """Validate answer quality and determine if refinement needed.
-    
-    Args:
-        state: Current workflow state
-        llm: Language model instance
-        
-    Returns:
-        Dict with is_valid, reflection_score, and needs_refinement
+class ReflectionAgent:
     """
-    if not state.draft_answer:
-        state.is_valid = False
-        state.reflection_score = 0.0
-        state.needs_refinement = False
-        return {
-            "is_valid": False,
-            "reflection_score": 0.0,
-            "needs_refinement": False,
-        }
-    
-    log.info("🔍 Reflecting on answer quality...")
-    
-    try:
-        # Check 1: Groundedness - is answer grounded in retrieved chunks?
-        groundedness_score = 1.0
-        if state.retrieved_chunks:
-            check_prompt = f"""Is this answer grounded in the provided context?
-Context: {state.retrieved_chunks[0].get('content', '')[:500]}
-Answer: {state.draft_answer[:500]}
+    Stage 5 of the agentic RAG pipeline.
+    Validates answer quality and triggers refinement loops if needed.
 
-Rate groundedness 0.0-1.0 (0=not grounded, 1=fully grounded). Answer ONLY with a number."""
-            
-            try:
-                score_str = await llm.generate(check_prompt, max_tokens=5, temperature=0.0)
-                groundedness_score = float(score_str.strip())
-            except:
-                groundedness_score = 0.7  # Default if parsing fails
-        
-        # Check 2: Completeness - does answer adequately address question?
-        completeness_check = f"""Does this answer adequately address the student's question?
-Question: {state.query}
-Answer: {state.draft_answer[:500]}
+    Returns:
+        (final_answer, confidence_score, refinement_count)
+    """
 
-Rate completeness 0.0-1.0 (0=incomplete, 1=complete). Answer ONLY with a number."""
-        
+    def __init__(self, llm):
+        """Initialize reflection agent."""
+        self.llm = llm
+        self.system_prompt = REFLECTION_SYSTEM_PROMPT
+        self.max_loops = Config.AGENTIC_MAX_LOOPS
+
+    async def reflect_and_refine(
+        self,
+        draft_answer: str,
+        chunks: List[Dict[str, Any]],
+        original_query: str,
+        max_refinements: int = 3
+    ) -> Tuple[str, float, int]:
+        """
+        Validate answer quality and refine if needed.
+
+        Args:
+            draft_answer: Initial answer from reasoner
+            chunks: Retrieved source chunks
+            original_query: Original student question
+            max_refinements: Maximum refinement loops
+
+        Returns:
+            (final_answer, confidence_score 0-1, refinement_loops_executed)
+        """
+        start_time = time.time()
+        current_answer = draft_answer
+        refinement_count = 0
+
         try:
-            completeness_str = await llm.generate(completeness_check, max_tokens=5, temperature=0.0)
-            completeness_score = float(completeness_str.strip())
-        except:
-            completeness_score = 0.7
-        
-        # Check 3: Clarity - is answer clear and understandable?
-        clarity_score = 1.0 if len(state.draft_answer) > 20 else 0.5
-        
-        # Combine scores
-        state.reflection_score = (
-            groundedness_score * 0.4 +
-            completeness_score * 0.4 +
-            clarity_score * 0.2
-        )
-        
-        # Determine if valid (>0.6) and if needs refinement
-        state.is_valid = state.reflection_score > 0.6
-        state.needs_refinement = state.reflection_score < 0.8 and state.is_valid
-        
-        log.info(f"✓ Reflection score: {state.reflection_score:.2f} (valid: {state.is_valid}, refine: {state.needs_refinement})")
-        
-        # Generate refinement suggestions if needed
-        if state.needs_refinement:
-            refine_prompt = f"""The student received this answer. What could be improved?
-Question: {state.query}
-Answer: {state.draft_answer}
+            for loop in range(max_refinements):
+                # Validate current answer
+                confidence, feedback, needs_refinement = await self._validate_answer(
+                    current_answer, chunks, original_query
+                )
 
-List 1-2 specific improvements (max 50 words each):"""
-            
-            try:
-                suggestions_text = await llm.generate(refine_prompt, max_tokens=100, temperature=0.7)
-                state.refinement_suggestions = suggestions_text.strip().split("\n")[:2]
-            except:
-                state.refinement_suggestions = []
-        
-        # Record in metadata
-        state.agent_metadata["reflection"] = {
-            "groundedness_score": groundedness_score,
-            "completeness_score": completeness_score,
-            "clarity_score": clarity_score,
-            "final_score": state.reflection_score,
-            "is_valid": state.is_valid,
-            "needs_refinement": state.needs_refinement,
-        }
-    
-    except Exception as e:
-        log.error(f"Reflection failed: {e}")
-        state.reflection_score = 0.6  # Default to passing
-        state.is_valid = True
-        state.needs_refinement = False
-    
-    return {
-        "is_valid": state.is_valid,
-        "reflection_score": state.reflection_score,
-        "needs_refinement": state.needs_refinement,
-        "refinement_suggestions": state.refinement_suggestions,
-        "agent_metadata": state.agent_metadata,
-    }
+                log.info(f"Reflection loop {loop+1}: confidence={confidence:.2f}, needs_refinement={needs_refinement}")
 
+                if not needs_refinement or confidence >= 0.8:
+                    # Answer is good enough
+                    log.info(f"Answer accepted with confidence {confidence:.2f}")
+                    break
 
-__all__ = [
-    "reflection_agent_node",
-]
+                if loop < max_refinements - 1:
+                    # Refine answer
+                    current_answer = await self._refine_answer(
+                        current_answer, feedback, chunks, original_query
+                    )
+                    refinement_count += 1
+                    log.info(f"Answer refined (attempt {refinement_count+1})")
+                else:
+                    # Final iteration
+                    refinement_count = loop + 1
+
+            duration_ms = (time.time() - start_time) * 1000
+            log.debug(f"Reflection completed in {duration_ms:.1f}ms ({refinement_count} refinements)")
+
+            return current_answer, confidence, refinement_count
+
+        except Exception as e:
+            log.error(f"Reflection failed: {e}")
+            return draft_answer, 0.5, 0
+
+    async def _validate_answer(
+        self,
+        answer: str,
+        chunks: List[Dict[str, Any]],
+        query: str
+    ) -> Tuple[float, str, bool]:
+        """
+        Validate answer quality across multiple dimensions.
+
+        Returns:
+            (confidence_score, feedback, needs_refinement)
+        """
+        try:
+            chunk_context = "\n".join([chunk.get("content", "")[:200] for chunk in chunks[:3]])
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": f"""Validate this answer:
+
+Query: {query}
+
+Answer: {answer}
+
+Source Material: {chunk_context}
+
+Score from 0-1 and provide feedback."""
+                }
+            ]
+
+            response = await self.llm.agenerate(messages, temperature=0.2, max_tokens=200)
+            result = response.content.strip()
+
+            # Parse confidence score from response
+            confidence = 0.7  # Default
+            feedback = result
+            needs_refinement = confidence < 0.7
+
+            # Try to extract confidence
+            for line in result.split("\n"):
+                if "confidence" in line.lower() or "score" in line.lower():
+                    try:
+                        parts = line.split(":")
+                        if len(parts) > 1:
+                            score_str = parts[-1].strip().rstrip("%")
+                            confidence = float(score_str) / 100 if "%" in line else float(score_str)
+                            confidence = max(0.0, min(1.0, confidence))
+                    except ValueError:
+                        pass
+
+            return confidence, feedback, needs_refinement
+
+        except Exception as e:
+            log.warning(f"Validation failed: {e}")
+            return 0.6, "", True
+
+    async def _refine_answer(
+        self,
+        current_answer: str,
+        feedback: str,
+        chunks: List[Dict[str, Any]],
+        query: str
+    ) -> str:
+        """
+        Refine answer based on validation feedback.
+
+        Args:
+            current_answer: Current answer
+            feedback: Validation feedback
+            chunks: Source chunks
+            query: Original query
+
+        Returns:
+            Refined answer
+        """
+        try:
+            chunk_context = "\n".join([chunk.get("content", "")[:200] for chunk in chunks[:3]])
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are an answer refinement expert. Improve answers based on feedback while staying grounded in source material."
+                },
+                {
+                    "role": "user",
+                    "content": f"""Improve this answer based on feedback:
+
+Original Query: {query}
+
+Current Answer: {current_answer}
+
+Feedback: {feedback}
+
+Source Material: {chunk_context}
+
+Provide an improved answer that addresses the feedback."""
+                }
+            ]
+
+            response = await self.llm.agenerate(messages, temperature=0.7, max_tokens=300)
+            refined = response.content.strip()
+
+            return refined if refined else current_answer
+
+        except Exception as e:
+            log.error(f"Refinement failed: {e}")
+            return current_answer

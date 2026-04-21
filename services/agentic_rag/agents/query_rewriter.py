@@ -1,108 +1,114 @@
-"""Query Rewriter Agent - Improves vague student questions."""
+"""
+Stage 1: Query Rewriter Agent
+Improves query clarity and specificity for better retrieval and understanding.
+Adapted from Repo 1 (agentic-rag-for-dummies) query rewriting pattern.
+"""
 
 import logging
-from typing import Dict, Any, Optional
-from infrastructure.logging import get_logger
+import time
+from typing import Optional
+from services.agentic_rag.prompts import REWRITE_PROMPT
+from config import Config
 
-log = get_logger(__name__)
+log = logging.getLogger("SmartTeacher.QueryRewriter")
 
 
-async def query_rewriter_node(
-    state: "AgenticRAGState",
-    llm,
-) -> Dict[str, Any]:
-    """Rewrite vague or short queries for better RAG retrieval.
-    
-    Args:
-        state: Current workflow state
-        llm: Language model instance
-        
-    Returns:
-        Dict with updated rewritten_query and query_intent
+class QueryRewriter:
     """
-    query = state.query
-    
-    # Check if query needs rewriting
-    if len(query) < 10 or _is_generic_query(query):
-        log.info(f"🔄 Generic query detected: '{query}' - attempting rewrite")
-        
-        # Build rewrite prompt
-        context = ""
-        if state.history and len(state.history) > 0:
-            context = "\n".join([
-                f"{turn.get('role', 'user')}: {turn.get('content', '')}"
-                for turn in state.history[-3:]
-            ])
-        
-        prompt = f"""You are a teacher assistant improving student questions for clarity.
+    Stage 1 of the agentic RAG pipeline.
+    Transforms vague student queries into clear, specific questions.
 
-Student asked: "{query}"
+    Example:
+        Input: "What is photo?"
+        Output: "Explain the process of photosynthesis in plants and its role in energy conversion"
+    """
 
-{f"Conversation context (last 3 turns):\n{context}" if context else ""}
+    def __init__(self, llm):
+        """
+        Initialize the rewriter with an LLM.
 
-Rewrite the student's question to be more specific and clear for a knowledge base search.
-Keep the original intent, but make it more explicit.
+        Args:
+            llm: Language model instance (e.g., OpenAI GPT-4)
+        """
+        self.llm = llm
+        self.system_prompt = REWRITE_PROMPT
 
-Return ONLY the rewritten question (no preamble)."""
-        
+    async def rewrite(self, query: str, course_context: Optional[str] = None) -> str:
+        """
+        Rewrite a student query for improved clarity.
+
+        Args:
+            query: Original student query
+            course_context: Optional course/topic context
+
+        Returns:
+            Rewritten query or original if no improvement needed
+        """
+        start_time = time.time()
+
         try:
-            rewritten = await llm.generate(prompt, max_tokens=100, temperature=0.3)
-            rewritten = rewritten.strip()
-            state.rewritten_query = rewritten
-            state.query_intent = _extract_intent(rewritten)
-            log.info(f"✅ Rewrote: '{query}' → '{rewritten}'")
+            # Build context for the rewriter
+            context = ""
+            if course_context:
+                context = f"\nCourse context: {course_context}"
+
+            # Create messages for LLM
+            messages = [
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": f"Please rewrite this student query for clarity:\n\nQuery: {query}{context}"
+                }
+            ]
+
+            # Call LLM
+            response = await self.llm.agenerate(
+                messages,
+                temperature=0.3,  # Lower temperature for consistency
+                max_tokens=150
+            )
+
+            rewritten = response.content.strip()
+
+            # Validate: if rewritten query is significantly shorter or empty, use original
+            if len(rewritten) < 10 or not rewritten:
+                rewritten = query
+                log.info(f"Rewrite validation: kept original query (rewrite too short)")
+            else:
+                log.info(f"Query rewritten: '{query}' → '{rewritten}'")
+
+            duration_ms = (time.time() - start_time) * 1000
+            log.debug(f"Query rewrite completed in {duration_ms:.1f}ms")
+
+            return rewritten
+
         except Exception as e:
-            log.error(f"Query rewriting failed: {e} - using original")
-            state.rewritten_query = query
-            state.query_intent = _extract_intent(query)
-    else:
-        # Query is sufficiently specific
-        state.rewritten_query = query
-        state.query_intent = _extract_intent(query)
-        log.debug(f"✓ Query specific enough: '{query}'")
-    
-    # Record in metadata
-    state.agent_metadata["query_rewriter"] = {
-        "original_query": query,
-        "rewritten_query": state.rewritten_query,
-        "intent": state.query_intent,
-    }
-    
-    return {
-        "rewritten_query": state.rewritten_query,
-        "query_intent": state.query_intent,
-        "agent_metadata": state.agent_metadata,
-    }
+            log.error(f"Query rewrite failed: {e}")
+            log.warning(f"Falling back to original query: '{query}'")
+            return query
 
+    async def rewrite_with_trace(self, query: str, course_context: Optional[str] = None) -> dict:
+        """
+        Rewrite query and return detailed trace.
 
-def _is_generic_query(query: str) -> bool:
-    """Check if query is too generic."""
-    generic_patterns = [
-        "explain", "can you", "help me", "tell me",
-        "what is", "how to", "expliquer", "aide",
-        "comprends pas", "c'est quoi", "comment",
-        "peux tu", "pourquoi", "why", "please",
-    ]
-    query_lower = query.lower()
-    return any(pattern in query_lower for pattern in generic_patterns) and len(query) < 20
+        Args:
+            query: Original query
+            course_context: Optional context
 
+        Returns:
+            Dictionary with rewritten query and metadata
+        """
+        start_time = time.time()
+        rewritten = await self.rewrite(query, course_context)
+        duration_ms = (time.time() - start_time) * 1000
 
-def _extract_intent(query: str) -> str:
-    """Extract main intent from query."""
-    query_lower = query.lower()
-    
-    if any(w in query_lower for w in ["explain", "expliquer", "definition", "c'est quoi", "what is"]):
-        return "explanation"
-    elif any(w in query_lower for w in ["how", "comment", "procedure", "steps", "étapes"]):
-        return "procedure"
-    elif any(w in query_lower for w in ["why", "pourquoi", "reason", "raison"]):
-        return "reasoning"
-    elif any(w in query_lower for w in ["example", "exemple", "instance"]):
-        return "example"
-    else:
-        return "general_question"
-
-
-__all__ = [
-    "query_rewriter_node",
-]
+        return {
+            "original_query": query,
+            "rewritten_query": rewritten,
+            "was_modified": query != rewritten,
+            "duration_ms": duration_ms,
+            "course_context": course_context
+        }
