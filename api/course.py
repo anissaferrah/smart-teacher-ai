@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+import tempfile
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+
+from database.core import AsyncSessionLocal
+from domains_config import auto_detect_course
+from modules.pedagogy.course_builder import CourseBuilder
+from services.app_state import ingestion_service, knowledge_retrieval_engine
+
+router = APIRouter(tags=["course"])
+
+
+@router.post("/ingest")
+async def ingest_course_files(files: list[UploadFile] = File(...), incremental: bool = Form(True), course_id: str | None = Form(None)):
+    if not files:
+        raise HTTPException(status_code=400, detail="Aucun fichier fourni")
+
+    upload_dir = Path("courses")
+    upload_dir.mkdir(exist_ok=True)
+    saved_paths: list[str] = []
+
+    for uploaded_file in files:
+        destination = upload_dir / Path(uploaded_file.filename).name
+        destination.write_bytes(await uploaded_file.read())
+        saved_paths.append(str(destination.resolve()))
+
+    __import__("logging").getLogger("SmartTeacher.CourseAPI").info(f"📤 Ingestion lancée ({len(saved_paths)} fichier(s))")
+    if course_id:
+        __import__("logging").getLogger("SmartTeacher.CourseAPI").info(f"   📚 course_id={course_id}")
+
+    __import__("asyncio").create_task(
+        _run_course_ingestion_background(saved_paths, incremental=incremental, domain="general", course="uploaded", course_id=course_id)
+    )
+
+    return {
+        "status": "ingestion_started",
+        "files": [f.filename for f in files],
+        "message": "Ingestion lancée en arrière-plan. Consultez /ingestion/status pour suivre la progression.",
+    }
+
+
+async def _run_course_ingestion_background(file_paths: list[str], incremental: bool = False, domain: str = "general", course: str = "uploaded", course_id: str | None = None) -> None:
+    try:
+        await ingestion_service.start_ingestion(len(file_paths))
+        loop = __import__("asyncio").get_event_loop()
+        ok = await loop.run_in_executor(
+            None,
+            lambda: knowledge_retrieval_engine.run_ingestion_pipeline_for_files(
+                file_paths,
+                domain=domain,
+                course=course,
+                course_id=course_id,
+                incremental=incremental,
+            ),
+        )
+
+        if ok:
+            stats = knowledge_retrieval_engine.get_stats()
+            total_chunks = stats.get("total_docs", 0)
+            await ingestion_service.complete_ingestion(total_chunks)
+        else:
+            await ingestion_service.fail_ingestion("run_ingestion_pipeline_for_files returned False")
+    except Exception as exc:
+        await ingestion_service.fail_ingestion(str(exc))
+
+
+@router.get("/ingestion/status")
+async def get_ingestion_status() -> dict:
+    return await ingestion_service.get_status()
+
+
+@router.get("/course/build")
+async def build_course_from_upload(files: list[UploadFile] = File(...), language: str = Form("fr"), level: str = Form("lycée"), domain: str = Form("general")):
+    builder = CourseBuilder()
+    if not files:
+        raise HTTPException(status_code=400, detail="Aucun fichier fourni")
+
+    results = []
+    files_to_index: list[dict] = []
+
+    for uploaded_file in files:
+        raw_upload_name = (uploaded_file.filename or "upload.pdf").replace("\\", "/")
+        upload_filename = Path(raw_upload_name).name or f"upload_{uuid.uuid4().hex[:8]}.pdf"
+        payload = await uploaded_file.read()
+        temp_path: Path | None = None
+
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(upload_filename).suffix or ".pdf") as tmp:
+                tmp.write(payload)
+                temp_path = Path(tmp.name)
+
+            detected_domain, detected_course = auto_detect_course(str(temp_path))
+            target_domain = detected_domain if detected_domain != "general" else domain
+            fallback_course = detected_course if detected_course != "generic" else None
+            if fallback_course is None and upload_filename:
+                stem_hint = Path(upload_filename).stem
+                if not builder._looks_like_chapter(stem_hint):
+                    fallback_course = stem_hint
+
+            target_domain, target_course, target_chapter = builder.infer_upload_context(
+                raw_upload_name,
+                fallback_domain=target_domain,
+                fallback_course=fallback_course,
+                fallback_chapter="chapter_1",
+            )
+
+            target_dir = Path("courses") / target_domain / target_course / target_chapter
+            target_dir.mkdir(parents=True, exist_ok=True)
+            destination = target_dir / upload_filename
+            temp_path.replace(destination)
+
+            course_data = await builder.build_from_file_direct(
+                str(destination),
+                language=language,
+                level=level,
+                domain=target_domain,
+                subject=target_course,
+                chapter=target_chapter,
+            )
+
+            course_id = None
+            db_error = None
+            try:
+                async with AsyncSessionLocal() as db:
+                    course_id = await builder.save_to_database(course_data, db, domain=target_domain)
+            except Exception as exc:
+                db_error = str(exc)
+
+            files_to_index.append({
+                "course_data": course_data,
+                "course_id": course_id,
+                "domain": target_domain,
+                "course": target_course,
+                "chapter": target_chapter,
+                "storage_path": str(destination.resolve()),
+            })
+
+            chapters = len(course_data.get("chapters", []))
+            sections = sum(len(ch.get("sections", [])) for ch in course_data.get("chapters", []))
+            results.append({
+                "file": upload_filename,
+                "course_id": course_id,
+                "title": course_data.get("title"),
+                "chapters": chapters,
+                "sections": sections,
+                "domain": target_domain,
+                "course": target_course,
+                "chapter": target_chapter,
+                "storage_path": str(destination),
+                "status": "ok" if db_error is None else "partial",
+                "db_error": db_error,
+            })
+        except Exception as exc:
+            results.append({"file": uploaded_file.filename, "status": "error", "error": str(exc)})
+        finally:
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+
+    if files_to_index:
+        for item in files_to_index:
+            course_data = item["course_data"]
+            course_id = item["course_id"]
+            target_domain = item["domain"]
+            target_course = item["course"]
+            knowledge_retrieval_engine.run_ingestion_pipeline_from_course_data(
+                course_data,
+                domain=target_domain,
+                course=target_course,
+                course_id=course_id,
+                incremental=True,
+            )
+
+    return {"results": results, "rag_stats": knowledge_retrieval_engine.get_stats()}
+
+
+@router.get("/course/list")
+async def list_courses() -> dict:
+    try:
+        from database.core import AsyncSessionLocal
+        from database.repositories import get_all_courses
+        async with AsyncSessionLocal() as db:
+            courses = await get_all_courses(db)
+            return {"courses": [{"id": str(course.id), "title": course.title, "subject": course.subject, "language": course.language, "level": course.level} for course in courses]}
+    except Exception as exc:
+        return {"courses": [], "error": str(exc)}
+
+
+@router.get("/course/{course_id}/structure")
+async def get_course_structure(course_id: str) -> dict:
+    try:
+        from database.core import AsyncSessionLocal
+        from database.repositories import get_course_with_structure
+        async with AsyncSessionLocal() as db:
+            course = await get_course_with_structure(db, uuid.UUID(course_id))
+            if not course:
+                raise HTTPException(status_code=404, detail="Cours introuvable")
+
+            slides = []
+            chapters_data = []
+            for chapter in course.chapters:
+                sections_data = []
+                for section in chapter.sections:
+                    slide_path = section.image_url or (section.image_urls[0] if getattr(section, "image_urls", None) else "")
+                    if slide_path:
+                        slides.append(slide_path)
+                    sections_data.append({
+                        "id": str(section.id),
+                        "title": section.title,
+                        "order": section.order,
+                        "content": section.content,
+                        "image_url": slide_path,
+                        "image_urls": section.image_urls or ([] if not slide_path else [slide_path]),
+                        "duration_s": section.duration_s,
+                        "concepts": [
+                            {
+                                "id": str(concept.id),
+                                "term": concept.term,
+                                "definition": concept.definition,
+                                "example": concept.example,
+                                "type": concept.concept_type,
+                            }
+                            for concept in section.concepts
+                        ],
+                    })
+                chapters_data.append({
+                    "id": str(chapter.id),
+                    "title": chapter.title,
+                    "order": chapter.order,
+                    "summary": chapter.summary,
+                    "sections": sections_data,
+                })
+
+            return {
+                "course": {
+                    "id": str(course.id),
+                    "title": course.title,
+                    "subject": course.subject,
+                    "domain": course.domain,
+                    "language": course.language,
+                    "level": course.level,
+                    "description": course.description,
+                },
+                "chapters": chapters_data,
+                "slides": slides,
+            }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

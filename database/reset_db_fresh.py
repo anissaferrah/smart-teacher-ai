@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from config import Config
-from database.init_db import engine
+from database.core import database_engine as engine
 from database.models import Base
 
 
