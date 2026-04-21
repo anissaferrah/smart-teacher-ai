@@ -147,7 +147,10 @@ class VoiceEngine:
         self,
         text: str,
         language_code: Optional[str] = None,
-        rate: str = "+0%"
+        rate: str = "+0%",
+        *,
+        language: Optional[str] = None,
+        rate_override: Optional[str] = None,
     ) -> Tuple[Optional[bytes], float, str, str, Optional[str]]:
         """
         Generate speech audio asynchronously.
@@ -165,6 +168,10 @@ class VoiceEngine:
         rate : str, optional
             Speech rate in Edge-TTS format (e.g., "-20%", "+15%").
             Default: "+0%" (normal speed)
+        language : str, optional
+            Backward-compatible alias for language_code.
+        rate_override : str, optional
+            Backward-compatible alias for rate.
         
         Returns
         -------
@@ -187,7 +194,11 @@ class VoiceEngine:
         if not text or len(text.strip()) < 2:
             return None, 0.0, "none", "none", None
         
-        safe_rate = self._sanitize_rate(rate)
+        if language_code is None and language is not None:
+            language_code = language
+
+        effective_rate = rate_override if rate_override is not None else rate
+        safe_rate = self._sanitize_rate(effective_rate)
         
         # Try configured provider first
         if self.provider == "elevenlabs" and self._el_client:

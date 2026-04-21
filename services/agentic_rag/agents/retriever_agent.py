@@ -7,7 +7,6 @@ Based on Repo 1 (agentic-rag-for-dummies) hybrid retrieval pattern.
 import logging
 import time
 from typing import List, Optional, Dict, Any
-from collections import defaultdict
 
 log = logging.getLogger("SmartTeacher.RetrieverAgent")
 
@@ -58,6 +57,9 @@ class RetrieverAgent:
                     course_id=course_id,
                     k=k
                 )
+                if not results:
+                    log.warning("Hybrid retriever returned no chunks; falling back to dense retrieval")
+                    results = await self._dense_retrieval_only(query, course_id, k)
                 log.info(f"Hybrid retrieval found {len(results)} chunks for '{query}'")
             else:
                 # Fallback to dense retrieval only
@@ -99,11 +101,40 @@ class RetrieverAgent:
 
             results = []
             for chunk in chunks:
+                if isinstance(chunk, tuple) and len(chunk) >= 3:
+                    document, score, source_info = chunk[:3]
+                    content = getattr(document, "page_content", str(document))
+                    metadata = dict(getattr(document, "metadata", {}) or {})
+                    source = source_info or metadata.get("source", "unknown")
+                    results.append({
+                        "content": content,
+                        "source": source,
+                        "score": float(score),
+                        "confidence": float(score),
+                        "method": "dense",
+                        "metadata": metadata,
+                    })
+                    continue
+
+                if isinstance(chunk, dict):
+                    metadata = dict(chunk.get("metadata", {})) if isinstance(chunk.get("metadata", {}), dict) else {}
+                    results.append({
+                        "content": chunk.get("content") or chunk.get("page_content") or chunk.get("text") or str(chunk),
+                        "source": chunk.get("source") or metadata.get("source", "unknown"),
+                        "score": float(chunk.get("score", 0.8) or 0.8),
+                        "confidence": float(chunk.get("confidence", chunk.get("score", 0.8)) or 0.8),
+                        "method": "dense",
+                        "metadata": metadata,
+                    })
+                    continue
+
                 results.append({
                     "content": chunk.page_content if hasattr(chunk, 'page_content') else str(chunk),
                     "source": getattr(chunk, 'metadata', {}).get('source', 'unknown'),
-                    "score": 0.8,  # Default score for fallback
-                    "method": "dense"
+                    "score": 0.8,
+                    "confidence": 0.8,
+                    "method": "dense",
+                    "metadata": getattr(chunk, 'metadata', {}) or {},
                 })
 
             return results

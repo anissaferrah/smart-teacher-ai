@@ -140,15 +140,15 @@ if Path("static").exists():
 
 # Register routers
 app.include_router(ws_router, prefix="", tags=["websocket"])
-app.include_router(dashboard_router, prefix="/dashboard", tags=["monitoring"])
+app.include_router(dashboard_router, tags=["monitoring"])
 app.include_router(health_api.router, prefix="/health", tags=["health"])
 app.include_router(sessions_api.router, prefix="/sessions", tags=["sessions"])
 app.include_router(search_api.router, prefix="/search", tags=["search"])
 app.include_router(analytics_api.router, prefix="/analytics", tags=["analytics"])
 app.include_router(cache_api.router, prefix="/cache", tags=["cache"])
-app.include_router(media_api.router, prefix="/media", tags=["media"])
+app.include_router(media_api.router, tags=["media"])
 app.include_router(profile_api.router, prefix="/profile", tags=["profile"])
-app.include_router(course_api.router, prefix="/course", tags=["course"])
+app.include_router(course_api.router, prefix="", tags=["course"])
 
 
 @app.get("/")

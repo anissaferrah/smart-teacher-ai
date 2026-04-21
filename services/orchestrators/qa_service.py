@@ -11,6 +11,7 @@ Responsibilities:
 
 import asyncio
 import logging
+import time
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 
@@ -65,19 +66,49 @@ class QAService:
             'rag_time_ms': 0.0,
             'rag_chunks': 0,
             'rag_score': 0.0,
+            'prompt_time_ms': 0.0,
+            'confusion_time_ms': 0.0,
             'confusion_detected': False,
             'confusion_reason': '',
             'llm_time_ms': 0.0,
             'tts_time_ms': 0.0,
+            'log_time_ms': 0.0,
         }
+        reasoning_trace: List[Dict[str, Any]] = []
+
+        def add_trace_step(
+            step: int,
+            key: str,
+            title: str,
+            state: str,
+            status: str,
+            summary: str,
+            duration_ms: float,
+            confidence: Optional[float] = None,
+            details: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            payload = {
+                'step': step,
+                'key': key,
+                'title': title,
+                'state': state,
+                'status': status,
+                'summary': summary,
+                'duration_ms': round(duration_ms, 1),
+            }
+            if confidence is not None:
+                payload['confidence'] = round(float(confidence), 3)
+            if details:
+                payload['details'] = details
+            reasoning_trace.append(payload)
         
         try:
             # Step 1: RAG retrieval
-            import time
             rag_start = time.time()
             
             rag_results = []
-            if settings.rag.enabled and self.rag:
+            rag_enabled = bool(settings.rag.enabled and self.rag)
+            if rag_enabled:
                 rag_results = await self.rag.retrieve(
                     question_text,
                     course_id=ctx.slide.course_id if ctx.slide else None,
@@ -88,13 +119,52 @@ class QAService:
             metrics['rag_chunks'] = len(rag_results)
             if rag_results:
                 metrics['rag_score'] = sum(r.get('score', 0) for r in rag_results) / len(rag_results)
+            add_trace_step(
+                step=1,
+                key='retrieval',
+                title='Recherche documentaire',
+                state=DialogState.PROCESSING.value,
+                status='done' if rag_enabled else 'skipped',
+                summary=(
+                    f"{len(rag_results)} passages récupérés"
+                    if rag_enabled
+                    else 'Recherche RAG désactivée'
+                ),
+                duration_ms=metrics['rag_time_ms'],
+                confidence=metrics['rag_score'] if rag_results else 0.0,
+                details={
+                    'chunks': len(rag_results),
+                    'rag_enabled': rag_enabled,
+                    'top_score': round(metrics['rag_score'], 3) if rag_results else 0.0,
+                },
+            )
             
             # Step 2: Detect confusion
+            confusion_start = time.time()
             confusion_result = await self._detect_confusion(question_text, language)
+            metrics['confusion_time_ms'] = (time.time() - confusion_start) * 1000
             metrics['confusion_detected'] = confusion_result['detected']
             metrics['confusion_reason'] = confusion_result['reason']
+            add_trace_step(
+                step=2,
+                key='confusion_detection',
+                title='Détection de confusion',
+                state=DialogState.PROCESSING.value,
+                status='done' if settings.confusion.enabled else 'skipped',
+                summary=(
+                    'Confusion détectée' if confusion_result['detected'] else 'Aucune confusion détectée'
+                ) if settings.confusion.enabled else 'Détection de confusion désactivée',
+                duration_ms=metrics['confusion_time_ms'],
+                confidence=0.85 if confusion_result['detected'] else 1.0,
+                details={
+                    'detected': confusion_result['detected'],
+                    'reason': confusion_result['reason'],
+                    'language': language,
+                },
+            )
             
             # Step 3: Build LLM prompt
+            prompt_start = time.time()
             prompt = self._build_qa_prompt(
                 question_text,
                 rag_results,
@@ -103,26 +173,93 @@ class QAService:
                 subject,
                 ctx,
             )
+            metrics['prompt_time_ms'] = (time.time() - prompt_start) * 1000
+            add_trace_step(
+                step=3,
+                key='prompt_build',
+                title='Construction du prompt',
+                state=DialogState.PROCESSING.value,
+                status='done',
+                summary='Prompt pédagogique construit',
+                duration_ms=metrics['prompt_time_ms'],
+                details={
+                    'subject': subject,
+                    'language': language,
+                    'context_length': len(prompt),
+                },
+            )
             
             # Step 4: Generate answer
             llm_start = time.time()
             answer_text = await self.llm.generate(prompt, temperature=0.7, max_tokens=400)
             metrics['llm_time_ms'] = (time.time() - llm_start) * 1000
+            add_trace_step(
+                step=4,
+                key='answer_generation',
+                title='Génération de la réponse',
+                state=DialogState.RESPONDING.value,
+                status='done',
+                summary=f'Réponse générée ({len(answer_text)} caractères)',
+                duration_ms=metrics['llm_time_ms'],
+                confidence=0.8,
+                details={
+                    'answer_preview': answer_text[:140],
+                    'answer_length': len(answer_text),
+                },
+            )
             
             # Step 5: Convert to speech
             tts_start = time.time()
             audio_bytes = await self.voice.generate_audio_async(answer_text, language=language)
             metrics['tts_time_ms'] = (time.time() - tts_start) * 1000
+            add_trace_step(
+                step=5,
+                key='tts_synthesis',
+                title='Synthèse vocale',
+                state=DialogState.RESPONDING.value,
+                status='done',
+                summary=(
+                    f'Audio synthétisé ({len(audio_bytes)} octets)'
+                    if audio_bytes
+                    else 'Synthèse vocale terminée'
+                ),
+                duration_ms=metrics['tts_time_ms'],
+                details={
+                    'audio_bytes': len(audio_bytes) if audio_bytes else 0,
+                },
+            )
             
             # Step 6: Log to analytics
+            log_start = time.time()
             await self._log_learning_turn(
                 session_id, question_text, answer_text, ctx, language, subject, metrics
             )
+            metrics['log_time_ms'] = (time.time() - log_start) * 1000
+            add_trace_step(
+                step=6,
+                key='analytics_logging',
+                title='Journalisation',
+                state=DialogState.IDLE.value,
+                status='done',
+                summary='Interaction enregistrée',
+                duration_ms=metrics['log_time_ms'],
+                details={
+                    'session_id': session_id,
+                    'question_length': len(question_text),
+                },
+            )
+
+            metrics['reasoning_trace'] = reasoning_trace
+            metrics['system_state'] = DialogState.IDLE.value
+            metrics['current_stage'] = 'completed'
             
             return answer_text, audio_bytes, metrics
         
         except Exception as e:
             log.error(f"QA processing failed: {e}")
+            metrics['reasoning_trace'] = reasoning_trace
+            metrics['system_state'] = DialogState.PROCESSING.value if reasoning_trace else DialogState.IDLE.value
+            metrics['current_stage'] = 'error'
             self.analytics.record_error(
                 session_id,
                 'qa_service',

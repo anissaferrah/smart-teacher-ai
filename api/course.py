@@ -9,9 +9,14 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from database.core import AsyncSessionLocal
 from domains_config import auto_detect_course
 from modules.pedagogy.course_builder import CourseBuilder
-from services.app_state import ingestion_service, knowledge_retrieval_engine
+from services.app_state import agentic_document_manager, ingestion_service, knowledge_retrieval_engine, media_service
 
 router = APIRouter(tags=["course"])
+
+
+def _media_upload_object_name(domain: str, course: str, chapter: str, filename: str) -> str:
+    safe_filename = Path(filename).name
+    return f"uploads/{domain}/{course}/{chapter}/{safe_filename}"
 
 
 @router.post("/ingest")
@@ -49,7 +54,7 @@ async def _run_course_ingestion_background(file_paths: list[str], incremental: b
         loop = __import__("asyncio").get_event_loop()
         ok = await loop.run_in_executor(
             None,
-            lambda: knowledge_retrieval_engine.run_ingestion_pipeline_for_files(
+            lambda: agentic_document_manager.index_course_files(
                 file_paths,
                 domain=domain,
                 course=course,
@@ -73,13 +78,14 @@ async def get_ingestion_status() -> dict:
     return await ingestion_service.get_status()
 
 
-@router.get("/course/build")
+@router.post("/course/build")
 async def build_course_from_upload(files: list[UploadFile] = File(...), language: str = Form("fr"), level: str = Form("lycée"), domain: str = Form("general")):
     builder = CourseBuilder()
     if not files:
         raise HTTPException(status_code=400, detail="Aucun fichier fourni")
 
     results = []
+
     files_to_index: list[dict] = []
 
     for uploaded_file in files:
@@ -96,6 +102,31 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
             detected_domain, detected_course = auto_detect_course(str(temp_path))
             target_domain = detected_domain if detected_domain != "general" else domain
             fallback_course = detected_course if detected_course != "generic" else None
+            chapter_hint = None
+
+            extracted_title = ""
+            extracted_text = ""
+            try:
+                extracted_text = builder.extractor.extract(str(temp_path))
+                extracted_title = builder._infer_course_title(extracted_text, detected_course, Path(upload_filename).stem)
+            except Exception:
+                extracted_title = Path(upload_filename).stem
+
+            for candidate in (upload_filename, extracted_title, extracted_text):
+                if not candidate:
+                    continue
+                lines = [candidate] if "\n" not in candidate else candidate.splitlines()[:5]
+                for line in lines:
+                    number = builder._chapter_number_from_value(line)
+                    if number:
+                        chapter_hint = f"chapter_{number}"
+                        break
+                if chapter_hint:
+                    break
+
+            if not fallback_course or fallback_course in {"generic", "general"}:
+                fallback_course = builder._course_slug(extracted_title, fallback=detected_course or upload_filename, domain=target_domain)
+
             if fallback_course is None and upload_filename:
                 stem_hint = Path(upload_filename).stem
                 if not builder._looks_like_chapter(stem_hint):
@@ -105,13 +136,27 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 raw_upload_name,
                 fallback_domain=target_domain,
                 fallback_course=fallback_course,
-                fallback_chapter="chapter_1",
+                fallback_chapter=chapter_hint or "chapter_1",
             )
 
             target_dir = Path("courses") / target_domain / target_course / target_chapter
             target_dir.mkdir(parents=True, exist_ok=True)
             destination = target_dir / upload_filename
-            temp_path.replace(destination)
+            destination.write_bytes(payload)
+
+            media_upload_path = ""
+            try:
+                media_upload_path = media_service.upload_bytes(
+                    payload,
+                    _media_upload_object_name(target_domain, target_course, target_chapter, upload_filename),
+                    uploaded_file.content_type or "application/octet-stream",
+                )
+            except Exception as exc:
+                __import__("logging").getLogger("SmartTeacher.CourseAPI").warning(
+                    "media/uploads mirror failed for %s: %s",
+                    destination,
+                    exc,
+                )
 
             course_data = await builder.build_from_file_direct(
                 str(destination),
@@ -120,6 +165,7 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 domain=target_domain,
                 subject=target_course,
                 chapter=target_chapter,
+                course_title_hint=extracted_title,
             )
 
             course_id = None
@@ -137,6 +183,7 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 "course": target_course,
                 "chapter": target_chapter,
                 "storage_path": str(destination.resolve()),
+                "media_upload_path": media_upload_path,
             })
 
             chapters = len(course_data.get("chapters", []))
@@ -151,6 +198,7 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 "course": target_course,
                 "chapter": target_chapter,
                 "storage_path": str(destination),
+                "media_upload_path": media_upload_path,
                 "status": "ok" if db_error is None else "partial",
                 "db_error": db_error,
             })
@@ -169,7 +217,7 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
             course_id = item["course_id"]
             target_domain = item["domain"]
             target_course = item["course"]
-            knowledge_retrieval_engine.run_ingestion_pipeline_from_course_data(
+            agentic_document_manager.index_course_data(
                 course_data,
                 domain=target_domain,
                 course=target_course,
@@ -184,10 +232,36 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
 async def list_courses() -> dict:
     try:
         from database.core import AsyncSessionLocal
-        from database.repositories import get_all_courses
+        from database.repositories.crud import get_all_courses
         async with AsyncSessionLocal() as db:
             courses = await get_all_courses(db)
-            return {"courses": [{"id": str(course.id), "title": course.title, "subject": course.subject, "language": course.language, "level": course.level} for course in courses]}
+            seen_keys: set[str] = set()
+            payload_courses = []
+
+            for course in courses:
+                dedupe_key = (course.file_path or str(course.id)).strip()
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+
+                chapters = list(course.chapters or [])
+                chapter_count = len(chapters)
+                section_count = sum(len(chapter.sections or []) for chapter in chapters)
+
+                payload_courses.append({
+                    "id": str(course.id),
+                    "title": course.title,
+                    "display_title": course.title or course.subject or "Cours importé",
+                    "subject": course.subject,
+                    "domain": course.domain,
+                    "language": course.language,
+                    "level": course.level,
+                    "chapter_count": chapter_count,
+                    "section_count": section_count,
+                    "file_path": course.file_path,
+                })
+
+            return {"courses": payload_courses}
     except Exception as exc:
         return {"courses": [], "error": str(exc)}
 
@@ -196,7 +270,7 @@ async def list_courses() -> dict:
 async def get_course_structure(course_id: str) -> dict:
     try:
         from database.core import AsyncSessionLocal
-        from database.repositories import get_course_with_structure
+        from database.repositories.crud import get_course_with_structure
         async with AsyncSessionLocal() as db:
             course = await get_course_with_structure(db, uuid.UUID(course_id))
             if not course:

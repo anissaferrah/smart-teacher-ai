@@ -10,10 +10,38 @@ class WSClient {
     this.ws = null;
     this.connected = false;
     this.sessionStarted = false;
+    this.sessionToken = '';
+    this.sessionLanguage = 'fr';
+    this.sessionLevel = 'lycée';
     this._listeners = new Map();
     this._reconnectAttempts = 0;
     this._maxReconnectAttempts = 10;
     this._reconnectDelay = 3000;
+    this._manualDisconnect = false;
+    this._reconnectTimer = null;
+    this._heartbeatTimer = null;
+    this._heartbeatInterval = 60000;
+  }
+
+  async prepareSession(language = 'fr', level = 'lycée') {
+    this.sessionLanguage = language;
+    this.sessionLevel = level;
+
+    const response = await fetch('/session', { method: 'POST' });
+    if (!response.ok) {
+      throw new Error(`Session negotiation failed (${response.status})`);
+    }
+
+    const payload = await response.json();
+    if (!payload.session_id || !payload.token) {
+      throw new Error('Session negotiation returned an invalid payload');
+    }
+
+    stateManager.sessionId = payload.session_id;
+    this.sessionToken = payload.token;
+    localStorage.setItem('session_id', payload.session_id);
+    localStorage.setItem('token', payload.token);
+    return payload;
   }
 
   // Subscribe to WebSocket events
@@ -42,6 +70,7 @@ class WSClient {
     const url = `${protocol}://${location.host}/ws/${stateManager.sessionId}`;
 
     try {
+      this._manualDisconnect = false;
       this.ws = new WebSocket(url);
 
       this.ws.onopen = () => {
@@ -49,6 +78,8 @@ class WSClient {
         this._reconnectAttempts = 0;
         this._emit('connected', { timestamp: Date.now() });
         console.log('✅ WebSocket connected');
+        this._startHeartbeat();
+        this._maybeStartSession();
       };
 
       this.ws.onmessage = (event) => {
@@ -67,12 +98,22 @@ class WSClient {
         console.error('❌ WebSocket error:', error);
       };
 
-      this.ws.onclose = () => {
+      this.ws.onclose = (event) => {
         this.connected = false;
         this.sessionStarted = false;
-        this._emit('disconnected', { timestamp: Date.now() });
-        console.log('⚠️ WebSocket disconnected, attempting reconnect...');
-        this._reconnect();
+        this._stopHeartbeat();
+        this._emit('disconnected', {
+          timestamp: Date.now(),
+          code: event.code,
+          reason: event.reason,
+          wasClean: event.wasClean,
+        });
+        console.log(`⚠️ WebSocket disconnected (code ${event.code}${event.reason ? `, reason: ${event.reason}` : ''})`);
+
+        if (!this._manualDisconnect) {
+          console.log('↻ Attempting reconnect...');
+          this._reconnect(event.code === 1008 || /Invalid token/i.test(event.reason || ''));
+        }
       };
     } catch (error) {
       console.error('❌ Failed to create WebSocket:', error);
@@ -81,7 +122,7 @@ class WSClient {
   }
 
   // Attempt to reconnect
-  _reconnect() {
+  _reconnect(forceNewSession = false) {
     if (this._reconnectAttempts >= this._maxReconnectAttempts) {
       console.error('❌ Max reconnection attempts reached');
       this._emit('reconnect-failed', {});
@@ -89,8 +130,25 @@ class WSClient {
     }
 
     this._reconnectAttempts++;
-    setTimeout(() => {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+    }
+
+    this._reconnectTimer = setTimeout(async () => {
       console.log(`🔄 Reconnection attempt ${this._reconnectAttempts}/${this._maxReconnectAttempts}`);
+
+      if (forceNewSession) {
+        try {
+          this.sessionStarted = false;
+          this.sessionToken = '';
+          await this.prepareSession(this.sessionLanguage, this.sessionLevel);
+        } catch (error) {
+          console.error('❌ Failed to refresh session before reconnect:', error);
+          this._reconnect(false);
+          return;
+        }
+      }
+
       this.connect();
     }, this._reconnectDelay);
   }
@@ -108,11 +166,40 @@ class WSClient {
     }
   }
 
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    this._heartbeatTimer = setInterval(() => {
+      if (this.isConnected()) {
+        this.send({ type: 'ping' });
+      }
+    }, this._heartbeatInterval);
+  }
+
+  _stopHeartbeat() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+  }
+
   // Start session on server
   startSession(language = 'fr', level = 'lycée') {
-    if (this.sessionStarted) return;
+    this.sessionLanguage = language;
+    this.sessionLevel = level;
 
-    const token = localStorage.getItem('token') || '';
+    if (this.sessionStarted) return true;
+
+    if (!this.isConnected()) {
+      console.warn('⚠️ WebSocket not ready for session start');
+      return false;
+    }
+
+    const token = this.sessionToken || localStorage.getItem('token') || '';
+    if (!token) {
+      console.warn('⚠️ Missing session token, cannot authenticate websocket session');
+      return false;
+    }
+
     this.send({
       type: 'start_session',
       language,
@@ -122,10 +209,32 @@ class WSClient {
     });
 
     this.sessionStarted = true;
+    this.sessionToken = token;
+    localStorage.setItem('token', token);
+    return true;
+  }
+
+  _maybeStartSession() {
+    if (this.sessionStarted) return;
+    if (!this.sessionToken) {
+      this.sessionToken = localStorage.getItem('token') || '';
+    }
+    if (!stateManager.sessionId) {
+      stateManager.sessionId = localStorage.getItem('session_id') || stateManager.sessionId;
+    }
+    if (this.sessionToken) {
+      this.startSession(this.sessionLanguage, this.sessionLevel);
+    }
   }
 
   // Disconnect WebSocket
   disconnect() {
+    this._manualDisconnect = true;
+    this._stopHeartbeat();
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;

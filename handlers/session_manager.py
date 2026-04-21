@@ -6,14 +6,19 @@ import tempfile
 import os
 from pathlib import Path
 from collections import deque
+from typing import Optional
 
 import numpy as np
 import soundfile as sf
 from langdetect import detect
+import redis.asyncio as aioredis
 
 from config import Config
 
 log = logging.getLogger("SmartTeacher.SessionManager")
+
+
+_redis_client: Optional[aioredis.Redis] = None
 
 
 def detect_lang_text(text: str) -> str:
@@ -167,6 +172,19 @@ def get_http_session(request) -> tuple[str, list]:
     if sid not in HTTP_SESSIONS:
         HTTP_SESSIONS[sid] = deque(maxlen=Config.MAX_HISTORY_TURNS * 2)
     return sid, list(HTTP_SESSIONS[sid])
+
+
+async def get_redis() -> aioredis.Redis:
+    """Get or create the shared Redis client used by diagnostics and state helpers."""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = aioredis.Redis(
+            host=Config.REDIS_HOST,
+            port=Config.REDIS_PORT,
+            db=Config.REDIS_DB,
+            decode_responses=True,
+        )
+    return _redis_client
 
 
 # Global session storage

@@ -7,8 +7,28 @@ from services.agentic_rag.orchestrator import AgenticRAGOrchestrator, AgenticRAG
 class MockLLM:
     """Mock LLM for testing"""
     async def agenerate(self, messages, temperature=0.7, max_tokens=100):
+        system_prompt = ""
+        user_prompt = ""
+        if messages:
+            system_prompt = str(messages[0].get("content", "")).lower()
+            if len(messages) > 1:
+                user_prompt = str(messages[1].get("content", "")).lower()
+
         class Response:
             content = "This is a test response about the query."
+
+        if "clarification assistant" in system_prompt or "clear_to_proceed" in system_prompt:
+            Response.content = "CLEAR_TO_PROCEED"
+        elif "clarify" in user_prompt and "question" in user_prompt:
+            Response.content = "CLEAR_TO_PROCEED"
+        elif "query rewriter" in system_prompt or "rewrite" in system_prompt:
+            Response.content = "Explain photosynthesis in plants and its role in energy conversion."
+        elif "answer quality validator" in system_prompt or "validate" in user_prompt:
+            Response.content = "CONFIDENCE: 0.85\nFEEDBACK: good\nREADY: YES"
+        elif "expert tutor" in system_prompt or "provide a clear answer" in user_prompt:
+            Response.content = "Photosynthesis converts light energy into chemical energy using light reactions and the Calvin cycle."
+        elif "answer aggregator" in system_prompt or "merge the sub-answers" in user_prompt:
+            Response.content = "Photosynthesis converts light energy into chemical energy using light reactions and the Calvin cycle."
         return Response()
 
 
@@ -51,6 +71,7 @@ async def test_pipeline_execution():
     assert "answer" in result
     assert "confidence" in result
     assert result["mode"] == "agentic"
+    assert result["sources"]
 
 
 if __name__ == "__main__":

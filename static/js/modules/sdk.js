@@ -37,6 +37,8 @@ class SmartTeacher {
     this._currentAudio = null;
     this._recording    = false;
     this._sessionStarted = false;
+    this._heartbeatTimer = null;
+    this._heartbeatInterval = 60000;
   }
 
   // ── Connexion WebSocket ─────────────────────────────────────────────
@@ -47,11 +49,13 @@ class SmartTeacher {
 
       this._ws.onopen = () => {
         this._startSession();
+        this._startHeartbeat();
         this.onConnected(this.sessionId);
         resolve(this);
       };
 
       this._ws.onclose = () => {
+        this._stopHeartbeat();
         this.onDisconnected();
         setTimeout(() => this.connect(), 3000);
       };
@@ -69,6 +73,7 @@ class SmartTeacher {
   }
 
   disconnect() {
+    this._stopHeartbeat();
     if (this._ws) { this._ws.close(); this._ws = null; }
   }
 
@@ -76,6 +81,22 @@ class SmartTeacher {
   _send(obj) {
     if (this._ws && this._ws.readyState === WebSocket.OPEN)
       this._ws.send(JSON.stringify(obj));
+  }
+
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    this._heartbeatTimer = setInterval(() => {
+      if (this._ws && this._ws.readyState === WebSocket.OPEN) {
+        this._send({ type: 'ping' });
+      }
+    }, this._heartbeatInterval);
+  }
+
+  _stopHeartbeat() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
   }
 
   _startSession() {

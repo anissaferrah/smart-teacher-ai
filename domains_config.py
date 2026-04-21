@@ -282,30 +282,105 @@ def auto_detect_course(file_path: str) -> tuple[str, str]:
         tuple[str, str] : (domain, course) - découvert AUTOMATIQUEMENT
     """
     from pathlib import Path
+    import unicodedata
     
     file_path_obj = Path(file_path)
-    filename_lower = file_path_obj.stem.lower()
+    
+    def normalize_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+        normalized = normalized.lower().replace("_", " ").replace("-", " ")
+        normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+        return " ".join(normalized.split())
+
+    filename_key = normalize_text(file_path_obj.stem)
+    parts = [part for part in file_path_obj.parts if part not in ("", ".", "..")]
+    normalized_parts = [normalize_text(part) for part in parts]
+    text_key = ""
+
+    try:
+        from unstructured.partition.auto import partition
+        elements = partition(file_path)
+        text = " ".join((getattr(el, "text", None) or str(el) or "") for el in elements)
+        text_key = normalize_text(text)
+    except Exception:
+        text_key = ""
+
+    # STRATÉGIE 0: si le chemin contient déjà courses/{domain}/{course}/, on le réutilise
+    if "courses" in normalized_parts:
+        courses_index = normalized_parts.index("courses")
+        if courses_index + 2 < len(parts):
+            hinted_domain = parts[courses_index + 1]
+            hinted_course = parts[courses_index + 2]
+            hinted_domain_key = normalize_text(hinted_domain)
+            hinted_course_key = normalize_text(hinted_course)
+            if hinted_domain_key not in {"", "general"} and hinted_course_key not in {"", "generic"}:
+                return (hinted_domain, hinted_course)
     
     # STRATÉGIE 1: Vérifier si le fichier est déjà dans courses/
     courses_dir = Path("courses")
     if courses_dir.exists():
+        best_match: tuple[str, str] | None = None
+        best_match_score = -1
+
         # Chercher dans tous les domaines/cours
         for domain_folder in courses_dir.iterdir():
             if not domain_folder.is_dir():
                 continue
             
             domain_name = domain_folder.name
+            domain_key = normalize_text(domain_name)
             
             for course_folder in domain_folder.iterdir():
                 if not course_folder.is_dir():
                     continue
                 
                 course_name = course_folder.name
-                
-                # Vérifier si le fichier existe déjà dans ce dossier
+                course_key = normalize_text(course_name)
+
+                if not course_key or course_key in {"general", "generic"}:
+                    continue
+
+                score = 0
+                if course_key == filename_key:
+                    score += 10
+                if course_key in filename_key:
+                    score += 5
+                if filename_key in course_key:
+                    score += 3
+
+                if course_key in text_key:
+                    score += 8
+
+                course_tokens = [token for token in course_key.split() if token]
+                if course_tokens:
+                    overlap = sum(1 for token in course_tokens if token in text_key or token in filename_key)
+                    score += overlap * 2
+
+                if domain_key and domain_key in text_key:
+                    score += 1
+
+                if score > best_match_score:
+                    best_match = (domain_name, course_name)
+                    best_match_score = score
+
+                # Vérifier si le fichier est déjà dans ce dossier
                 for existing_file in course_folder.glob(f"*{file_path_obj.suffix}"):
                     if existing_file.name.lower() == file_path_obj.name.lower():
                         return (domain_name, course_name)
+
+        if best_match and best_match_score > 0:
+            return best_match
+
+        # Dernier recours: renvoyer un cours non générique si la structure existe déjà.
+        for domain_folder in courses_dir.iterdir():
+            if not domain_folder.is_dir():
+                continue
+            for course_folder in domain_folder.iterdir():
+                if course_folder.is_dir():
+                    course_name_key = normalize_text(course_folder.name)
+                    if course_name_key not in {"general", "generic"}:
+                        return (domain_folder.name, course_folder.name)
     
     # STRATÉGIE 2: Comparer avec les noms des cours existants
     if courses_dir.exists():
@@ -320,10 +395,10 @@ def auto_detect_course(file_path: str) -> tuple[str, str]:
                     continue
                 
                 course_name = course_folder.name
-                course_name_lower = course_name.lower()
+                course_name_key = normalize_text(course_name)
                 
                 # Comparer avec le NOM DU FICHIER
-                if course_name_lower in filename_lower or filename_lower in course_name_lower:
+                if course_name_key and (course_name_key in filename_key or filename_key in course_name_key):
                     return (domain_name, course_name)
     
     # STRATÉGIE 3: Comparer avec le CONTENU DU PDF
@@ -331,7 +406,7 @@ def auto_detect_course(file_path: str) -> tuple[str, str]:
         try:
             from unstructured.partition.auto import partition
             elements = partition(file_path)
-            text = "\n".join([el.text for el in elements]).lower()
+            text = normalize_text(" ".join([(getattr(el, "text", None) or str(el) or "") for el in elements]))
             
             for domain_folder in courses_dir.iterdir():
                 if not domain_folder.is_dir():
@@ -344,10 +419,12 @@ def auto_detect_course(file_path: str) -> tuple[str, str]:
                         continue
                     
                     course_name = course_folder.name
-                    course_name_lower = course_name.lower()
+                    course_name_key = normalize_text(course_name)
+                    if not course_name_key or course_name_key in {"general", "generic"}:
+                        continue
                     
                     # Si le contenu mentionne le cours, c'est probablement ce cours
-                    if course_name_lower in text or course_name_lower.replace(" ", "") in text:
+                    if course_name_key in text:
                         return (domain_name, course_name)
         except:
             pass

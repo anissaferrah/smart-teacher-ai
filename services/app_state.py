@@ -18,11 +18,14 @@ from modules.monitoring.analytics import get_analytics
 from modules.monitoring.dashboard import record_checkpoint_event, record_session_event, record_trace_event
 from modules.monitoring.logger import CsvLogger
 from modules.monitoring.stt_logger import STTLogger
+from modules.ai.confusion.unified_detector import UnifiedConfusionDetector
 from modules.pedagogy.course_analyzer import get_analyzer
 from modules.pedagogy.dialogue import DialogueManager
 from modules.pedagogy.ingestion_manager import IngestionManager
 from modules.pedagogy.slide_sync import SlideSynchronizer
 from modules.pedagogy.student_profile import ProfileManager
+from services.agentic_rag.document_manager import DocumentManager
+from services.agentic_rag.vector_db_manager import VectorDBManager
 
 Config.validate()
 
@@ -32,6 +35,12 @@ speech_synthesizer = VoiceEngine()
 knowledge_retrieval_engine = MultiModalRAG(
     db_dir=Config.RAG_DB_DIR,
     force_local_embeddings=not Config.RAG_ENABLED,
+)
+confusion_detector = UnifiedConfusionDetector(sight_model_path=Config.CONFUSION_MODEL_PATH)
+agentic_vector_db_manager = VectorDBManager(knowledge_retrieval_engine)
+agentic_document_manager = DocumentManager(
+    knowledge_retrieval_engine,
+    vector_db_manager=agentic_vector_db_manager,
 )
 turn_logger = CsvLogger()
 stt_event_logger = STTLogger()

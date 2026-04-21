@@ -10,6 +10,7 @@ Responsibilities:
 
 import asyncio
 import logging
+import uuid
 from typing import Optional, Tuple, Dict, Any
 from datetime import datetime
 
@@ -58,36 +59,45 @@ class PresentationService:
         try:
             from database.repositories.crud import get_course_with_structure
             from database.core import AsyncSessionLocal
+
+            try:
+                course_uuid = uuid.UUID(str(course_id))
+            except Exception:
+                log.warning("Invalid course id for slide loading: %s", course_id)
+                return None
             
             async with AsyncSessionLocal() as db:
-                course_struct = await get_course_with_structure(db, course_id)
+                course_struct = await get_course_with_structure(db, course_uuid)
                 if not course_struct:
                     return None
                 
-                # Navigate to chapter/section
-                course_data = course_struct.get("data", {})
-                chapters = course_data.get("chapters", [])
+                # Navigate the ORM hierarchy directly: Course -> Chapter -> Section
+                chapters = sorted(course_struct.chapters or [], key=lambda chapter: chapter.order or 0)
                 
                 if chapter_index >= len(chapters):
                     return None
                 
                 chapter = chapters[chapter_index]
-                sections = chapter.get("sections", [])
+                sections = sorted(chapter.sections or [], key=lambda section: section.order or 0)
                 
                 if section_index >= len(sections):
                     return None
                 
                 section = sections[section_index]
+                slide_path = section.image_url or (
+                    section.image_urls[0] if getattr(section, "image_urls", None) else ""
+                )
                 
                 return CourseSlide(
                     course_id=course_id,
-                    course_title=course_data.get("title", ""),
-                    course_domain=course_data.get("domain", ""),
+                    course_title=course_struct.title or "",
+                    course_domain=course_struct.domain or "",
                     chapter_index=chapter_index,
-                    chapter_title=chapter.get("title", ""),
+                    chapter_title=chapter.title or "",
                     section_index=section_index,
-                    section_title=section.get("title", ""),
-                    slide_content=section.get("content", ""),
+                    section_title=section.title or "",
+                    slide_path=slide_path,
+                    slide_content=section.content or "",
                 )
         except Exception as e:
             log.error(f"Failed to load slide: {e}")
@@ -98,7 +108,7 @@ class PresentationService:
         slide: CourseSlide,
         student_profile,
         language: str,
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, bytes]:
         """Generate focused narration for a slide.
         
         Args:
@@ -116,9 +126,18 @@ class PresentationService:
             if cache_key in self.narration_cache:
                 narration = self.narration_cache[cache_key]
             else:
-                # Generate narration using LLM
-                prompt = self._build_narration_prompt(slide, student_profile, language)
-                narration = await self.llm.generate(prompt, temperature=0.6)
+                # Generate narration using the Brain presentation API
+                student_level = student_profile.level if student_profile else "lycée"
+                narration, _duration = await asyncio.to_thread(
+                    self.llm.present,
+                    section_content=slide.slide_content,
+                    language=language,
+                    student_level=student_level,
+                    chapter_idx=slide.chapter_index,
+                    chapter_title=slide.chapter_title,
+                    section_title=slide.section_title,
+                    domain=slide.course_domain or None,
+                )
                 self.narration_cache[cache_key] = narration
             
             # Check audio cache
@@ -126,11 +145,12 @@ class PresentationService:
                 audio_bytes = self.audio_cache[cache_key]
             else:
                 # Generate audio using TTS
-                audio_bytes = await self.voice.generate_audio_async(
+                audio_bytes, _duration, _engine, _voice, _mime = await self.voice.generate_audio_async(
                     narration,
                     language=language,
                     rate_override="+0%" if not settings.realtime_session.enable_rate_adaptation else "+10%",
                 )
+                audio_bytes = audio_bytes or b""
                 self.audio_cache[cache_key] = audio_bytes
             
             return narration, audio_bytes

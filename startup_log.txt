@@ -1,0 +1,6 @@
+? Configuration validated
+? Config Domaines & Cours chargée : 1 domaine(s)
+   Domaines actuels : ['informatique']
+   ? Chapitres découverts DYNAMIQUEMENT depuis courses/{domain}/{course}/
+   ? Ajouter un nouveau domaine : modifier ce fichier + créer le dossier courses/{new_domain}/
+   Defaults: domain='general', course='generic' (Génériques)

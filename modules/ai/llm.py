@@ -59,6 +59,38 @@ _FALLBACK_PRESENTATION_PROMPTS = {
 }
 
 
+def _resolve_domain_prompt_parts(domain: str | None) -> tuple[str, str]:
+    """Return human-readable domain description and label for prompts."""
+    fallback_desc = "specialty subjects"
+    fallback_name = "diverse topics"
+
+    if not domain:
+        return fallback_desc, fallback_name
+
+    try:
+        from domains_config import DOMAINS
+    except ImportError:
+        human = domain.replace("_", " ")
+        return human, human
+
+    domain_entry = DOMAINS.get(domain)
+    human_domain = domain.replace("_", " ")
+
+    if isinstance(domain_entry, dict):
+        return (
+            domain_entry.get("description", human_domain),
+            domain_entry.get("name", human_domain),
+        )
+
+    if isinstance(domain_entry, list):
+        return human_domain, human_domain
+
+    if domain_entry is not None:
+        return human_domain, human_domain
+
+    return human_domain, human_domain
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  DÉTECTION AUTOMATIQUE DE CONFUSION (S29-32)
 # ══════════════════════════════════════════════════════════════════════
@@ -137,20 +169,13 @@ def get_clarification_prompt(language: str = "fr", domain: str = None) -> str:
 
 def get_system_prompt(domain: str = None, language: str = "en") -> str:
     """Génère un prompt système dynamique basé sur le domaine."""
-    try:
-        from domains_config import DOMAINS
-    except ImportError:
-        log.warning("⚠️  domains_config not available, using fallback prompts")
-        return _FALLBACK_PROMPTS.get(language, _FALLBACK_PROMPTS["en"])
-
     lang = language.lower()[:2] if language else "en"
 
-    if domain and domain in DOMAINS:
-        domain_desc = DOMAINS[domain].get("description", "specialty subjects")
-        domain_name = DOMAINS[domain].get("name", domain)
-    else:
-        domain_desc = "specialty subjects"
-        domain_name = "diverse topics"
+    try:
+        domain_desc, domain_name = _resolve_domain_prompt_parts(domain)
+    except Exception:
+        log.warning("⚠️  domains_config not available, using fallback prompts")
+        return _FALLBACK_PROMPTS.get(language, _FALLBACK_PROMPTS["en"])
 
     prompts_map = {
         "en": (
@@ -182,20 +207,16 @@ def get_system_prompt(domain: str = None, language: str = "en") -> str:
 
 def get_presentation_prompt(domain: str = None, language: str = "en", chapter_title: str = "") -> str:
     """Génère un prompt de présentation centré sur la slide courante."""
+    lang = language.lower()[:2] if language else "en"
+
     try:
-        from domains_config import DOMAINS
-    except ImportError:
+        domain_desc, domain_name = _resolve_domain_prompt_parts(domain)
+    except Exception:
         log.warning("⚠️  domains_config not available, using fallback presentation prompts")
         return _FALLBACK_PRESENTATION_PROMPTS.get(language, _FALLBACK_PRESENTATION_PROMPTS["en"])
 
-    lang = language.lower()[:2] if language else "en"
-
-    if domain and domain in DOMAINS:
-        domain_desc = DOMAINS[domain].get("description", "specialty subjects")
-        domain_name = DOMAINS[domain].get("name", domain)
-    else:
-        domain_desc = "specialty subjects"
-        domain_name = "this field"
+    if domain_name == domain_desc:
+        domain_name = domain_name or "this field"
 
     chapter_ctx = f"\nThis content is from the chapter: '{chapter_title}'." if chapter_title else ""
 

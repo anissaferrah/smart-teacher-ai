@@ -204,6 +204,63 @@ class RealtimeSessionService:
                         
                         # Update context
                         ctx.slide = slide
+
+                        # Send the slide immediately so the frontend can render the visual presentation
+                        presentation_reasoning = [
+                            {
+                                "title": "Chargement du cours",
+                                "summary": f"Cours: {slide.course_title}",
+                                "state": "presenting",
+                                "status": "done",
+                                "details": {
+                                    "chapter_title": slide.chapter_title,
+                                    "section_title": slide.section_title,
+                                    "course_id": course_id,
+                                },
+                            },
+                            {
+                                "title": "Sélection du chapitre",
+                                "summary": f"Chapitre: {slide.chapter_title}",
+                                "state": "presenting",
+                                "status": "done",
+                                "details": {
+                                    "chapter_index": chapter_idx,
+                                    "section_index": section_idx,
+                                    "slide_path": slide.slide_path,
+                                },
+                            },
+                        ]
+
+                        await send({
+                            "type": "presentation_started",
+                            "course": slide.course_title,
+                            "chapter": slide.chapter_title,
+                            "section": slide.section_title,
+                            "image_url": slide.slide_path,
+                            "slide_path": slide.slide_path,
+                            "narration": slide.slide_content or "Présentation en cours…",
+                            "audio_url": f"/media/slide_{course_id}_{chapter_idx}_{section_idx}.mp3",
+                            "reasoning": {
+                                "steps": presentation_reasoning,
+                                "current_state": "presenting",
+                                "current_stage": "presentation_started",
+                            },
+                        })
+
+                        await send({
+                            "type": "slide_data",
+                            "course": slide.course_title,
+                            "chapter": slide.chapter_title,
+                            "section": slide.section_title,
+                            "title": slide.section_title,
+                            "text": slide.slide_content or "Présentation en cours…",
+                            "image_url": slide.slide_path,
+                            "slide_path": slide.slide_path,
+                            "section": section_idx + 1,
+                            "total_sections": 1,
+                        })
+
+                        log.info(f"📖 Presentation started: {slide.course_title}/{slide.chapter_title}")
                         
                         # Generate narration
                         narration, audio_bytes = await self.presentation_service.explain_slide_focused(
@@ -212,27 +269,16 @@ class RealtimeSessionService:
                         
                         ctx.current_slide_narration = narration
                         
-                        # Send presentation to client
-                        await send({
-                            "type": "presentation_started",
-                            "course": slide.course_title,
-                            "chapter": slide.chapter_title,
-                            "section": slide.section_title,
-                            "narration": narration,
-                            "audio_url": f"/media/slide_{course_id}_{chapter_idx}_{section_idx}.mp3",
-                        })
-                        
-                        log.info(f"📖 Presentation started: {slide.course_title}/{slide.chapter_title}")
                     
                     # Text question
-                    elif msg_type == "text_question":
+                    elif msg_type in {"text_question", "question"}:
                         if not ctx:
                             await send({"type": "error", "message": "Session not initialized"})
                             continue
                         
-                        question = message.get("content", "")
+                        question = message.get("content") or message.get("text") or message.get("question") or ""
                         language = message.get("language", ctx.language)
-                        subject = message.get("subject", "")
+                        subject = message.get("subject", "") or message.get("topic", "")
                         
                         # Process question
                         answer, audio_bytes, metrics = await self.qa_service.process_text_question(
@@ -252,6 +298,11 @@ class RealtimeSessionService:
                                 "tts_time_ms": metrics.get("tts_time_ms", 0.0),
                                 "rag_chunks": metrics.get("rag_chunks", 0),
                                 "confusion_detected": metrics.get("confusion_detected", False),
+                            },
+                            "reasoning": {
+                                "steps": metrics.get("reasoning_trace", []),
+                                "current_state": metrics.get("system_state", "idle"),
+                                "current_stage": metrics.get("current_stage", "completed"),
                             },
                         })
                         

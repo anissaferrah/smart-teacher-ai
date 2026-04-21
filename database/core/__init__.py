@@ -1,13 +1,32 @@
 """Clear database core helpers.
 
-This module gives human-readable names for the engine, session factory, and
-connection helpers without changing the underlying implementation.
+This module exposes both the canonical database helper names and the legacy
+alias names used elsewhere in the codebase.
 """
 
 from .init_db import (
-    engine as database_engine,
-    AsyncSessionLocal as database_session_factory,
-    create_tables as create_database_tables,
-    get_db as get_database_session,
-    check_db_connection as test_database_connection,
+    AsyncSessionLocal,
+    check_db_connection,
+    create_tables,
+    engine,
+    get_db,
 )
+
+database_engine = engine
+database_session_factory = AsyncSessionLocal
+create_database_tables = create_tables
+get_database_session = get_db
+test_database_connection = check_db_connection
+
+__all__ = [
+    "AsyncSessionLocal",
+    "check_db_connection",
+    "create_tables",
+    "engine",
+    "get_db",
+    "database_engine",
+    "database_session_factory",
+    "create_database_tables",
+    "get_database_session",
+    "test_database_connection",
+]

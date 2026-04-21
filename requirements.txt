@@ -47,6 +47,7 @@ pdfminer.six
 python-docx
 pytesseract
 pdf2image
+pypdfium2
 
 # Visualization / analysis
 matplotlib

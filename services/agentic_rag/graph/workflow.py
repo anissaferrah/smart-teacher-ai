@@ -3,7 +3,7 @@ import logging
 from services.agentic_rag.agents.query_rewriter import QueryRewriter
 from services.agentic_rag.agents.query_clarifier import QueryClarifier
 from services.agentic_rag.agents.retriever_agent import RetrieverAgent
-from services.agentic_rag.agents.reasoner_agent import ReasonerAgent
+from services.agentic_rag.reasoner_agent import ReasonerAgent
 from services.agentic_rag.agents.reflection_agent import ReflectionAgent
 
 log = logging.getLogger("SmartTeacher.Workflow")

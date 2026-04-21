@@ -45,6 +45,10 @@ class AnalyticsSink:
                 from clickhouse_driver import Client
                 self._client = Client(host=self.host, port=self.port, database=self.database)
                 log.info("ClickHouse client connected")
+            except ModuleNotFoundError as e:
+                log.warning(f"ClickHouse driver unavailable, analytics disabled: {e}")
+                self.enabled = False
+                self._client = None
             except Exception as e:
                 log.error(f"Failed to connect to ClickHouse: {e}")
                 self._client = None

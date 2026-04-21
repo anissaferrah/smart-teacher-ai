@@ -184,20 +184,55 @@ class LocalStructurer:
 
     def _pdf_to_images(self, pdf_path: str, output_dir: str) -> list[str]:
         """Convertit PDF en images PNG."""
-        if not self.convert_from_path:
-            return []
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        for old_png in output_path.glob("page_*.png"):
+            try:
+                old_png.unlink()
+            except Exception:
+                pass
+
+        if self.convert_from_path:
+            try:
+                images = self.convert_from_path(pdf_path, dpi=150)
+                paths = []
+                for i, img in enumerate(images, 1):
+                    png_path = output_path / f"page_{i:03d}.png"
+                    img.save(str(png_path), "PNG")
+                    paths.append(str(png_path))
+                if paths:
+                    log.info(f"  ✅ {len(paths)} PNG générées")
+                    return paths
+                log.warning("  ⚠️ pdf2image n'a produit aucune image, fallback pypdfium2…")
+            except Exception as e:
+                log.info(f"  ℹ️ Conversion PDF→PNG via pdf2image échouée: {e}")
+
         try:
-            images = self.convert_from_path(pdf_path, dpi=150)
-            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            import pypdfium2 as pdfium
+
+            pdf = pdfium.PdfDocument(pdf_path)
             paths = []
-            for i, img in enumerate(images, 1):
-                png_path = Path(output_dir) / f"page_{i:03d}.png"
-                img.save(str(png_path), "PNG")
-                paths.append(str(png_path))
-            log.info(f"  ✅ {len(paths)} PNG générées")
+            try:
+                for i in range(len(pdf)):
+                    page = pdf[i]
+                    bitmap = page.render(scale=2.0)
+                    image = bitmap.to_pil()
+                    png_path = output_path / f"page_{i + 1:03d}.png"
+                    image.save(str(png_path), "PNG")
+                    paths.append(str(png_path))
+            finally:
+                close = getattr(pdf, "close", None)
+                if callable(close):
+                    close()
+
+            if paths:
+                log.info(f"  ✅ {len(paths)} PNG générées via pypdfium2")
             return paths
+        except ImportError:
+            log.info("  ℹ️ pypdfium2 non disponible pour convertir le PDF en PNG")
         except Exception as e:
-            log.info(f"  ℹ️ Conversion PDF→PNG échouée: {e}")
+            log.info(f"  ℹ️ Conversion PDF→PNG via pypdfium2 échouée: {e}")
             return []
 
     def _extract_text_with_ocr(self, pdf_path: str, lang: str = "fra+ara+eng") -> str:
@@ -377,6 +412,30 @@ class CourseBuilder:
         )
 
     @staticmethod
+    def _chapter_number_from_value(value: str | None) -> int | None:
+        if not value:
+            return None
+
+        normalized = value.strip().lower().replace("\\", "/").split("/")[-1]
+        patterns = [
+            r"(?:chapter|chapitre|chap)\s*[_\-\s]*(\d+)",
+            r"\bchapter[_\-\s]*(\d+)\b",
+            r"\bchapitre[_\-\s]*(\d+)\b",
+            r"\bchap[_\-\s]*(\d+)\b",
+            r"\bch[_\-\s]*(\d+)\b",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, normalized)
+            if match:
+                try:
+                    return max(1, int(match.group(1)))
+                except (TypeError, ValueError):
+                    continue
+
+        return None
+
+    @staticmethod
     def _chapter_slug(value: str | None, fallback: str = "chapter_1") -> str:
         candidate = (value or fallback).strip().replace("\\", "/").split("/")[-1]
         candidate = candidate.lower()
@@ -388,6 +447,29 @@ class CourseBuilder:
     def _display_label(value: str | None, fallback: str) -> str:
         candidate = (value or "").replace("_", " ").replace("-", " ").strip()
         return candidate.title() if candidate else fallback
+
+    def _infer_course_title(self, raw_text: str, course_slug: str, fallback_title: str) -> str:
+        """Infer a real course title from the detected course slug or the document text."""
+        slug = (course_slug or "").strip()
+        if slug and slug.lower() not in {DEFAULT_COURSE, "generic"} and not self._looks_like_chapter(slug):
+            return self._display_label(slug, fallback_title)
+
+        for line in (raw_text or "").splitlines():
+            candidate = line.strip()
+            if not candidate:
+                continue
+            if len(candidate) > 120 or len(candidate.split()) > 10:
+                continue
+            if self._looks_like_chapter(candidate):
+                continue
+            if not any(char.isalpha() for char in candidate):
+                continue
+            normalized = candidate.lower().strip()
+            if normalized in {"outline", "table of contents", "contents", "introduction", "summary"}:
+                continue
+            return self._display_label(candidate, candidate)
+
+        return self._display_label(fallback_title, "Cours importé")
 
     def infer_upload_context(
         self,
@@ -458,6 +540,24 @@ class CourseBuilder:
 
         if not domain:
             domain = fallback_domain or DEFAULT_DOMAIN
+
+        if course and domain.lower() in {DEFAULT_DOMAIN.lower(), "general"}:
+            try:
+                course_key = self._course_slug(course, fallback=course, domain=None).lower()
+                for known_domain in get_domains():
+                    if known_domain.lower() == domain.lower():
+                        continue
+                    try:
+                        existing_courses = get_courses(known_domain)
+                    except Exception:
+                        continue
+
+                    if any(self._course_slug(existing_course, fallback=existing_course, domain=None).lower() == course_key for existing_course in existing_courses):
+                        domain = known_domain
+                        break
+            except Exception:
+                pass
+
         if not course or self._looks_like_chapter(course):
             if fallback_course and not self._looks_like_chapter(fallback_course):
                 course = fallback_course
@@ -708,17 +808,23 @@ class CourseBuilder:
         if len(raw_text.strip()) < 100:
             raise ValueError(f"Texte trop court : {len(raw_text)} chars")
 
+        course_title = self._infer_course_title(raw_text, course_slug, path.stem)
+
         course_data = await self.structurer.structure(
             raw_text=raw_text,
             language=language,
             level=level,
-            title=path.stem.replace("_", " ").replace("-", " ").title(),
+            title=course_title,
             subject=course_slug,
         )
+        chapter_order = self._chapter_number_from_value(chapter_slug) or 1
         course_data["file_path"] = str(file_path)
         course_data["subject"] = course_slug
+        course_data["title"] = course_title
         course_data["chapter_slug"] = chapter_slug
-        course_data["chapters"][0]["title"] = self._display_label(chapter_slug, "Chapter 1")
+        course_data["chapters"][0]["title"] = self._display_label(chapter_slug, f"Chapter {chapter_order}")
+        course_data["chapters"][0]["order"] = chapter_order
+        course_data["chapter_order"] = chapter_order
         course_data["slides"] = [f"/media/slides/{domain}/{course_slug}/{chapter_slug}/page_{i+1:03d}.png" for i in range(len(png_paths))]
         self._print_summary(course_data)
         return course_data
@@ -731,6 +837,7 @@ class CourseBuilder:
         subject: str = "",
         domain: str = DEFAULT_DOMAIN,
         chapter: str = "chapter_1",
+        course_title_hint: str | None = None,
     ) -> dict:
         """
         Construit un cours directement depuis le fichier, sans génération IA.
@@ -750,6 +857,10 @@ class CourseBuilder:
         )
         domain = inferred_domain or domain
         chapter_title = self._display_label(chapter_slug, "Chapter 1")
+        course_title_hint = (course_title_hint or "").strip()
+
+        if course_slug.lower() in {DEFAULT_COURSE, "generic"} and course_title_hint:
+            course_slug = self._course_slug(course_title_hint, fallback=course_slug, domain=domain)
 
         log.info(f"\n{'='*60}")
         log.info(f"📚 Construction directe (sans IA) : {path.name}")
@@ -758,6 +869,7 @@ class CourseBuilder:
         sections: list[dict] = []
         ext = path.suffix.lower()
         slides: list[str] = []
+        title_source_text = ""
 
         if ext == ".pdf":
             course_dir = Path("media/slides") / domain / course_slug
@@ -771,6 +883,7 @@ class CourseBuilder:
             ]
 
             pages = self._extract_pdf_pages(str(path))
+            title_source_text = "\n\n".join(page_text for _, page_text in pages if page_text)
             for page_idx, page_text in pages:
                 content = (page_text or "").strip()
                 if not content:
@@ -789,6 +902,7 @@ class CourseBuilder:
                 })
         elif ext == ".pptx":
             slides_data = self.extractor.extract_structured_pptx(str(path))
+            title_source_text = "\n\n".join((s.get("content") or "") for s in slides_data if s.get("content"))
             for i, s in enumerate(slides_data, start=1):
                 title = (s.get("title") or f"Slide {i}").strip()
                 content = (s.get("content") or "").strip()
@@ -805,6 +919,7 @@ class CourseBuilder:
                 })
         else:
             raw_text = self.extractor.extract(str(path)).strip()
+            title_source_text = raw_text
             if len(raw_text) < 30:
                 raise ValueError(f"Texte trop court : {len(raw_text)} chars")
 
@@ -826,16 +941,19 @@ class CourseBuilder:
         if not sections:
             raise ValueError("Impossible d'extraire des sections depuis ce fichier")
 
+        course_title = self._display_label(course_title_hint, path.stem) if course_title_hint else self._infer_course_title(title_source_text, course_slug, path.stem)
+
         course_data = {
-            "title": path.stem.replace("_", " ").replace("-", " ").title(),
+            "title": course_title,
             "subject": course_slug,
             "language": language,
             "level": level,
             "description": "Cours importé directement (sans génération IA)",
+            "chapter_order": self._chapter_number_from_value(chapter_slug) or 1,
             "chapters": [
                 {
                     "title": chapter_title,
-                    "order": 1,
+                    "order": self._chapter_number_from_value(chapter_slug) or 1,
                     "summary": "Import direct du document original",
                     "sections": sections,
                 }
