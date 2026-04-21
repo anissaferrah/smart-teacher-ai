@@ -1,1 +1,1 @@
-"""Memory module."""
+"""Memory systems for agentic RAG"""

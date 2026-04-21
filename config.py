@@ -66,6 +66,8 @@ class Config:
 
     # RAG (Retrieval-Augmented Generation)
     RAG_ENABLED: bool = os.getenv("RAG_ENABLED", "false").lower() == "true"  # Disabled temporarily (OpenAI quota)
+    RAG_MODE: str = os.getenv("RAG_MODE", "classic")  # "classic" or "agentic"
+    AGENTIC_MAX_LOOPS: int = int(os.getenv("AGENTIC_MAX_LOOPS", "3"))  # Reflection refinement loops
     RAG_NUM_RESULTS: int = int(os.getenv("RAG_NUM_RESULTS", "5"))
     RAG_EMBEDDING_MODEL: str = os.getenv("RAG_EMBEDDING_MODEL", "BAAI/bge-m3")
     RAG_DB_DIR: str = os.getenv("RAG_DB_DIR", "data/multimodal_db")
