@@ -30,7 +30,7 @@ class Config:
     POSTGRES_PORT: int = int(os.getenv("POSTGRES_PORT", "5432"))
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "smart_teacher")
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "admin")
-    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "secret")
+    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "")
 
     DATABASE_URL: str = (
         f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
@@ -189,6 +189,8 @@ class Config:
             errors.append("OPENAI_API_KEY missing in .env")
         if cls.TTS_PROVIDER == "elevenlabs" and not cls.ELEVENLABS_API_KEY:
             errors.append("ELEVENLABS_API_KEY missing (required if TTS_PROVIDER=elevenlabs)")
+        if not cls.POSTGRES_PASSWORD:
+            errors.append("POSTGRES_PASSWORD missing in .env")
 
         if errors:
             print("\n" + "=" * 60)
@@ -198,6 +200,7 @@ class Config:
                 print(f"   • {err}")
             print("\n💡 Create .env file:")
             print("   OPENAI_API_KEY=sk-...")
+            print("   POSTGRES_PASSWORD=your-secure-password")
             print("   ELEVENLABS_API_KEY=... (optional)")
             print("=" * 60 + "\n")
             sys.exit(1)
