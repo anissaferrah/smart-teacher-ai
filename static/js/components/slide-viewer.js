@@ -5,7 +5,7 @@
 
 import { BaseComponent } from './base-component.js';
 import { stateManager } from '../modules/state-manager.js';
-import { audioManager } from '../modules/audio-manager.js';
+import { audioManager } from '../modules/audio-manager.js?v=20260421g';
 
 export class SlideViewer extends BaseComponent {
   constructor(containerId) {

@@ -16,6 +16,14 @@ export class QAPanel extends BaseComponent {
 
   render() {
     const content = `
+      <div class="reasoning-shell" id="qaReasoningShell" hidden>
+        <div class="reasoning-head">
+          <span id="qaReasoningTitle">Suivi du traitement</span>
+          <span class="reasoning-count" id="qaReasoningCount">0 étape</span>
+        </div>
+        <div class="reasoning-list" id="qaReasoningList"></div>
+      </div>
+
       <div class="qa-msgs" id="qaMessages">
         <div class="msg msg-t">
           <div class="msg-lbl">Professeur</div>
@@ -26,16 +34,6 @@ export class QAPanel extends BaseComponent {
       <div class="state-bar">
         <div class="sd" id="qaStatus"></div>
         <span id="qaStatusText">En attente</span>
-      </div>
-
-      <div class="reasoning-shell">
-        <div class="reasoning-head">
-          <span>Blocs de raisonnement</span>
-          <span class="reasoning-count" id="qaReasoningCount">Aucun bloc</span>
-        </div>
-        <div class="reasoning-list" id="qaReasoningBlocks">
-          <div class="reasoning-empty">Le système affichera ici ses étapes de traitement.</div>
-        </div>
       </div>
 
       <div class="inp-row">
@@ -55,70 +53,32 @@ export class QAPanel extends BaseComponent {
   }
 
   setReasoningTrace(trace = []) {
-    const steps = Array.isArray(trace) ? trace.filter(Boolean) : [];
-    this.reasoningTrace = steps;
+    const steps = Array.isArray(trace)
+      ? trace.map((step) => this._normalizeReasoningStep(step)).filter(Boolean)
+      : [];
 
-    const count = this.query('#qaReasoningCount');
-    if (count) {
-      count.textContent = steps.length ? `${steps.length} blocs` : 'Aucun bloc';
-    }
+    this.reasoningTrace = steps.sort((left, right) => this._compareReasoningSteps(left, right));
+    this._syncReasoningMeta();
+    this._renderReasoningTrace();
+  }
 
-    const container = this.query('#qaReasoningBlocks');
-    if (!container) return;
-
-    if (!steps.length) {
-      container.innerHTML = '<div class="reasoning-empty">Le système affichera ici ses étapes de traitement.</div>';
-      stateManager.setState('lastStateMain', null);
-      stateManager.setState('lastSubstep', null);
+  appendReasoningStep(step) {
+    const normalized = this._normalizeReasoningStep(step);
+    if (!normalized) {
       return;
     }
 
-    container.innerHTML = steps.map((step, index) => {
-      const state = this._normalizeState(step);
-      const status = String(step?.status || 'done').toLowerCase();
-      const title = this._escapeHtml(step?.title || step?.label || step?.stage || `Étape ${index + 1}`);
-      const summary = this._escapeHtml(step?.summary || step?.message || '—');
-      const duration = Number(step?.duration_ms ?? step?.duration ?? 0);
-      const confidence = step?.confidence != null ? Number(step.confidence) : null;
-      const details = step?.details || {};
-      const detailParts = [];
+    const merged = [...this.reasoningTrace];
+    const key = this._reasoningStepKey(normalized);
+    const index = merged.findIndex((item) => this._reasoningStepKey(item) === key);
 
-      if (details.chunks != null) detailParts.push(`${details.chunks} chunks`);
-      if (details.top_score != null) detailParts.push(`score ${Number(details.top_score).toFixed(2)}`);
-      if (details.detected != null) detailParts.push(details.detected ? 'confusion détectée' : 'pas de confusion');
-      if (details.answer_length != null) detailParts.push(`${details.answer_length} caractères`);
-      if (details.audio_bytes != null) detailParts.push(`${details.audio_bytes} octets audio`);
-      if (details.question_length != null) detailParts.push(`${details.question_length} caractères question`);
-      if (details.rag_enabled === false) detailParts.push('RAG désactivé');
+    if (index >= 0) {
+      merged[index] = { ...merged[index], ...normalized };
+    } else {
+      merged.push(normalized);
+    }
 
-      if (details.answer_preview) {
-        detailParts.push(`Aperçu: ${details.answer_preview}`);
-      }
-
-      const detailLine = detailParts.length ? this._escapeHtml(detailParts.join(' • ')) : '';
-
-      return `
-        <div class="reasoning-block reasoning-status-${status}" data-state="${this._escapeHtml(state)}">
-          <div class="reasoning-top">
-            <div>
-              <div class="reasoning-title">${index + 1}. ${title}</div>
-              <div class="reasoning-sub">${summary}</div>
-            </div>
-            <div class="reasoning-time">${duration ? `${duration.toFixed(0)} ms` : '—'}</div>
-          </div>
-          <div class="reasoning-badges">
-            <span class="reasoning-chip reasoning-chip-state">${this._escapeHtml(state.toUpperCase())}</span>
-            <span class="reasoning-chip reasoning-chip-status">${this._escapeHtml(status.toUpperCase())}</span>
-            ${confidence != null ? `<span class="reasoning-chip reasoning-chip-confidence">CONF ${confidence.toFixed(2)}</span>` : ''}
-          </div>
-          ${detailLine ? `<div class="reasoning-detail">${detailLine}</div>` : ''}
-        </div>
-      `;
-    }).join('');
-
-    const latest = steps[steps.length - 1] || {};
-    stateManager.setState('lastStateMain', this._normalizeState(latest));
-    stateManager.setState('lastSubstep', latest?.summary || latest?.title || null);
+    this.setReasoningTrace(merged);
   }
 
   clearReasoningTrace() {
@@ -202,9 +162,10 @@ export class QAPanel extends BaseComponent {
         'idle': 'En attente',
         'listening': 'Écoute',
         'processing': 'Traitement',
-        'responding': 'Réponse'
+        'responding': 'Réponse',
+        'presenting': 'Présentation'
       };
-      statusText.textContent = labels[state] || text || 'En attente';
+      statusText.textContent = text || labels[state] || 'En attente';
     }
   }
 
@@ -214,6 +175,8 @@ export class QAPanel extends BaseComponent {
 
     const text = input.value.trim();
     if (!text) return;
+
+    this.clearReasoningTrace();
 
     // Add user message
     this.addMessage(text, 's', 'Vous');
@@ -238,6 +201,12 @@ export class QAPanel extends BaseComponent {
       btn.classList.toggle('recording', this.recordingActive);
       btn.style.opacity = this.recordingActive ? '1' : '0.6';
     }
+
+    if (this.recordingActive) {
+      this.clearReasoningTrace();
+    }
+
+    this.setStatus(this.recordingActive ? 'listening' : 'idle', this.recordingActive ? 'Enregistrement…' : 'En attente');
 
     // Emit event
     const event = new CustomEvent('qa-recording-toggled', {
@@ -282,6 +251,197 @@ export class QAPanel extends BaseComponent {
 
   _normalizeState(step) {
     return String(step?.state || step?.dialog_state || step?.system_state || 'idle').toLowerCase();
+  }
+
+  _syncReasoningMeta() {
+    const latest = this.reasoningTrace[this.reasoningTrace.length - 1] || {};
+
+    if (this.reasoningTrace.length) {
+      const normalizedState = this._normalizeState(latest);
+      stateManager.setState('lastStateMain', normalizedState);
+      stateManager.setState('lastSubstep', latest?.summary || latest?.title || null);
+      this.setStatus(normalizedState, latest?.summary || latest?.title || 'En cours');
+    } else {
+      stateManager.setState('lastStateMain', null);
+      stateManager.setState('lastSubstep', null);
+      this.setStatus('idle', 'En attente');
+    }
+  }
+
+  _renderReasoningTrace() {
+    const shell = this.query('#qaReasoningShell');
+    const title = this.query('#qaReasoningTitle');
+    const count = this.query('#qaReasoningCount');
+    const list = this.query('#qaReasoningList');
+
+    if (!shell || !title || !count || !list) {
+      return;
+    }
+
+    if (!this.reasoningTrace.length) {
+      shell.hidden = true;
+      title.textContent = 'Suivi du traitement';
+      count.textContent = '0 étape';
+      list.innerHTML = '';
+      return;
+    }
+
+    shell.hidden = false;
+    const hasRunningStep = this.reasoningTrace.some((step) => this._isReasoningRunning(step));
+    title.textContent = hasRunningStep ? 'Traitement en cours…' : 'Trace du traitement';
+    count.textContent = `${this.reasoningTrace.length} étape${this.reasoningTrace.length > 1 ? 's' : ''}`;
+    list.innerHTML = this.reasoningTrace
+      .map((step, index) => this._renderReasoningBlock(step, index))
+      .join('');
+    list.scrollTop = list.scrollHeight;
+  }
+
+  _renderReasoningBlock(step, index) {
+    const stepNumber = Number.isFinite(Number(step?.step)) ? Number(step.step) : index + 1;
+    const status = String(step?.status || 'done').toLowerCase();
+    const stateLabel = this._formatReasoningState(step);
+    const statusLabel = this._formatReasoningStatus(status);
+    const detailText = this._formatReasoningDetails(step?.details);
+    const durationText = Number.isFinite(Number(step?.duration_ms)) && Number(step.duration_ms) > 0
+      ? `${Number(step.duration_ms).toFixed(1)} ms`
+      : '';
+    const confidenceText = Number.isFinite(Number(step?.confidence))
+      ? `${Math.round(Number(step.confidence) * 100)}%`
+      : '';
+    const statusClass =
+      status === 'done'
+        ? 'reasoning-status-done'
+        : status === 'skipped'
+          ? 'reasoning-status-skipped'
+          : status === 'failed'
+            ? 'reasoning-status-failed'
+            : '';
+    const runningStyle = this._isReasoningRunning(step)
+      ? ' style="border-color: rgba(0, 229, 176, 0.34); box-shadow: 0 0 0 1px rgba(0, 229, 176, 0.08) inset;"'
+      : '';
+
+    return `
+      <div class="reasoning-block ${statusClass}"${runningStyle}>
+        <div class="reasoning-top">
+          <div>
+            <div class="reasoning-title">${this._escapeHtml(step?.title || step?.key || `Étape ${stepNumber}`)}</div>
+            <div class="reasoning-sub">${this._escapeHtml(step?.summary || 'En cours')}</div>
+          </div>
+          <div class="reasoning-time">${this._escapeHtml(durationText)}</div>
+        </div>
+        <div class="reasoning-badges">
+          <span class="reasoning-chip reasoning-chip-state">${this._escapeHtml(`Étape ${stepNumber}`)}</span>
+          <span class="reasoning-chip reasoning-chip-state">${this._escapeHtml(stateLabel)}</span>
+          <span class="reasoning-chip reasoning-chip-status">${this._escapeHtml(statusLabel)}</span>
+          ${confidenceText ? `<span class="reasoning-chip reasoning-chip-confidence">${this._escapeHtml(`Confiance ${confidenceText}`)}</span>` : ''}
+        </div>
+        ${detailText ? `<div class="reasoning-detail">${this._escapeHtml(detailText)}</div>` : ''}
+      </div>
+    `;
+  }
+
+  _normalizeReasoningStep(step) {
+    if (!step || typeof step !== 'object') {
+      return null;
+    }
+
+    const normalizedStep = { ...step };
+    if (normalizedStep.step !== undefined && normalizedStep.step !== null && normalizedStep.step !== '') {
+      const parsedStep = Number(normalizedStep.step);
+      normalizedStep.step = Number.isFinite(parsedStep) ? parsedStep : null;
+    } else {
+      normalizedStep.step = null;
+    }
+
+    normalizedStep.key = normalizedStep.key || normalizedStep.title || normalizedStep.summary || '';
+    normalizedStep.title = normalizedStep.title || normalizedStep.key || '';
+    normalizedStep.summary = normalizedStep.summary || normalizedStep.title || '';
+    normalizedStep.state = this._normalizeState(normalizedStep);
+    normalizedStep.status = String(normalizedStep.status || 'done').toLowerCase();
+
+    if (normalizedStep.duration_ms !== undefined && normalizedStep.duration_ms !== null && normalizedStep.duration_ms !== '') {
+      const parsedDuration = Number(normalizedStep.duration_ms);
+      normalizedStep.duration_ms = Number.isFinite(parsedDuration) ? parsedDuration : null;
+    } else {
+      normalizedStep.duration_ms = null;
+    }
+
+    if (normalizedStep.confidence !== undefined && normalizedStep.confidence !== null && normalizedStep.confidence !== '') {
+      const parsedConfidence = Number(normalizedStep.confidence);
+      normalizedStep.confidence = Number.isFinite(parsedConfidence) ? parsedConfidence : null;
+    } else {
+      normalizedStep.confidence = null;
+    }
+
+    return normalizedStep;
+  }
+
+  _reasoningStepKey(step) {
+    if (!step || typeof step !== 'object') {
+      return '';
+    }
+
+    if (Number.isFinite(Number(step.step))) {
+      return `step:${Number(step.step)}`;
+    }
+
+    return `key:${String(step.key || step.title || step.summary || '').trim().toLowerCase()}`;
+  }
+
+  _compareReasoningSteps(left, right) {
+    const leftStep = Number.isFinite(Number(left?.step)) ? Number(left.step) : Number.MAX_SAFE_INTEGER;
+    const rightStep = Number.isFinite(Number(right?.step)) ? Number(right.step) : Number.MAX_SAFE_INTEGER;
+
+    if (leftStep !== rightStep) {
+      return leftStep - rightStep;
+    }
+
+    return String(left?.key || left?.title || '').localeCompare(String(right?.key || right?.title || ''));
+  }
+
+  _isReasoningRunning(step) {
+    const status = String(step?.status || '').toLowerCase();
+    return ['running', 'in_progress', 'processing'].includes(status);
+  }
+
+  _formatReasoningState(step) {
+    const value = String(step?.state || step?.dialog_state || step?.system_state || 'idle').toLowerCase();
+    const labels = {
+      idle: 'Attente',
+      listening: 'Écoute',
+      processing: 'Traitement',
+      presenting: 'Présentation',
+      responding: 'Réponse',
+    };
+
+    return labels[value] || value;
+  }
+
+  _formatReasoningStatus(status) {
+    const labels = {
+      running: 'En cours',
+      done: 'Terminé',
+      skipped: 'Ignoré',
+      failed: 'Erreur',
+    };
+
+    return labels[String(status || '').toLowerCase()] || 'En cours';
+  }
+
+  _formatReasoningDetails(details) {
+    if (!details) {
+      return '';
+    }
+
+    if (typeof details === 'string') {
+      return details;
+    }
+
+    try {
+      return JSON.stringify(details, null, 2);
+    } catch (_) {
+      return String(details);
+    }
   }
 
   _escapeHtml(value) {

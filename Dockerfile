@@ -22,4 +22,4 @@ RUN mkdir -p courses logs data/rag_cache media/audio media/pdfs media/slides sta
 
 EXPOSE 8000
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

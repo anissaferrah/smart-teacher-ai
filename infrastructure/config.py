@@ -185,7 +185,7 @@ def load_settings() -> AppSettings:
             max_history_turns=int(os.getenv("LLM__MAX_HISTORY_TURNS", "10")),
         ),
         rag=RAGConfig(
-            enabled=os.getenv("RAG__ENABLED", "false").lower() == "true",
+            enabled=os.getenv("RAG__ENABLED", "true").lower() == "true",
             num_results=int(os.getenv("RAG__NUM_RESULTS", "5")),
             embedding_model=os.getenv("RAG__EMBEDDING_MODEL", "BAAI/bge-m3"),
             db_dir=os.getenv("RAG__DB_DIR", "data/multimodal_db"),

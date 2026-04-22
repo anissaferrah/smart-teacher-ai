@@ -5,13 +5,13 @@
 
 import { stateManager } from './modules/state-manager.js';
 import { wsClient } from './modules/ws-client.js?v=20260421a';
-import { audioManager } from './modules/audio-manager.js';
+import { audioManager } from './modules/audio-manager.js?v=20260421g';
 import UIManager from './modules/ui-manager.js';
-import { Header } from './components/header.js';
+import { Header } from './components/header.js?v=20260421b';
 import { SlideViewer } from './components/slide-viewer.js';
-import { ChatPanel } from './components/chat-panel.js';
+import { ChatPanel } from './components/chat-panel.js?v=20260421h';
 import { CourseSelector } from './components/course-selector.js';
-import { QAPanel } from './components/qa-panel.js';
+import { QAPanel } from './components/qa-panel.js?v=20260421h';
 
 class SmartTeacherApp {
   constructor() {
@@ -20,6 +20,13 @@ class SmartTeacherApp {
     this._selectedUploadFiles = [];
     this._uploadingCourse = false;
     this._lastUploadSummary = '';
+    this._questionRecordingActive = false;
+    this._questionRecorder = null;
+    this._questionMediaStream = null;
+    this._questionAudioChunks = [];
+    this._questionAudioMimeType = 'audio/webm';
+    this._questionAudioListenersBound = false;
+    this._uploadStatusPollTimer = null;
   }
 
   async init() {
@@ -37,6 +44,9 @@ class SmartTeacherApp {
 
       this._setupCourseUpload();
       console.log('✅ Course upload handlers attached');
+
+      this._setupQuestionAudioListeners();
+      console.log('✅ Audio question handlers attached');
 
       if (!this._beforeUnloadHandler) {
         this._beforeUnloadHandler = () => wsClient.disconnect();
@@ -171,6 +181,174 @@ class SmartTeacherApp {
 
     wsClient.on('status_update', (data) => {
       this._handleStatusUpdate(data);
+    });
+
+    wsClient.on('interrupt', (data) => {
+      this._handleInterrupt(data);
+    });
+  }
+
+  _setupQuestionAudioListeners() {
+    if (this._questionAudioListenersBound) {
+      return;
+    }
+
+    this._questionAudioListenersBound = true;
+
+    window.addEventListener('qa-recording-toggled', (event) => {
+      const active = Boolean(event.detail?.active);
+      void this._setQuestionRecordingActive(active);
+    });
+
+    window.addEventListener('start-recording', () => {
+      void this._toggleQuestionRecording();
+    });
+  }
+
+  _interruptCurrentPlayback(reason = 'student_speaking') {
+    const playbackSnapshot = audioManager.stopAudio();
+    this.components.slideViewer?.setWaveformState('off');
+
+    if (wsClient.isConnected()) {
+      wsClient.send({
+        type: 'interrupt',
+        reason,
+        playback_snapshot: playbackSnapshot,
+      });
+    }
+
+    return playbackSnapshot;
+  }
+
+  _setQuestionStatus(state, text) {
+    this.components.chatPanel?.setStatus(state, text);
+    this.components.qaPanel?.setStatus(state, text);
+  }
+
+  async _toggleQuestionRecording() {
+    if (this._questionRecordingActive) {
+      return this._stopQuestionRecording();
+    }
+
+    return this._startQuestionRecording();
+  }
+
+  async _setQuestionRecordingActive(active) {
+    if (active) {
+      return this._startQuestionRecording();
+    }
+
+    return this._stopQuestionRecording();
+  }
+
+  async _startQuestionRecording() {
+    if (this._questionRecordingActive) {
+      return true;
+    }
+
+    if (!wsClient.isConnected()) {
+      UIManager.showNotification('WebSocket non connecté, impossible d\'enregistrer la question.', 'error');
+      return false;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      UIManager.showNotification('L\'enregistrement audio n\'est pas supporté dans ce navigateur.', 'error');
+      return false;
+    }
+
+    try {
+      this._interruptCurrentPlayback('student_speaking');
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+
+      this._questionAudioChunks = [];
+      this._questionAudioMimeType = mimeType;
+      this._questionMediaStream = stream;
+      this._questionRecorder = new MediaRecorder(stream, { mimeType });
+      this._questionRecordingActive = true;
+
+      this._setQuestionStatus('listening', 'Enregistrement en cours…');
+
+      this._questionRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          this._questionAudioChunks.push(event.data);
+        }
+      };
+
+      this._questionRecorder.onstop = async () => {
+        const chunks = this._questionAudioChunks.slice();
+        this._questionAudioChunks = [];
+
+        if (this._questionMediaStream) {
+          this._questionMediaStream.getTracks().forEach((track) => track.stop());
+        }
+
+        this._questionMediaStream = null;
+        this._questionRecorder = null;
+        this._questionRecordingActive = false;
+
+        if (!chunks.length) {
+          this._setQuestionStatus('idle', 'En attente');
+          return;
+        }
+
+        const blob = new Blob(chunks, { type: this._questionAudioMimeType });
+        this._setQuestionStatus('processing', 'Transcription de la question…');
+
+        try {
+          await this._submitQuestionAudio(blob, this._questionAudioMimeType);
+        } catch (error) {
+          console.error('❌ Audio question submission failed:', error);
+          UIManager.showNotification('Impossible d\'envoyer la question audio.', 'error');
+          this._setQuestionStatus('idle', 'En attente');
+        }
+      };
+
+      this._questionRecorder.start();
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to start audio recording:', error);
+      UIManager.showNotification('Impossible de démarrer le micro.', 'error');
+      this._setQuestionStatus('idle', 'En attente');
+      this._questionRecordingActive = false;
+      return false;
+    }
+  }
+
+  async _stopQuestionRecording() {
+    if (!this._questionRecorder || this._questionRecorder.state === 'inactive') {
+      this._questionRecordingActive = false;
+      return false;
+    }
+
+    this._questionRecorder.stop();
+    return true;
+  }
+
+  async _submitQuestionAudio(blob, mimeType) {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Audio encoding failed'));
+      reader.readAsDataURL(blob);
+    });
+
+    const audioData = String(dataUrl || '').split(',')[1] || '';
+    if (!audioData) {
+      throw new Error('Empty audio payload');
+    }
+
+    wsClient.send({
+      type: 'audio_question',
+      audio_data: audioData,
+      mime_type: mimeType,
+      course_id: stateManager.courseId,
+      language: wsClient.sessionLanguage || 'fr',
+      subject: stateManager.course?.domain || stateManager.course?.subject || '',
+      turn_id: stateManager.activeQuestionTurnId,
     });
   }
 
@@ -316,6 +494,50 @@ class SmartTeacherApp {
     this._syncUploadControls();
   }
 
+  _applyUploadProgressStatus(payload) {
+    const status = payload && typeof payload === 'object' ? payload : {};
+    const progress = Number(status.progress ?? 0);
+    const boundedProgress = Number.isFinite(progress) ? Math.max(0, Math.min(progress, 100)) : 0;
+    const stepText = String(status.current_step || '').trim();
+
+    if (this.uploadStatus && stepText) {
+      this.uploadStatus.textContent = stepText;
+    }
+
+    if (this.uploadFill) {
+      this.uploadFill.style.width = `${boundedProgress}%`;
+    }
+  }
+
+  async _pollUploadStatusOnce() {
+    try {
+      const response = await fetch('/ingestion/status');
+      if (!response.ok) {
+        return;
+      }
+
+      const payload = await response.json();
+      this._applyUploadProgressStatus(payload);
+    } catch (error) {
+      // Non-blocking: upload can continue even if polling fails intermittently.
+    }
+  }
+
+  _startUploadStatusPolling() {
+    this._stopUploadStatusPolling();
+    this._pollUploadStatusOnce();
+    this._uploadStatusPollTimer = setInterval(() => {
+      this._pollUploadStatusOnce();
+    }, 1200);
+  }
+
+  _stopUploadStatusPolling() {
+    if (this._uploadStatusPollTimer) {
+      clearInterval(this._uploadStatusPollTimer);
+      this._uploadStatusPollTimer = null;
+    }
+  }
+
   async _uploadSelectedCourses() {
     if (this._uploadingCourse) {
       return;
@@ -339,6 +561,7 @@ class SmartTeacherApp {
 
     try {
       this._setUploadBusy(true, 'Import du cours en cours…');
+      this._startUploadStatusPolling();
 
       const response = await fetch('/course/build', {
         method: 'POST',
@@ -375,6 +598,9 @@ class SmartTeacherApp {
           level: level,
         };
 
+        wsClient.sessionLanguage = language;
+        wsClient.sessionLevel = level;
+
         stateManager.setState('courseId', uploadedCourse.id);
         stateManager.setState('course', uploadedCourse);
         if (this.components.courseSelector) {
@@ -406,6 +632,8 @@ class SmartTeacherApp {
       this._setUploadBusy(false, 'Import échoué');
       this._renderUploadSelection();
       UIManager.showNotification(error.message || 'Import impossible', 'error');
+    } finally {
+      this._stopUploadStatusPolling();
     }
   }
 
@@ -456,36 +684,77 @@ class SmartTeacherApp {
   }
 
   _handleSlideData(data) {
-    const { title, text, image_url, slide_path, course, chapter, section, total_sections } = data;
-    const slideImageUrl = image_url || slide_path || null;
-    const courseTitle = course || stateManager.course?.name || 'Aucun cours';
+    const courseTitle = data.course || data.course_title || stateManager.course?.name || 'Aucun cours';
+    const chapterTitle = data.chapter
+      || data.chapter_title
+      || data.chapter_display
+      || (Number.isFinite(Number(data.chapter_number)) ? `Chapter ${Number(data.chapter_number)}` : 'Chapitre');
+    const slideTitle = data.title || data.section_title || data.slide_title || stateManager.slideTitle || 'Section';
+    const slideText = data.text || data.narration || data.content || 'Présentation en cours…';
+    const imageUrl = data.image_url || data.slide_path || null;
+    const progressCurrent = Number(data.progress?.current ?? data.section_number ?? data.section ?? data.section_index ?? 0);
+    const progressTotal = Number(data.progress?.total ?? data.total_sections ?? data.section_total ?? 0);
 
-    stateManager.setState('slideTitle', title);
-    stateManager.setState('slideText', text);
+    const chapterNumber = Number(data.chapter_number ?? data.progress?.chapter ?? data.chapter_index ?? 1);
+    const sectionNumber = Number(data.section_number ?? data.progress?.current ?? data.section ?? data.section_index ?? 1);
+
+    stateManager.setState('slideTitle', slideTitle);
+    stateManager.setState('slideText', slideText);
+    stateManager.setState('slidePath', imageUrl || '');
+    if (Number.isFinite(chapterNumber) && chapterNumber > 0) {
+      stateManager.setState('chapterIndex', chapterNumber - 1);
+    }
+    if (Number.isFinite(sectionNumber) && sectionNumber > 0) {
+      stateManager.setState('sectionIndex', sectionNumber - 1);
+    }
 
     if (this.components.slideViewer) {
-      this.components.slideViewer.displaySlide(title, text, slideImageUrl);
-      this.components.slideViewer.updateHeader(courseTitle, chapter || 'Chapitre');
-      this.components.slideViewer.updateProgress(section || 0, total_sections || 1);
+      this.components.slideViewer.displaySlide(slideTitle, slideText, imageUrl);
+      this.components.slideViewer.updateHeader(courseTitle, chapterTitle);
+      if (Number.isFinite(progressCurrent) && Number.isFinite(progressTotal) && progressTotal > 0) {
+        this.components.slideViewer.updateProgress(progressCurrent, progressTotal);
+      }
+      this.components.slideViewer.enableControls();
+    }
+
+    this._setQuestionStatus('presenting', 'Présentation en cours…');
+
+    if (this.components.chatPanel && slideText && slideText !== 'Présentation en cours…') {
+      this.components.chatPanel.addMessage(slideText, 't', 'Professeur');
     }
   }
 
   _handlePresentationStarted(data) {
     const courseTitle = data.course || stateManager.course?.name || 'Aucun cours';
-    const chapterTitle = data.chapter || 'Chapitre 1';
-    const sectionTitle = data.section || 'Section 1';
+    const chapterTitle = data.chapter
+      || data.chapter_title
+      || data.chapter_display
+      || (Number.isFinite(Number(data.chapter_number)) ? `Chapter ${Number(data.chapter_number)}` : 'Chapitre 1');
+    const sectionTitle = data.section || data.section_title || 'Section 1';
     const narration = data.narration || data.content || 'Présentation en cours…';
+    const imageUrl = this._normalizeImageUrl(data.image_url || data.slide_path || null);
     const reasoningTrace = this._normalizeReasoningTrace(
       data.reasoning || data.reasoning_trace || data.metrics?.reasoning_trace || []
     );
 
+    const chapterNumber = Number(data.chapter_number ?? data.chapter_index ?? 1);
+    const sectionNumber = Number(data.section_number ?? data.section ?? data.section_index ?? 1);
+
     stateManager.setState('activePanel', 'course');
     stateManager.setState('slideTitle', sectionTitle);
     stateManager.setState('slideText', narration);
+    if (Number.isFinite(chapterNumber) && chapterNumber > 0) {
+      stateManager.setState('chapterIndex', chapterNumber - 1);
+    }
+    if (Number.isFinite(sectionNumber) && sectionNumber > 0) {
+      stateManager.setState('sectionIndex', sectionNumber - 1);
+    }
+
+    this._setQuestionStatus('presenting', 'Présentation en cours…');
 
     if (this.components.slideViewer) {
       this.components.slideViewer.updateHeader(courseTitle, chapterTitle);
-      this.components.slideViewer.displaySlide(sectionTitle, narration, data.image_url || data.slide_path || null);
+      this.components.slideViewer.displaySlide(sectionTitle, narration, imageUrl);
       this.components.slideViewer.enableControls();
     }
 
@@ -510,9 +779,16 @@ class SmartTeacherApp {
   }
 
   _handleAudioStream(data) {
-    const { audio_data, mime_type, is_final, stream_id, turn_id } = data;
+    const { audio_data, mime_type, is_final, turn_id } = data;
+    const kind = turn_id !== null && turn_id !== undefined ? 'answer' : 'presentation';
 
-    audioManager.bufferAudioChunk(audio_data, mime_type, is_final, stream_id, turn_id);
+    if (audio_data) {
+      if (data.clip !== false) {
+        audioManager.enqueueAudioClip(audio_data, mime_type, kind);
+      } else {
+        audioManager.bufferAudioChunk(audio_data, mime_type, is_final, data.stream_id, turn_id);
+      }
+    }
 
     if (is_final) {
       this.components.slideViewer?.setWaveformState('off');
@@ -526,6 +802,10 @@ class SmartTeacherApp {
       if (is_final) {
         this.components.chatPanel.addMessage(text, 's', label || 'Étudiant');
       }
+    }
+
+    if (this.components.qaPanel && is_final) {
+      this.components.qaPanel.addMessage(text, 's', label || 'Étudiant');
     }
   }
 
@@ -549,6 +829,9 @@ class SmartTeacherApp {
       this.components.qaPanel.setReasoningTrace(reasoningTrace);
     }
 
+    const nextStatus = stateManager.activePanel === 'qa' ? 'responding' : 'presenting';
+    this._setQuestionStatus(nextStatus, answerText ? 'Réponse reçue' : 'Présentation');
+
     if (reasoningTrace.length) {
       const lastStage = reasoningTrace[reasoningTrace.length - 1] || {};
       stateManager.setState('lastStateMain', (lastStage.state || 'idle').toLowerCase());
@@ -561,7 +844,7 @@ class SmartTeacherApp {
   }
 
   _handleStatusUpdate(data) {
-    const { state, message } = data;
+    const { state, message, reasoning_step: reasoningStep } = data;
 
     const stateMap = {
       idle: 'idle',
@@ -574,9 +857,30 @@ class SmartTeacherApp {
     const mappedState = stateMap[state] || 'idle';
     this.components.slideViewer?.setWaveformState(mappedState);
     this.components.chatPanel?.setStatus(mappedState, message);
+    this.components.qaPanel?.setStatus(mappedState, message);
+
+    if (reasoningStep) {
+      this.components.chatPanel?.appendReasoningStep?.(reasoningStep);
+      if (typeof this.components.chatPanel?.expand === 'function') {
+        this.components.chatPanel.expand();
+      }
+      this.components.qaPanel?.appendReasoningStep?.(reasoningStep);
+    }
+  }
+
+  _handleInterrupt(data) {
+    audioManager.stopAudio();
+    const isSpeechInterrupt = data?.reason === 'student_speaking';
+    this.components.slideViewer?.setWaveformState(isSpeechInterrupt ? 'listening' : 'off');
+    this._setQuestionStatus(
+      isSpeechInterrupt ? 'listening' : 'idle',
+      isSpeechInterrupt ? 'Interruption détectée' : 'Lecture interrompue'
+    );
   }
 
   async askQuestion(text) {
+    this._interruptCurrentPlayback('typed_question');
+
     if (!wsClient.isConnected()) {
       UIManager.showNotification('WebSocket non connecté, impossible d\'envoyer la question.', 'error');
       return false;
@@ -597,6 +901,9 @@ class SmartTeacherApp {
 
   async selectCourse(courseId, course = null) {
     const selectedCourse = course || this.components.courseSelector?.courses?.find((item) => item.id === courseId) || stateManager.course;
+    const courseLanguage = selectedCourse?.language || wsClient.sessionLanguage || 'fr';
+
+    this._interruptCurrentPlayback('course_change');
 
     stateManager.setState('courseId', courseId);
     if (selectedCourse) {
@@ -605,6 +912,8 @@ class SmartTeacherApp {
     stateManager.setState('chapterIndex', 0);
     stateManager.setState('sectionIndex', 0);
     stateManager.setState('activePanel', 'course');
+
+    this.components.header?.enableQuizButton();
 
     this.components.slideViewer?.displaySlide(
       selectedCourse?.name || 'Cours sélectionné',
@@ -623,6 +932,7 @@ class SmartTeacherApp {
       course_id: courseId,
       chapter_index: 0,
       section_index: 0,
+      language: courseLanguage,
     });
 
     return true;
@@ -630,11 +940,17 @@ class SmartTeacherApp {
 
   pause() {
     stateManager.setState('paused', true);
+    const playbackSnapshot = this._interruptCurrentPlayback('user_pause');
+
     if (!wsClient.isConnected()) {
       return false;
     }
 
-    wsClient.send({ type: 'pause', reason: 'user_request' });
+    wsClient.send({
+      type: 'pause',
+      reason: 'user_request',
+      playback_snapshot: playbackSnapshot,
+    });
     return true;
   }
 
@@ -653,6 +969,8 @@ class SmartTeacherApp {
       return false;
     }
 
+    this._interruptCurrentPlayback('slide_change');
+
     const nextSectionIndex = (stateManager.sectionIndex || 0) + 1;
     stateManager.setState('sectionIndex', nextSectionIndex);
 
@@ -661,6 +979,7 @@ class SmartTeacherApp {
       course_id: stateManager.courseId,
       chapter_index: stateManager.chapterIndex || 0,
       section_index: nextSectionIndex,
+      language: wsClient.sessionLanguage || stateManager.course?.language || 'fr',
     });
 
     return true;
@@ -671,6 +990,8 @@ class SmartTeacherApp {
       return false;
     }
 
+    this._interruptCurrentPlayback('slide_change');
+
     const previousSectionIndex = Math.max(0, (stateManager.sectionIndex || 0) - 1);
     stateManager.setState('sectionIndex', previousSectionIndex);
 
@@ -679,6 +1000,7 @@ class SmartTeacherApp {
       course_id: stateManager.courseId,
       chapter_index: stateManager.chapterIndex || 0,
       section_index: previousSectionIndex,
+      language: wsClient.sessionLanguage || stateManager.course?.language || 'fr',
     });
 
     return true;
@@ -691,6 +1013,17 @@ class SmartTeacherApp {
     if (Array.isArray(reasoning.trace)) return reasoning.trace;
     if (Array.isArray(reasoning.stages)) return reasoning.stages;
     return [];
+  }
+
+  _normalizeImageUrl(url) {
+    if (!url) return null;
+
+    const value = String(url).trim();
+    if (/^(https?:)?\/\//i.test(value) || value.startsWith('/') || value.startsWith('data:')) {
+      return value;
+    }
+
+    return null;
   }
 }
 

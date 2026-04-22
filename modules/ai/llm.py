@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+import threading
 from difflib import SequenceMatcher
 
 import requests
@@ -374,8 +375,14 @@ class Brain:
         throttler["call_count"] += 1
         return True, ""
 
-    def _call_ollama_sync(self, prompt: str, temperature: float = 0.7, max_tokens: int = 400) -> str | None:
-        """Appel synchrone à Ollama via HTTP."""
+    def _call_ollama_sync(
+        self,
+        prompt: str,
+        temperature: float = 0.7,
+        max_tokens: int = 400,
+        cancel_event: threading.Event | None = None,
+    ) -> str | None:
+        """Appel synchrone à Ollama via HTTP, avec annulation coopérative."""
         if not self.fallback or not self.fallback.available:
             return None
 
@@ -386,17 +393,40 @@ class Brain:
                 "prompt": prompt,
                 "temperature": temperature,
                 "num_predict": max_tokens,
-                "stream": False,
+                "stream": True,
             }
             response = requests.post(
                 f"{self.fallback.base_url}/api/generate",
                 json=payload,
-                timeout=None,
+                stream=True,
+                timeout=(5, 15),
             )
 
             if response.status_code == 200:
-                result = response.json()
-                answer = result.get("response", "").strip()
+                chunks: list[str] = []
+                try:
+                    for line in response.iter_lines(decode_unicode=True):
+                        if cancel_event and cancel_event.is_set():
+                            log.info("🛑 Ollama annulé avant fin de génération")
+                            response.close()
+                            return None
+                        if not line:
+                            continue
+
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        text = str(chunk.get("response", "") or "")
+                        if text:
+                            chunks.append(text)
+                        if chunk.get("done"):
+                            break
+                finally:
+                    response.close()
+
+                answer = "".join(chunks).strip()
                 if answer:
                     log.info(f"✅ Ollama réponse : {len(answer)} chars")
                     return answer
@@ -511,6 +541,60 @@ class Brain:
         log.error("❌ LLM indisponible (OpenAI + Ollama échoué) — Vérifiez: docker-compose up -d")
         return "Je n'ai pas pu générer de réponse pour le moment. Réessayez dans un instant.", time.time() - start
 
+    async def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.7,
+        max_tokens: int = 400,
+    ) -> str:
+        """Backward-compatible generic generation helper.
+
+        Older services still call `generate(...)` directly. This wrapper keeps
+        those call sites working while routing through the same OpenAI/Ollama
+        backends used elsewhere in this module.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return ""
+
+        start = time.time()
+
+        if self.client:
+            try:
+                log.info("🤖 Generic generation: OpenAI...")
+                response = self.client.chat.completions.create(
+                    model=Config.GPT_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                answer = self._clean_for_speech(response.choices[0].message.content or "")
+                answer = self._dedupe_answer_text(answer)
+                duration = time.time() - start
+                log.info(f"✅ OpenAI generate OK | {duration:.2f}s | {len(answer)} chars")
+                return answer
+            except Exception as openai_err:
+                if self._should_disable_openai(openai_err):
+                    self._disable_openai(str(openai_err))
+                log.warning(f"⚠️  OpenAI generate failed: {openai_err} → Fallback Ollama...")
+
+        if self.fallback and self.fallback.available:
+            log.info("🖥️ Generic generation: Ollama fallback...")
+            answer = self._call_ollama_sync(
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if answer:
+                answer = self._clean_for_speech(answer)
+                answer = self._dedupe_answer_text(answer)
+                duration = time.time() - start
+                log.info(f"✅ Ollama generate OK | {duration:.2f}s | {len(answer)} chars")
+                return answer
+
+        log.error("❌ LLM generic generation unavailable")
+        return ""
+
     def label_confusion(
         self,
         text: str,
@@ -612,6 +696,7 @@ class Brain:
         section_title: str = "",
         domain: str | None = None,
         session_id: str | None = None,  # ✅ For rate limiting
+        cancel_event: threading.Event | None = None,
     ) -> tuple[str, float]:
         """Présente une slide ou section de cours oralement."""
         # ✅ Check rate limit before proceeding
@@ -672,6 +757,7 @@ class Brain:
                 prompt=fallback_prompt,
                 temperature=0.7,
                 max_tokens=300,
+                cancel_event=cancel_event,
             )
 
             if answer:

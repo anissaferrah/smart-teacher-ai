@@ -13,6 +13,7 @@
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 import logging, time, json
+from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger("SmartTeacher.Dashboard")
@@ -87,26 +88,59 @@ def _format_pointer_detail(event: dict) -> str:
 @router.get("/stats")
 async def get_stats():
     """Statistiques globales pour le dashboard."""
-    total    = len(_SESSIONS_CACHE)
-    kpi_ok   = sum(1 for e in _SESSIONS_CACHE if e.get("meets_kpi"))
-    avg_time = (sum(e.get("total_time", 0) for e in _SESSIONS_CACHE) / total) if total else 0
+    total = len(_SESSIONS_CACHE)
+    kpi_ok = sum(1 for e in _SESSIONS_CACHE if e.get("meets_kpi"))
+    avg_time = (sum(float(e.get("total_time", 0) or 0) for e in _SESSIONS_CACHE) / total) if total else 0
 
-    # Par langue
     langs: dict[str, int] = {}
     for e in _SESSIONS_CACHE:
-        l = e.get("language", "unknown")
-        langs[l] = langs.get(l, 0) + 1
+        lang = e.get("language", "unknown")
+        langs[lang] = langs.get(lang, 0) + 1
 
-    # Par matière
     subjects: dict[str, int] = {}
     for e in _SESSIONS_CACHE:
-        s = e.get("subject") or "unknown"
-        subjects[s] = subjects.get(s, 0) + 1
+        subject = e.get("subject") or "unknown"
+        subjects[subject] = subjects.get(subject, 0) + 1
 
-    # Tentatives PostgreSQL
+    cache_sessions = len({e.get("session_id", "") for e in _SESSIONS_CACHE if e.get("session_id")})
+    cache_last_24h = sum(1 for e in _SESSIONS_CACHE if time.time() - float(e.get("ts", 0) or 0) < 86400)
+
+    analytics_total = 0
+    analytics_kpi_rate = 0.0
+    analytics_avg_time = 0.0
+    analytics_sessions = 0
+    analytics_last_24h = 0
+
+    try:
+        from services.app_state import analytics_service
+
+        analytics_report = analytics_service.full_report() or {}
+        analytics_kpi = analytics_report.get("kpi") or {}
+        analytics_total = int(analytics_kpi.get("total") or analytics_report.get("total_events") or 0)
+        analytics_kpi_rate = float(analytics_kpi.get("kpi_rate_pct") or 0)
+        analytics_avg_time = float(analytics_kpi.get("avg_time") or 0)
+        analytics_sessions = len({
+            getattr(event, "session_id", None)
+            for event in getattr(analytics_service, "_cache", [])
+            if getattr(event, "session_id", None)
+        })
+
+        cutoff_dt = datetime.utcnow().timestamp() - 86400
+        analytics_last_24h = sum(
+            1
+            for event in getattr(analytics_service, "_cache", [])
+            if getattr(event, "event_time", None)
+            and datetime.fromisoformat(event.event_time).timestamp() > cutoff_dt
+        )
+    except Exception:
+        pass
+
+    total_db = 0
+    sessions_db = 0
     try:
         from database.core import AsyncSessionLocal
         from sqlalchemy import text
+
         async with AsyncSessionLocal() as db:
             r = await db.execute(text("SELECT COUNT(*) FROM interactions"))
             total_db = r.scalar() or 0
@@ -114,16 +148,22 @@ async def get_stats():
             sessions_db = r2.scalar() or 0
     except Exception:
         total_db = total
-        sessions_db = len(set(e.get("session_id","") for e in _SESSIONS_CACHE))
+        sessions_db = cache_sessions
+
+    total_interactions = max(int(total_db or 0), int(total or 0), int(analytics_total or 0))
+    total_sessions = max(int(sessions_db or 0), int(cache_sessions or 0), int(analytics_sessions or 0))
+
+    final_kpi_rate = round(analytics_kpi_rate if analytics_total else (kpi_ok / total * 100 if total else 0), 1)
+    final_avg_time = round(analytics_avg_time if analytics_total else avg_time, 2)
 
     return {
-        "total_interactions": total_db,
-        "total_sessions":     sessions_db,
-        "kpi_rate_pct":       round(kpi_ok / total * 100, 1) if total else 0,
-        "avg_response_time":  round(avg_time, 2),
-        "by_language":        langs,
-        "by_subject":         subjects,
-        "last_24h":           sum(1 for e in _SESSIONS_CACHE if time.time() - e.get("ts",0) < 86400),
+        "total_interactions": total_interactions,
+        "total_sessions": total_sessions,
+        "kpi_rate_pct": final_kpi_rate,
+        "avg_response_time": final_avg_time,
+        "by_language": langs,
+        "by_subject": subjects,
+        "last_24h": max(cache_last_24h, analytics_last_24h),
     }
 
 
@@ -176,24 +216,47 @@ async def get_active_sessions():
 @router.get("/analytics")
 async def get_analytics():
     """Métriques d'apprentissage détaillées."""
+    try:
+        from services.app_state import analytics_service
+
+        report = analytics_service.full_report() or {}
+        kpi = report.get("kpi") or {}
+        total = int(kpi.get("total") or 0)
+        if total:
+            avg_time = round(float(kpi.get("avg_time") or 0), 2)
+            return {
+                "total_time": {"min": avg_time, "max": avg_time, "avg": avg_time},
+                "stt_time": {"avg": round(float(kpi.get("avg_stt") or 0), 2)},
+                "llm_time": {"avg": round(float(kpi.get("avg_llm") or 0), 2)},
+                "tts_time": {"avg": round(float(kpi.get("avg_tts") or 0), 2)},
+                "kpi_threshold_s": 5.0,
+                "kpi_rate_pct": round(float(kpi.get("kpi_rate_pct") or 0), 1),
+            }
+    except Exception:
+        pass
+
     if not _SESSIONS_CACHE:
         return {"message": "Pas encore de données"}
 
     times = [e["total_time"] for e in _SESSIONS_CACHE if e.get("total_time")]
-    stt_t = [e["stt_time"]   for e in _SESSIONS_CACHE if e.get("stt_time")]
-    llm_t = [e["llm_time"]   for e in _SESSIONS_CACHE if e.get("llm_time")]
-    tts_t = [e["tts_time"]   for e in _SESSIONS_CACHE if e.get("tts_time")]
+    stt_t = [e["stt_time"] for e in _SESSIONS_CACHE if e.get("stt_time")]
+    llm_t = [e["llm_time"] for e in _SESSIONS_CACHE if e.get("llm_time")]
+    tts_t = [e["tts_time"] for e in _SESSIONS_CACHE if e.get("tts_time")]
 
     def stats(lst):
-        if not lst: return {}
-        return {"min": round(min(lst),2), "max": round(max(lst),2),
-                "avg": round(sum(lst)/len(lst),2)}
+        if not lst:
+            return {}
+        return {
+            "min": round(min(lst), 2),
+            "max": round(max(lst), 2),
+            "avg": round(sum(lst) / len(lst), 2),
+        }
 
     return {
         "total_time": stats(times),
-        "stt_time":   stats(stt_t),
-        "llm_time":   stats(llm_t),
-        "tts_time":   stats(tts_t),
+        "stt_time": stats(stt_t),
+        "llm_time": stats(llm_t),
+        "tts_time": stats(tts_t),
         "kpi_threshold_s": 5.0,
         "kpi_rate_pct": round(sum(1 for e in _SESSIONS_CACHE if e.get("meets_kpi")) / len(_SESSIONS_CACHE) * 100, 1),
     }
@@ -915,8 +978,30 @@ async function loadQuestions() {
   } catch(e) { console.error(e); }
 }
 
+let dashboardPollTimer = null;
+
+function startDashboardPolling() {
+  if (dashboardPollTimer) return;
+  dashboardPollTimer = setInterval(loadAll, 60000);
+}
+
+function stopDashboardPolling() {
+  if (!dashboardPollTimer) return;
+  clearInterval(dashboardPollTimer);
+  dashboardPollTimer = null;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopDashboardPolling();
+    return;
+  }
+  loadAll();
+  startDashboardPolling();
+});
+
 loadAll();
-setInterval(loadAll, 30000);
+startDashboardPolling();
 </script>
 </body>
 </html>"""

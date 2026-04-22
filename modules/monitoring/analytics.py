@@ -94,6 +94,7 @@ class AnalyticsEngine:
         self._ch     = None
         self._use_ch = False
         self._ch_initialized = False  # Track if initialization was attempted
+        self._ch_password_in_use = CH_PASSWORD
         self._cache: list[LearningEvent] = []
         CSV_DIR.mkdir(parents=True, exist_ok=True)
         self._csv_path = CSV_DIR / f"events_{date.today().isoformat()}.csv"
@@ -112,15 +113,36 @@ class AnalyticsEngine:
 
         try:
             probe_url = f"http://{CH_HOST}:{CH_PORT}/?query=SELECT%201"
-            request = Request(probe_url)
-            if CH_PASSWORD:
-                credentials = f"{CH_USER}:{CH_PASSWORD}".encode("utf-8")
-                request.add_header("Authorization", f"Basic {base64.b64encode(credentials).decode('ascii')}")
+            candidate_passwords: list[str] = []
+            if CH_PASSWORD not in candidate_passwords:
+                candidate_passwords.append(CH_PASSWORD)
+            if "" not in candidate_passwords:
+                candidate_passwords.append("")
+            if "smart_teacher" not in candidate_passwords:
+                candidate_passwords.append("smart_teacher")
 
-            with urlopen(request, timeout=1.5) as response:
-                body = response.read().decode("utf-8", errors="ignore").strip().lower()
-                if response.status != 200 or body not in {"1", "1\n"}:
-                    raise RuntimeError(f"unexpected ping response: {response.status} {body!r}")
+            last_probe_error: Exception | None = None
+            connected = False
+
+            for candidate_password in candidate_passwords:
+                request = Request(probe_url)
+                if candidate_password:
+                    credentials = f"{CH_USER}:{candidate_password}".encode("utf-8")
+                    request.add_header("Authorization", f"Basic {base64.b64encode(credentials).decode('ascii')}")
+
+                try:
+                    with urlopen(request, timeout=1.5) as response:
+                        body = response.read().decode("utf-8", errors="ignore").strip().lower()
+                        if response.status == 200 and body in {"1", "1\n"}:
+                            self._ch_password_in_use = candidate_password
+                            connected = True
+                            break
+                        last_probe_error = RuntimeError(f"unexpected ping response: {response.status} {body!r}")
+                except Exception as exc:
+                    last_probe_error = exc
+
+            if not connected:
+                raise last_probe_error or RuntimeError("ClickHouse ping failed")
         except HTTPError as exc:
             log.info("📊 ClickHouse indisponible sur %s:%s (%s) → analytics CSV + mémoire", CH_HOST, CH_PORT, exc)
             return
@@ -135,7 +157,7 @@ class AnalyticsEngine:
             import clickhouse_connect
             self._ch = clickhouse_connect.get_client(
                 host=CH_HOST, port=CH_PORT,
-                database=CH_DB, username=CH_USER, password=CH_PASSWORD,
+                database=CH_DB, username=CH_USER, password=self._ch_password_in_use,
                 connect_timeout=2,  # Short timeout to avoid blocking
                 send_receive_timeout=2,
             )

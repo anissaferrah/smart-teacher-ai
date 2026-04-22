@@ -18,7 +18,7 @@ export class Header extends BaseComponent {
       <div class="nav-tabs" id="navTabs">
         <button class="nav-tab active" data-panel="course">📖 Cours</button>
         <button class="nav-tab" data-panel="library">📚 Mes Cours</button>
-        <button class="nav-tab" id="quizBtn" data-panel="qa" disabled>📝 Q&A</button>
+        <button class="nav-tab" id="quizBtn" data-panel="quiz" disabled>📝 Quiz</button>
       </div>
       <div class="nav-status">
         <div class="status-dot" id="statusDot"></div>
@@ -34,9 +34,35 @@ export class Header extends BaseComponent {
     const tabs = this.queryAll('.nav-tab[data-panel]');
     tabs.forEach((tab) => {
       tab.addEventListener('click', () => {
+        if (tab.dataset.panel === 'quiz') {
+          this._openQuizPage();
+          return;
+        }
+
         this._switchPanel(tab.dataset.panel);
       });
     });
+  }
+
+  _openQuizPage() {
+    const course = stateManager.course || {};
+    const params = new URLSearchParams({
+      course_id: stateManager.courseId || '',
+      chapter_index: String(stateManager.chapterIndex ?? 0),
+      section_index: String(stateManager.sectionIndex ?? 0),
+      chapter: course.chapter || course.chapter_title || `Chapitre ${Number(stateManager.chapterIndex || 0) + 1}`,
+      section_title: stateManager.slideTitle || '',
+      slide_title: stateManager.slideTitle || '',
+      slide_content: stateManager.slideText || '',
+      slide_path: stateManager.slidePath || '',
+      image_url: stateManager.slidePath || '',
+      course_title: course.name || course.title || '',
+      course_domain: course.domain || '',
+      language: course.language || 'fr',
+      level: course.level || 'lycée',
+    });
+
+    window.open(`/static/quiz.html?${params.toString()}`, '_blank', 'noopener,noreferrer');
   }
 
   _switchPanel(panelName) {

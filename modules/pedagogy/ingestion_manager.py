@@ -25,6 +25,8 @@ class IngestionStatus:
     total_chunks: int = 0
     processed_files: int = 0
     total_files: int = 0
+    current_step: str = ""
+    stage: str = ""
     error_message: Optional[str] = None
     start_time: float = field(default_factory=time.time)
     end_time: Optional[float] = None
@@ -41,6 +43,8 @@ class IngestionStatus:
             "total_chunks": self.total_chunks,
             "processed_files": self.processed_files,
             "total_files": self.total_files,
+            "current_step": self.current_step,
+            "stage": self.stage,
             "error_message": self.error_message,
             "elapsed_seconds": round(self.elapsed_seconds, 2),
         }
@@ -61,12 +65,14 @@ class IngestionManager:
         self._lock = asyncio.Lock()
         self._current_task: Optional[asyncio.Task] = None
     
-    async def start_ingestion(self, total_files: int) -> None:
+    async def start_ingestion(self, total_files: int, current_step: str = "Initialisation…") -> None:
         """Démarre un nouvelle ingestion"""
         async with self._lock:
             self.status = IngestionStatus(
                 state=IngestionState.PROCESSING,
                 total_files=total_files,
+                current_step=current_step,
+                stage="init",
                 start_time=time.time()
             )
             log.info(f"🚀 Ingestion démarrée ({total_files} fichiers)")
@@ -75,13 +81,19 @@ class IngestionManager:
         self,
         processed_files: int,
         chunks_count: int,
-        progress_percent: int
+        progress_percent: int,
+        current_step: Optional[str] = None,
+        stage: Optional[str] = None,
     ) -> None:
         """Met à jour la progression"""
         async with self._lock:
             self.status.processed_files = processed_files
             self.status.total_chunks = chunks_count
             self.status.progress = min(100, progress_percent)
+            if current_step is not None:
+                self.status.current_step = current_step
+            if stage is not None:
+                self.status.stage = stage
             log.debug(f"📊 Progress: {progress_percent}% ({processed_files}/{self.status.total_files} files, {chunks_count} chunks)")
     
     async def complete_ingestion(self, total_chunks: int) -> None:
@@ -90,6 +102,8 @@ class IngestionManager:
             self.status.state = IngestionState.READY
             self.status.progress = 100
             self.status.total_chunks = total_chunks
+            self.status.current_step = "Import terminé"
+            self.status.stage = "done"
             self.status.end_time = time.time()
             log.info(f"✅ Ingestion complétée | {total_chunks} chunks | {self.status.elapsed_seconds:.1f}s")
     
@@ -98,6 +112,8 @@ class IngestionManager:
         async with self._lock:
             self.status.state = IngestionState.ERROR
             self.status.error_message = error_message
+            self.status.current_step = "Erreur pendant l'import"
+            self.status.stage = "error"
             self.status.end_time = time.time()
             log.error(f"❌ Ingestion échouée: {error_message}")
     

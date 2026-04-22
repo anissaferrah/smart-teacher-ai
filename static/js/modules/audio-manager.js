@@ -38,6 +38,7 @@ class AudioManager {
 
     const labels = {
       'off': 'En attente',
+      'presenting': 'Présentation en cours',
       'speaking': 'Professeur parle',
       'listening': 'En écoute',
       'processing': 'Traitement...',
@@ -61,7 +62,7 @@ class AudioManager {
           height = 8 + Math.sin(Date.now() / 200 + i * 0.4) * 14 + Math.random() * 5;
         } else if (state === 'listening') {
           height = 4 + Math.random() * 18;
-        } else if (state === 'processing') {
+        } else if (state === 'processing' || state === 'presenting') {
           height = 4 + Math.abs(Math.sin(Date.now() / 400 + i * 0.5)) * 8;
         }
 
@@ -87,9 +88,7 @@ class AudioManager {
 
     if (stateManager.currentAudio || !stateManager.audioQueue.length) {
       if (!stateManager.currentAudio && !stateManager.audioQueue.length) {
-        if (stateManager.audioBuffer.length === 0) {
-          // Resume presentation or show completion
-        }
+        this.animateWaveform('off');
       }
       return;
     }
@@ -108,7 +107,11 @@ class AudioManager {
       } catch (e) {}
       stateManager.currentAudio = null;
       stateManager.currentAudioKind = null;
-      this.playQueuedAudio();
+      if (stateManager.audioQueue.length) {
+        this.playQueuedAudio();
+      } else {
+        this.animateWaveform('off');
+      }
     };
 
     audio.onerror = () => {
@@ -118,10 +121,14 @@ class AudioManager {
       } catch (e) {}
       stateManager.currentAudio = null;
       stateManager.currentAudioKind = null;
-      this.playQueuedAudio();
+      if (stateManager.audioQueue.length) {
+        this.playQueuedAudio();
+      } else {
+        this.animateWaveform('off');
+      }
     };
 
-    this.animateWaveform('speaking');
+    this.animateWaveform(kind === 'presentation' ? 'presenting' : 'speaking');
     stateManager.currentAudio = audio;
 
     const playPromise = audio.play();
@@ -140,6 +147,7 @@ class AudioManager {
 
   // Stop audio playback
   stopAudio() {
+    const playbackSnapshot = this._captureCurrentAudioSnapshot();
     stateManager.answerAudioPaused = false;
     stateManager.currentAudioKind = null;
 
@@ -165,6 +173,50 @@ class AudioManager {
     stateManager.audioBuffer = [];
 
     this.animateWaveform('off');
+
+    return playbackSnapshot;
+  }
+
+  _captureCurrentAudioSnapshot() {
+    if (!stateManager.currentAudio) {
+      return null;
+    }
+
+    const currentTime = Number.isFinite(stateManager.currentAudio.currentTime)
+      ? stateManager.currentAudio.currentTime
+      : 0;
+    const duration = Number.isFinite(stateManager.currentAudio.duration)
+      ? stateManager.currentAudio.duration
+      : 0;
+
+    return {
+      kind: stateManager.currentAudioKind || 'presentation',
+      currentTime,
+      duration,
+      playbackRatio: duration > 0 ? currentTime / duration : 0,
+    };
+  }
+
+  // Add a full audio clip to the queue and play it as soon as possible
+  enqueueAudioClip(base64Data, mimeType, kind = 'presentation') {
+    if (!base64Data) return;
+
+    try {
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      const blob = new Blob([bytes], { type: mimeType || 'audio/mpeg' });
+      const objectUrl = URL.createObjectURL(blob);
+
+      stateManager.audioQueue.push(objectUrl);
+      stateManager.audioQueueKinds.push(kind);
+      this.playQueuedAudio();
+    } catch (error) {
+      console.error('Audio clip decode error:', error);
+    }
   }
 
   // Add audio chunk to buffer

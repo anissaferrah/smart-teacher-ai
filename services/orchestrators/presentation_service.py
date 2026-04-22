@@ -11,6 +11,7 @@ Responsibilities:
 import asyncio
 import logging
 import uuid
+import threading
 from typing import Optional, Tuple, Dict, Any
 from datetime import datetime
 
@@ -93,8 +94,10 @@ class PresentationService:
                     course_title=course_struct.title or "",
                     course_domain=course_struct.domain or "",
                     chapter_index=chapter_index,
+                    chapter_number=int(chapter.order or (chapter_index + 1)),
                     chapter_title=chapter.title or "",
                     section_index=section_index,
+                    section_number=int(section.order or (section_index + 1)),
                     section_title=section.title or "",
                     slide_path=slide_path,
                     slide_content=section.content or "",
@@ -108,6 +111,7 @@ class PresentationService:
         slide: CourseSlide,
         student_profile,
         language: str,
+        cancel_event: threading.Event | None = None,
     ) -> Tuple[str, bytes]:
         """Generate focused narration for a slide.
         
@@ -137,19 +141,28 @@ class PresentationService:
                     chapter_title=slide.chapter_title,
                     section_title=slide.section_title,
                     domain=slide.course_domain or None,
+                    cancel_event=cancel_event,
                 )
                 self.narration_cache[cache_key] = narration
+
+            if cancel_event and cancel_event.is_set():
+                return "", b""
             
             # Check audio cache
             if cache_key in self.audio_cache:
                 audio_bytes = self.audio_cache[cache_key]
             else:
+                if cancel_event and cancel_event.is_set():
+                    return "", b""
+
                 # Generate audio using TTS
                 audio_bytes, _duration, _engine, _voice, _mime = await self.voice.generate_audio_async(
                     narration,
                     language=language,
                     rate_override="+0%" if not settings.realtime_session.enable_rate_adaptation else "+10%",
                 )
+                if cancel_event and cancel_event.is_set():
+                    return "", b""
                 audio_bytes = audio_bytes or b""
                 self.audio_cache[cache_key] = audio_bytes
             

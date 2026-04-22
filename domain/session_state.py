@@ -27,6 +27,9 @@ class DialogState(str, Enum):
     
     # Processing: STT + RAG + LLM (no audio feedback)
     PROCESSING = "processing"
+
+    # Presenting: course narration playback in progress
+    PRESENTING = "presenting"
     
     # Responding: TTS playback of AI response
     RESPONDING = "responding"
@@ -43,12 +46,13 @@ class DialogState(str, Enum):
 
 # Valid state transitions (strict)
 STATE_TRANSITIONS: Dict[DialogState, Set[DialogState]] = {
-    DialogState.WAITING: {DialogState.IDLE, DialogState.LISTENING, DialogState.ENDED},
-    DialogState.IDLE: {DialogState.WAITING, DialogState.LISTENING, DialogState.ENDED},
-    DialogState.LISTENING: {DialogState.PROCESSING, DialogState.IDLE, DialogState.PAUSED},
+    DialogState.WAITING: {DialogState.IDLE, DialogState.LISTENING, DialogState.PRESENTING, DialogState.ENDED},
+    DialogState.IDLE: {DialogState.WAITING, DialogState.LISTENING, DialogState.PRESENTING, DialogState.ENDED},
+    DialogState.PRESENTING: {DialogState.LISTENING, DialogState.PAUSED, DialogState.IDLE, DialogState.ENDED},
+    DialogState.LISTENING: {DialogState.PROCESSING, DialogState.IDLE, DialogState.PAUSED, DialogState.PRESENTING},
     DialogState.PROCESSING: {DialogState.RESPONDING, DialogState.IDLE, DialogState.PAUSED},
-    DialogState.RESPONDING: {DialogState.LISTENING, DialogState.IDLE, DialogState.PAUSED, DialogState.ENDED},
-    DialogState.PAUSED: {DialogState.IDLE, DialogState.LISTENING, DialogState.ENDED},
+    DialogState.RESPONDING: {DialogState.LISTENING, DialogState.IDLE, DialogState.PAUSED, DialogState.PRESENTING, DialogState.ENDED},
+    DialogState.PAUSED: {DialogState.IDLE, DialogState.LISTENING, DialogState.PRESENTING, DialogState.ENDED},
     DialogState.ENDED: set(),  # Terminal state
 }
 
@@ -75,8 +79,10 @@ class CourseSlide:
     course_title: str = ""
     course_domain: str = ""
     chapter_index: int = 0
+    chapter_number: int = 1
     chapter_title: str = ""
     section_index: int = 0
+    section_number: int = 1
     section_title: str = ""
     slide_path: str = ""
     slide_content: str = ""

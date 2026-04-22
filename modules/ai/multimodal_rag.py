@@ -638,6 +638,41 @@ class MultiModalRAG:
         log.info(f"✅ {len(top_results)} chunks retenus (avg confidence: {sum(s[1] for s in top_results)/max(1,len(top_results)):.2f})")
         return top_results
 
+    async def retrieve(
+        self,
+        query: str,
+        course_id: str | None = None,
+        top_k: int = 5,
+        chapter_idx: int | None = None,
+        strict_chapter: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Compatibility API used by QA service.
+
+        Returns normalized retrieval payloads with content/score/metadata and the
+        original Document object for advanced generation paths.
+        """
+        scored_chunks = self.retrieve_chunks(
+            query=query,
+            k=top_k,
+            current_chapter_idx=chapter_idx,
+            strict_chapter=strict_chapter,
+            course_id=course_id,
+        )
+
+        normalized: list[dict[str, Any]] = []
+        for doc, confidence, source_info in scored_chunks:
+            normalized.append(
+                {
+                    "content": doc.page_content,
+                    "score": float(confidence),
+                    "source": source_info,
+                    "metadata": dict(doc.metadata or {}),
+                    "document": doc,
+                }
+            )
+
+        return normalized
+
     def _vector_search(
         self, query: str, k: int,
         chapter_filter: int | None = None,

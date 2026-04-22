@@ -106,11 +106,12 @@ class UnifiedConfusionDetector:
                 repetition_score * 0.3
             )
         
-        # Determine reason
-        reason = self._determine_reason(signals, language)
+        is_confused = confidence > self.threshold
+        # Keep reason consistent with boolean outcome to avoid contradictory logs.
+        reason = self._determine_reason(signals, language) if is_confused else ""
         
         return {
-            "is_confused": confidence > self.threshold,
+            "is_confused": is_confused,
             "confidence": round(min(confidence, 1.0), 3),
             "reason": reason,
             "signals": {k: round(v, 3) for k, v in signals.items()},

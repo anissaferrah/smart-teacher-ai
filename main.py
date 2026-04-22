@@ -151,6 +151,12 @@ app.include_router(profile_api.router, prefix="/profile", tags=["profile"])
 app.include_router(course_api.router, prefix="", tags=["course"])
 
 
+@app.get("/dashboard/services")
+async def dashboard_services_alias():
+    """Compatibility alias for the dashboard services overview."""
+    return await health_api.get_dashboard_service_overview()
+
+
 @app.get("/")
 async def root():
     """API root endpoint."""

@@ -65,7 +65,7 @@ class Config:
     MAX_HISTORY_TURNS: int = int(os.getenv("MAX_HISTORY_TURNS", "10"))
 
     # RAG (Retrieval-Augmented Generation)
-    RAG_ENABLED: bool = os.getenv("RAG_ENABLED", "false").lower() == "true"  # Disabled temporarily (OpenAI quota)
+    RAG_ENABLED: bool = os.getenv("RAG_ENABLED", "true").lower() == "true"
     RAG_MODE: str = os.getenv("RAG_MODE", "classic")  # "classic" or "agentic"
     AGENTIC_MAX_LOOPS: int = int(os.getenv("AGENTIC_MAX_LOOPS", "3"))  # Reflection refinement loops
     RAG_NUM_RESULTS: int = int(os.getenv("RAG_NUM_RESULTS", "5"))

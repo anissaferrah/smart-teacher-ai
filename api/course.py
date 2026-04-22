@@ -84,20 +84,42 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
     if not files:
         raise HTTPException(status_code=400, detail="Aucun fichier fourni")
 
+    total_files = len(files)
+    await ingestion_service.start_ingestion(total_files, current_step="Préparation de l'import…")
+
     results = []
 
     files_to_index: list[dict] = []
 
-    for uploaded_file in files:
+    for index, uploaded_file in enumerate(files, start=1):
         raw_upload_name = (uploaded_file.filename or "upload.pdf").replace("\\", "/")
         upload_filename = Path(raw_upload_name).name or f"upload_{uuid.uuid4().hex[:8]}.pdf"
         payload = await uploaded_file.read()
         temp_path: Path | None = None
 
+        file_start = int(((index - 1) / max(total_files, 1)) * 90)
+        file_end = int((index / max(total_files, 1)) * 90)
+
+        await ingestion_service.update_progress(
+            processed_files=index - 1,
+            chunks_count=0,
+            progress_percent=max(1, file_start + 2),
+            current_step=f"[{index}/{total_files}] Lecture du fichier {upload_filename}",
+            stage="read_file",
+        )
+
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=Path(upload_filename).suffix or ".pdf") as tmp:
                 tmp.write(payload)
                 temp_path = Path(tmp.name)
+
+            await ingestion_service.update_progress(
+                processed_files=index - 1,
+                chunks_count=0,
+                progress_percent=max(file_start + 6, file_start + 2),
+                current_step=f"[{index}/{total_files}] Analyse du contenu ({upload_filename})",
+                stage="extract_content",
+            )
 
             detected_domain, detected_course = auto_detect_course(str(temp_path))
             target_domain = detected_domain if detected_domain != "general" else domain
@@ -144,6 +166,14 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
             destination = target_dir / upload_filename
             destination.write_bytes(payload)
 
+            await ingestion_service.update_progress(
+                processed_files=index - 1,
+                chunks_count=0,
+                progress_percent=max(file_start + 18, file_start + 2),
+                current_step=f"[{index}/{total_files}] Sauvegarde locale du cours",
+                stage="save_local",
+            )
+
             media_upload_path = ""
             try:
                 media_upload_path = media_service.upload_bytes(
@@ -158,6 +188,14 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                     exc,
                 )
 
+            await ingestion_service.update_progress(
+                processed_files=index - 1,
+                chunks_count=0,
+                progress_percent=max(file_start + 32, file_start + 2),
+                current_step=f"[{index}/{total_files}] Construction de la structure pédagogique",
+                stage="build_structure",
+            )
+
             course_data = await builder.build_from_file_direct(
                 str(destination),
                 language=language,
@@ -170,6 +208,13 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
 
             course_id = None
             db_error = None
+            await ingestion_service.update_progress(
+                processed_files=index - 1,
+                chunks_count=0,
+                progress_percent=max(file_start + 48, file_start + 2),
+                current_step=f"[{index}/{total_files}] Enregistrement base de données",
+                stage="save_database",
+            )
             try:
                 async with AsyncSessionLocal() as db:
                     course_id = await builder.save_to_database(course_data, db, domain=target_domain)
@@ -202,8 +247,24 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 "status": "ok" if db_error is None else "partial",
                 "db_error": db_error,
             })
+
+            await ingestion_service.update_progress(
+                processed_files=index,
+                chunks_count=0,
+                progress_percent=max(file_end - 2, file_start + 2),
+                current_step=f"[{index}/{total_files}] Fichier traité: {upload_filename}",
+                stage="file_done",
+            )
         except Exception as exc:
             results.append({"file": uploaded_file.filename, "status": "error", "error": str(exc)})
+
+            await ingestion_service.update_progress(
+                processed_files=index,
+                chunks_count=0,
+                progress_percent=max(file_end - 2, file_start + 2),
+                current_step=f"[{index}/{total_files}] Échec sur {upload_filename}",
+                stage="file_error",
+            )
         finally:
             if temp_path and temp_path.exists():
                 try:
@@ -212,6 +273,14 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                     pass
 
     if files_to_index:
+        await ingestion_service.update_progress(
+            processed_files=len(files_to_index),
+            chunks_count=0,
+            progress_percent=94,
+            current_step="Indexation documentaire RAG…",
+            stage="rag_indexing",
+        )
+
         for item in files_to_index:
             course_data = item["course_data"]
             course_id = item["course_id"]
@@ -224,6 +293,11 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 course_id=course_id,
                 incremental=True,
             )
+
+        stats = knowledge_retrieval_engine.get_stats()
+        await ingestion_service.complete_ingestion(int(stats.get("total_docs", 0)))
+    else:
+        await ingestion_service.fail_ingestion("Aucun fichier n'a pu être importé")
 
     return {"results": results, "rag_stats": knowledge_retrieval_engine.get_stats()}
 

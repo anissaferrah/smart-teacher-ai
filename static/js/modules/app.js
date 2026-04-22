@@ -170,10 +170,6 @@ class SmartTeacherApp {
       this._handleTranscription(data);
     });
 
-    wsClient.on('text_answer', (data) => {
-      this._handleResponse(data);
-    });
-
     wsClient.on('response', (data) => {
       this._handleResponse(data);
     });
@@ -465,16 +461,17 @@ class SmartTeacherApp {
   }
 
   _handleSlideData(data) {
-    const { title, text, image_url, slide_path, course, chapter, section, total_sections } = data;
-    const slideImageUrl = image_url || slide_path || null;
-    const courseTitle = course || stateManager.course?.name || 'Aucun cours';
+    const { title, text, image_url, chapter, section, total_sections } = data;
     
     stateManager.setState('slideTitle', title);
     stateManager.setState('slideText', text);
     
     if (this.components.slideViewer) {
-      this.components.slideViewer.displaySlide(title, text, slideImageUrl);
-      this.components.slideViewer.updateHeader(courseTitle, chapter || 'Chapitre');
+      this.components.slideViewer.displaySlide(title, text, image_url);
+      this.components.slideViewer.updateHeader(
+        stateManager.course?.name || 'Aucun cours',
+        chapter || 'Chapitre'
+      );
       this.components.slideViewer.updateProgress(section || 0, total_sections || 1);
     }
   }
@@ -494,7 +491,7 @@ class SmartTeacherApp {
 
     if (this.components.slideViewer) {
       this.components.slideViewer.updateHeader(courseTitle, chapterTitle);
-      this.components.slideViewer.displaySlide(sectionTitle, narration, data.image_url || data.slide_path || null);
+      this.components.slideViewer.displaySlide(sectionTitle, narration, data.image_url || null);
       this.components.slideViewer.enableControls();
     }
 
@@ -539,30 +536,14 @@ class SmartTeacherApp {
   }
 
   _handleResponse(data) {
-    const answerText = data.text || data.content || '';
-    const label = data.label || 'Professeur';
-    const reasoningTrace = this._normalizeReasoningTrace(
-      data.reasoning || data.reasoning_trace || data.metrics?.reasoning_trace || []
-    );
+    const { text, label, reasoning } = data;
     
     if (this.components.chatPanel) {
-      this.components.chatPanel.addMessage(answerText, 't', label);
-      this.components.chatPanel.setReasoningTrace(reasoningTrace);
-      if (reasoningTrace.length && typeof this.components.chatPanel.expand === 'function') {
-        this.components.chatPanel.expand();
+      this.components.chatPanel.addMessage(text, 't', label || 'Professeur');
+      
+      if (reasoning && reasoning.steps) {
+        console.log('Reasoning:', reasoning.steps);
       }
-    }
-
-    if (this.components.qaPanel) {
-      this.components.qaPanel.addMessage(answerText, 't', label);
-      this.components.qaPanel.setReasoningTrace(reasoningTrace);
-    }
-
-    if (reasoningTrace.length) {
-      const lastStage = reasoningTrace[reasoningTrace.length - 1] || {};
-      stateManager.setState('lastStateMain', (lastStage.state || 'idle').toLowerCase());
-      stateManager.setState('lastSubstep', lastStage.summary || lastStage.title || null);
-      console.log('Reasoning:', reasoningTrace);
     }
   }
 
@@ -580,15 +561,6 @@ class SmartTeacherApp {
     const mappedState = stateMap[state] || 'idle';
     this.components.slideViewer?.setWaveformState(mappedState);
     this.components.chatPanel?.setStatus(mappedState, message);
-  }
-
-  _normalizeReasoningTrace(reasoning) {
-    if (!reasoning) return [];
-    if (Array.isArray(reasoning)) return reasoning;
-    if (Array.isArray(reasoning.steps)) return reasoning.steps;
-    if (Array.isArray(reasoning.trace)) return reasoning.trace;
-    if (Array.isArray(reasoning.stages)) return reasoning.stages;
-    return [];
   }
 
   // Public API for manual interactions

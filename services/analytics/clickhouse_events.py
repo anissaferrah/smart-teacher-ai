@@ -11,6 +11,7 @@ This replaces CSV logging and other ad-hoc metrics collection.
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from infrastructure.config import settings
@@ -28,6 +29,8 @@ class AnalyticsSink:
         self.host = settings.analytics.clickhouse_host
         self.port = settings.analytics.clickhouse_port
         self.database = settings.analytics.clickhouse_db
+        self.username = os.getenv("ANALYTICS__CLICKHOUSE_USER", os.getenv("CLICKHOUSE_USER", "default"))
+        self.password = os.getenv("ANALYTICS__CLICKHOUSE_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", ""))
         
         # Lazy-loaded ClickHouse client
         self._client = None
@@ -42,11 +45,20 @@ class AnalyticsSink:
         """Lazy-load ClickHouse client."""
         if self._client is None and self.enabled:
             try:
-                from clickhouse_driver import Client
-                self._client = Client(host=self.host, port=self.port, database=self.database)
+                import clickhouse_connect
+
+                self._client = clickhouse_connect.get_client(
+                    host=self.host,
+                    port=self.port,
+                    database=self.database,
+                    username=self.username,
+                    password=self.password,
+                    connect_timeout=2,
+                    send_receive_timeout=5,
+                )
                 log.info("ClickHouse client connected")
             except ModuleNotFoundError as e:
-                log.warning(f"ClickHouse driver unavailable, analytics disabled: {e}")
+                log.warning(f"ClickHouse client unavailable, analytics disabled: {e}")
                 self.enabled = False
                 self._client = None
             except Exception as e:
@@ -239,7 +251,7 @@ class AnalyticsSink:
                 'events',
                 [
                     (
-                        event['timestamp'],
+                        datetime.fromisoformat(event['timestamp']),
                         event['event_type'],
                         event['session_id'],
                         event['data'],
@@ -256,7 +268,7 @@ class AnalyticsSink:
             return
         
         try:
-            self.client.execute("""
+            self.client.command("""
                 CREATE TABLE IF NOT EXISTS events (
                     timestamp DateTime,
                     event_type String,
@@ -312,7 +324,8 @@ class AnalyticsSink:
                 LIMIT {limit}
             """
             
-            results = self.client.execute(query)
+            result = self.client.query(query)
+            results = result.result_rows if hasattr(result, "result_rows") else []
             return [
                 {
                     'timestamp': row[0],

@@ -889,8 +889,7 @@ class CourseBuilder:
                 if not content:
                     continue
 
-                first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
-                title = first_line[:80] if first_line else f"Page {page_idx}"
+                title = self._infer_page_title(content, page_idx)
                 sections.append({
                     "title": title,
                     "order": page_idx,
@@ -1074,6 +1073,61 @@ class CourseBuilder:
         words = len((text or "").split())
         # ~130 mots/minute avec bornes raisonnables
         return max(30, min(600, int((words / 130.0) * 60)))
+
+    def _infer_page_title(self, page_text: str, page_index: int) -> str:
+        """Infer a page title by scoring heading-like lines.
+
+        This avoids selecting formula annotations (e.g., "n: ...") as section titles.
+        """
+        lines = [ln.strip() for ln in (page_text or "").splitlines() if ln.strip()]
+        if not lines:
+            return f"Page {page_index}"
+
+        candidates = lines[:12]
+        best_line = ""
+        best_score = -10.0
+
+        for pos, line in enumerate(candidates):
+            words = line.split()
+            if len(line) < 3:
+                continue
+            if len(words) > 12:
+                continue
+
+            score = 0.0
+            score += max(0.0, 4.0 - (pos * 0.45))
+
+            if 2 <= len(words) <= 7:
+                score += 2.0
+            elif len(words) <= 10:
+                score += 0.6
+
+            alpha_ratio = sum(1 for ch in line if ch.isalpha()) / max(1, len(line))
+            score += alpha_ratio * 2.0
+
+            if line[:1].isupper():
+                score += 0.8
+
+            if ":" in line:
+                score -= 1.7
+            if re.search(r"\b(?:n|x|y|z|p|q|m|k|f)\s*:", line.lower()):
+                score -= 2.2
+            if re.search(r"[=<>±∑∫√]", line):
+                score -= 2.0
+            if re.search(r"\b\d+(?:\.\d+)?\b", line):
+                score -= 0.6
+            if line.endswith(":"):
+                score -= 1.3
+
+            if score > best_score:
+                best_score = score
+                best_line = line
+
+        normalized = (best_line or "").strip(" .:-")
+        if not normalized:
+            normalized = lines[0][:80]
+
+        return normalized[:100] if normalized else f"Page {page_index}"
 
     def _split_text_into_sections(self, raw_text: str) -> list[tuple[str, str]]:
         """

@@ -10,10 +10,13 @@ Responsibilities:
 """
 
 import asyncio
+import hashlib
 import logging
+import re
 import time
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from datetime import datetime
+from difflib import SequenceMatcher
 
 from domain.session_state import SessionContext, DialogState
 from infrastructure.config import settings
@@ -41,6 +44,86 @@ class QAService:
         self.voice = voice
         self.confusion_detector = confusion_detector
         self.analytics = analytics_sink or get_analytics_sink()
+        self._qa_cache: Dict[str, Dict[str, Any]] = {}
+        self._qa_cache_order: List[str] = []
+        self._qa_cache_max_entries = 300
+
+    @staticmethod
+    def _normalize_question(text: str) -> str:
+        normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+        normalized = re.sub(r"[^\w\s]", "", normalized)
+        return normalized
+
+    @staticmethod
+    def _slide_context_key(ctx: SessionContext) -> str:
+        if not ctx.slide:
+            return "global"
+        return f"{ctx.slide.course_id}:{ctx.slide.chapter_index}:{ctx.slide.section_index}"
+
+    def _question_context_prefix(
+        self,
+        session_id: str,
+        language: str,
+        subject: str,
+        ctx: SessionContext,
+    ) -> str:
+        return "|".join([
+            session_id,
+            (language or "").strip().lower(),
+            (subject or "").strip().lower(),
+            self._slide_context_key(ctx),
+        ])
+
+    def _question_cache_key(self, prefix: str, normalized_question: str) -> str:
+        digest = hashlib.sha1(normalized_question.encode("utf-8")).hexdigest()
+        return f"{prefix}|{digest}"
+
+    def _find_cached_answer(
+        self,
+        prefix: str,
+        normalized_question: str,
+    ) -> Optional[Dict[str, Any]]:
+        exact_key = self._question_cache_key(prefix, normalized_question)
+        if exact_key in self._qa_cache:
+            return self._qa_cache[exact_key]
+
+        # Fuzzy fallback for near-duplicates in the same session+slide context.
+        best_entry = None
+        best_similarity = 0.0
+        for cache_key, entry in self._qa_cache.items():
+            if not cache_key.startswith(prefix + "|"):
+                continue
+            candidate_question = entry.get("normalized_question", "")
+            if not candidate_question:
+                continue
+            similarity = SequenceMatcher(None, normalized_question, candidate_question).ratio()
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_entry = entry
+
+        if best_entry and best_similarity >= 0.92:
+            return best_entry
+        return None
+
+    def _store_cached_answer(
+        self,
+        prefix: str,
+        normalized_question: str,
+        answer_text: str,
+        audio_bytes: Optional[bytes],
+    ) -> None:
+        cache_key = self._question_cache_key(prefix, normalized_question)
+        self._qa_cache[cache_key] = {
+            "normalized_question": normalized_question,
+            "answer_text": answer_text,
+            "audio_bytes": audio_bytes,
+            "cached_at": datetime.utcnow().isoformat(),
+        }
+        self._qa_cache_order.append(cache_key)
+
+        while len(self._qa_cache_order) > self._qa_cache_max_entries:
+            oldest_key = self._qa_cache_order.pop(0)
+            self._qa_cache.pop(oldest_key, None)
     
     async def process_text_question(
         self,
@@ -49,7 +132,10 @@ class QAService:
         ctx: SessionContext,
         language: str,
         subject: str,
-    ) -> Tuple[str, Optional[str], Dict[str, Any]]:
+        history: Optional[List[Dict[str, Any]]] = None,
+        on_step: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        on_audio_chunk: Optional[Callable[[Optional[bytes], Optional[str], bool], Any]] = None,
+    ) -> Tuple[str, Optional[bytes], Dict[str, Any]]:
         """Process a text-based student question.
         
         Args:
@@ -73,10 +159,41 @@ class QAService:
             'llm_time_ms': 0.0,
             'tts_time_ms': 0.0,
             'log_time_ms': 0.0,
+            'cache_hit': False,
         }
         reasoning_trace: List[Dict[str, Any]] = []
+        history = history or []
 
-        def add_trace_step(
+        normalized_question = self._normalize_question(question_text)
+        cache_prefix = self._question_context_prefix(session_id, language, subject, ctx)
+        cached_answer = self._find_cached_answer(cache_prefix, normalized_question)
+        if cached_answer:
+            metrics['cache_hit'] = True
+            await add_trace_step(
+                step=1,
+                key='retrieval',
+                title='Recherche documentaire',
+                state=DialogState.PROCESSING.value,
+                status='done',
+                summary='Réponse récupérée depuis le cache',
+                duration_ms=0.0,
+                details={
+                    'cache_hit': True,
+                    'chunks': 0,
+                    'rag_enabled': bool(settings.rag.enabled and self.rag),
+                    'top_score': 0.0,
+                },
+            )
+            metrics['reasoning_trace'] = reasoning_trace
+            metrics['system_state'] = DialogState.IDLE.value
+            metrics['current_stage'] = 'completed'
+            return (
+                str(cached_answer.get('answer_text') or ''),
+                cached_answer.get('audio_bytes'),
+                metrics,
+            )
+
+        async def add_trace_step(
             step: int,
             key: str,
             title: str,
@@ -100,7 +217,43 @@ class QAService:
                 payload['confidence'] = round(float(confidence), 3)
             if details:
                 payload['details'] = details
-            reasoning_trace.append(payload)
+
+            existing_index = next(
+                (
+                    index
+                    for index, existing in enumerate(reasoning_trace)
+                    if existing.get('step') == step or existing.get('key') == key
+                ),
+                None,
+            )
+
+            if existing_index is not None:
+                reasoning_trace[existing_index] = payload
+            else:
+                reasoning_trace.append(payload)
+
+            if on_step:
+                try:
+                    result = on_step(payload)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as step_exc:
+                    log.debug(f"QA step callback failed: {step_exc}")
+
+        async def emit_audio_chunk(
+            audio_bytes: Optional[bytes],
+            mime_type: Optional[str],
+            is_final: bool = False,
+        ) -> None:
+            if not on_audio_chunk:
+                return
+
+            try:
+                result = on_audio_chunk(audio_bytes, mime_type, is_final)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as audio_exc:
+                log.debug(f"QA audio chunk callback failed: {audio_exc}")
         
         try:
             # Step 1: RAG retrieval
@@ -109,6 +262,19 @@ class QAService:
             rag_results = []
             rag_enabled = bool(settings.rag.enabled and self.rag)
             if rag_enabled:
+                await add_trace_step(
+                    step=1,
+                    key='retrieval',
+                    title='Recherche documentaire',
+                    state=DialogState.PROCESSING.value,
+                    status='running',
+                    summary='Recherche documentaire en cours…',
+                    duration_ms=0.0,
+                    details={
+                        'rag_enabled': rag_enabled,
+                    },
+                )
+
                 rag_results = await self.rag.retrieve(
                     question_text,
                     course_id=ctx.slide.course_id if ctx.slide else None,
@@ -118,8 +284,15 @@ class QAService:
             metrics['rag_time_ms'] = (time.time() - rag_start) * 1000
             metrics['rag_chunks'] = len(rag_results)
             if rag_results:
-                metrics['rag_score'] = sum(r.get('score', 0) for r in rag_results) / len(rag_results)
-            add_trace_step(
+                metrics['rag_score'] = sum(
+                    (
+                        float(r.get('score', 0.0))
+                        if isinstance(r, dict)
+                        else float(r[1]) if isinstance(r, tuple) and len(r) > 1 else 0.0
+                    )
+                    for r in rag_results
+                ) / len(rag_results)
+            await add_trace_step(
                 step=1,
                 key='retrieval',
                 title='Recherche documentaire',
@@ -141,11 +314,25 @@ class QAService:
             
             # Step 2: Detect confusion
             confusion_start = time.time()
+            if settings.confusion.enabled:
+                await add_trace_step(
+                    step=2,
+                    key='confusion_detection',
+                    title='Détection de confusion',
+                    state=DialogState.PROCESSING.value,
+                    status='running',
+                    summary='Détection de confusion en cours…',
+                    duration_ms=0.0,
+                    details={
+                        'language': language,
+                    },
+                )
+
             confusion_result = await self._detect_confusion(question_text, language)
             metrics['confusion_time_ms'] = (time.time() - confusion_start) * 1000
             metrics['confusion_detected'] = confusion_result['detected']
             metrics['confusion_reason'] = confusion_result['reason']
-            add_trace_step(
+            await add_trace_step(
                 step=2,
                 key='confusion_detection',
                 title='Détection de confusion',
@@ -165,6 +352,20 @@ class QAService:
             
             # Step 3: Build LLM prompt
             prompt_start = time.time()
+            await add_trace_step(
+                step=3,
+                key='prompt_build',
+                title='Construction du prompt',
+                state=DialogState.PROCESSING.value,
+                status='running',
+                summary='Construction du prompt en cours…',
+                duration_ms=0.0,
+                details={
+                    'subject': subject,
+                    'language': language,
+                },
+            )
+
             prompt = self._build_qa_prompt(
                 question_text,
                 rag_results,
@@ -174,7 +375,7 @@ class QAService:
                 ctx,
             )
             metrics['prompt_time_ms'] = (time.time() - prompt_start) * 1000
-            add_trace_step(
+            await add_trace_step(
                 step=3,
                 key='prompt_build',
                 title='Construction du prompt',
@@ -189,53 +390,179 @@ class QAService:
                 },
             )
             
-            # Step 4: Generate answer
+            # Step 4 + 5: generate the answer and stream TTS clips.
             llm_start = time.time()
-            answer_text = await self.llm.generate(prompt, temperature=0.7, max_tokens=400)
+            await add_trace_step(
+                step=4,
+                key='answer_generation',
+                title='Génération de la réponse',
+                state=DialogState.PROCESSING.value,
+                status='running',
+                summary='Réponse en cours…',
+                duration_ms=0.0,
+                details={
+                    'question_length': len(question_text),
+                },
+            )
+
+            await add_trace_step(
+                step=5,
+                key='tts_synthesis',
+                title='Synthèse vocale',
+                state=DialogState.RESPONDING.value,
+                status='running',
+                summary='Synthèse vocale en cours…',
+                duration_ms=0.0,
+                details={
+                    'language': language,
+                },
+            )
+
+            full_response = ""
+            final_audio_bytes: Optional[bytes] = None
+            audio_clip_count = 0
+            tts_engine = "none"
+            tts_voice = "none"
+
+            streaming_supported = bool(
+                rag_enabled and rag_results and self.rag and hasattr(self.rag, "generate_final_answer_stream")
+            )
+
+            stream_input_docs = []
+            for item in rag_results:
+                if isinstance(item, dict):
+                    doc = item.get("document")
+                    if doc is not None:
+                        stream_input_docs.append(doc)
+                elif isinstance(item, tuple) and item:
+                    stream_input_docs.append(item[0])
+                else:
+                    stream_input_docs.append(item)
+
+            streaming_supported = streaming_supported and bool(stream_input_docs)
+
+            if streaming_supported:
+                try:
+                    student_level = ctx.student_profile.level if ctx.student_profile else "université"
+                    async for sentence, full_so_far in self.rag.generate_final_answer_stream(
+                        stream_input_docs,
+                        question=question_text,
+                        history=history,
+                        language=language,
+                        student_level=student_level,
+                        current_chapter_title=ctx.slide.chapter_title if ctx.slide else "",
+                        current_section_title=ctx.slide.section_title if ctx.slide else "",
+                    ):
+                        full_response = full_so_far or full_response
+                        cleaned_sentence = str(sentence or "").strip()
+                        if not cleaned_sentence:
+                            continue
+
+                        clip_start = time.time()
+                        audio_bytes, _, tts_engine, tts_voice, mime = await self.voice.generate_audio_async(
+                            cleaned_sentence,
+                            language=language,
+                        )
+                        metrics['tts_time_ms'] += (time.time() - clip_start) * 1000
+
+                        if audio_bytes:
+                            final_audio_bytes = audio_bytes
+                            audio_clip_count += 1
+                            await emit_audio_chunk(audio_bytes, mime, False)
+
+                    full_response = full_response.strip()
+                except Exception as stream_exc:
+                    log.warning(f"Streaming answer failed, fallback direct synthesis: {stream_exc}")
+                    streaming_supported = False
+
+            if not streaming_supported:
+                answer_text = await self.llm.generate(prompt, temperature=0.7, max_tokens=400)
+                full_response = str(answer_text or "").strip()
+
+                clip_start = time.time()
+                audio_bytes, _, tts_engine, tts_voice, mime = await self.voice.generate_audio_async(
+                    full_response,
+                    language=language,
+                )
+                metrics['tts_time_ms'] += (time.time() - clip_start) * 1000
+
+                if audio_bytes:
+                    final_audio_bytes = audio_bytes
+                    audio_clip_count = 1
+                    await emit_audio_chunk(audio_bytes, mime, False)
+
+            if full_response and audio_clip_count == 0:
+                clip_start = time.time()
+                audio_bytes, _, tts_engine, tts_voice, mime = await self.voice.generate_audio_async(
+                    full_response,
+                    language=language,
+                )
+                metrics['tts_time_ms'] += (time.time() - clip_start) * 1000
+
+                if audio_bytes:
+                    final_audio_bytes = audio_bytes
+                    audio_clip_count = 1
+                    await emit_audio_chunk(audio_bytes, mime, False)
+
             metrics['llm_time_ms'] = (time.time() - llm_start) * 1000
-            add_trace_step(
+
+            await add_trace_step(
                 step=4,
                 key='answer_generation',
                 title='Génération de la réponse',
                 state=DialogState.RESPONDING.value,
                 status='done',
-                summary=f'Réponse générée ({len(answer_text)} caractères)',
+                summary=f'Réponse générée ({len(full_response)} caractères)',
                 duration_ms=metrics['llm_time_ms'],
                 confidence=0.8,
                 details={
-                    'answer_preview': answer_text[:140],
-                    'answer_length': len(answer_text),
+                    'answer_preview': full_response[:140],
+                    'answer_length': len(full_response),
+                    'audio_clips': audio_clip_count,
                 },
             )
-            
-            # Step 5: Convert to speech
-            tts_start = time.time()
-            audio_bytes = await self.voice.generate_audio_async(answer_text, language=language)
-            metrics['tts_time_ms'] = (time.time() - tts_start) * 1000
-            add_trace_step(
+
+            await add_trace_step(
                 step=5,
                 key='tts_synthesis',
                 title='Synthèse vocale',
                 state=DialogState.RESPONDING.value,
                 status='done',
                 summary=(
-                    f'Audio synthétisé ({len(audio_bytes)} octets)'
-                    if audio_bytes
+                    f'Audio synthétisé ({len(final_audio_bytes)} octets)'
+                    if final_audio_bytes
                     else 'Synthèse vocale terminée'
                 ),
                 duration_ms=metrics['tts_time_ms'],
                 details={
-                    'audio_bytes': len(audio_bytes) if audio_bytes else 0,
+                    'audio_bytes': len(final_audio_bytes) if final_audio_bytes else 0,
+                    'audio_clips': audio_clip_count,
+                    'tts_engine': tts_engine,
+                    'tts_voice': tts_voice,
                 },
             )
             
             # Step 6: Log to analytics
             log_start = time.time()
+            await add_trace_step(
+                step=6,
+                key='analytics_logging',
+                title='Journalisation',
+                state=DialogState.IDLE.value,
+                status='running',
+                summary="Enregistrement de l'interaction…",
+                duration_ms=0.0,
+                details={
+                    'session_id': session_id,
+                    'question_length': len(question_text),
+                },
+            )
+
             await self._log_learning_turn(
-                session_id, question_text, answer_text, ctx, language, subject, metrics
+                session_id, question_text, full_response, ctx, language, subject, metrics
             )
             metrics['log_time_ms'] = (time.time() - log_start) * 1000
-            add_trace_step(
+            await add_trace_step(
                 step=6,
                 key='analytics_logging',
                 title='Journalisation',
@@ -252,8 +579,15 @@ class QAService:
             metrics['reasoning_trace'] = reasoning_trace
             metrics['system_state'] = DialogState.IDLE.value
             metrics['current_stage'] = 'completed'
+
+            self._store_cached_answer(
+                cache_prefix,
+                normalized_question,
+                full_response,
+                final_audio_bytes,
+            )
             
-            return answer_text, audio_bytes, metrics
+            return full_response, final_audio_bytes, metrics
         
         except Exception as e:
             log.error(f"QA processing failed: {e}")
@@ -336,9 +670,11 @@ class QAService:
         
         try:
             result = await self.confusion_detector.detect(text, language=language)
+            detected = bool(result.get('is_confused', False))
+            reason = str(result.get('reason', '') if detected else '')
             return {
-                'detected': result.get('is_confused', False),
-                'reason': result.get('reason', ''),
+                'detected': detected,
+                'reason': reason,
             }
         except Exception as e:
             log.debug(f"Confusion detection failed: {e}")
