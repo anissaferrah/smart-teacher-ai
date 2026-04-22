@@ -15,31 +15,20 @@ class SmartTeacherApp {
     this.components = {};
   }
 
-  // =========================
-  // INIT SAFE FLOW
-  // =========================
   async init() {
+    if (this.initialized) return;
+
     try {
       console.log("🚀 APP INIT START");
 
       this._initializeComponents();
-      console.log("✔ components ready");
-
       this._setupStateListeners();
-      console.log("✔ state ready");
-
       this._setupWebSocketListeners();
-      console.log("✔ ws listeners ready");
-
       this._setupCourseUpload();
-      console.log("✔ upload ready");
 
-      // 🔥 IMPORTANT FIX: session MUST come BEFORE WS connect
-      await this._ensureWebSocketSession('fr', 'lycée');
-      console.log("✔ session ready");
+      await this._ensureSession("fr", "lycée");
 
       wsClient.connect();
-      console.log("✔ ws connecting");
 
       this.initialized = true;
       console.log("🎉 APP READY");
@@ -50,35 +39,40 @@ class SmartTeacherApp {
       document.body.innerHTML = `
         <div style="padding:20px;color:red;font-family:Arial">
           <h2>Application error</h2>
-          <pre>${error.stack}</pre>
+          <pre>${error?.stack || error}</pre>
         </div>
       `;
     }
   }
 
-  // =========================
-  // COMPONENTS
-  // =========================
+  // ================= COMPONENTS =================
   _initializeComponents() {
-    this.components.header = new Header('headerContainer');
-    this.components.header.render();
+    const safe = (Cls, id) => {
+      try {
+        const el = document.getElementById(id);
+        if (!el) return null;
+        const c = new Cls(id);
+        c.render();
+        return c;
+      } catch (e) {
+        console.warn(`Component error ${id}`, e);
+        return null;
+      }
+    };
 
-    this.components.slideViewer = new SlideViewer('slideViewerContainer');
-    this.components.slideViewer.render();
-
-    this.components.chatPanel = new ChatPanel('chatPanelContainer');
-    this.components.chatPanel.render();
-
-    this.components.courseSelector = new CourseSelector('courseSelectorContainer');
-    this.components.courseSelector.render();
-
-    this.components.qaPanel = new QAPanel('qaPanelContainer');
-    this.components.qaPanel.render();
+    this.components.header = safe(Header, 'headerContainer');
+    this.components.slideViewer = safe(SlideViewer, 'slideViewerContainer');
+    this.components.chatPanel = safe(ChatPanel, 'chatPanelContainer');
+    this.components.courseSelector = safe(CourseSelector, 'courseSelectorContainer');
+    if (this.components.courseSelector) {
+      this.components.courseSelector.onCourseSelect = (course) => {
+        this.selectCourse(course.id);
+      };
+    }
+    this.components.qaPanel = safe(QAPanel, 'qaPanelContainer');
   }
 
-  // =========================
-  // STATE
-  // =========================
+  // ================= STATE =================
   _setupStateListeners() {
     stateManager.subscribe('paused', (val) => {
       const btn = document.getElementById('pauseBtn');
@@ -92,29 +86,20 @@ class SmartTeacherApp {
     });
   }
 
-  // =========================
-  // WEBSOCKET (FIXED)
-  // =========================
+  // ================= WEBSOCKET =================
   _setupWebSocketListeners() {
 
     wsClient.on('connected', () => {
-      console.log("✅ WS connected");
       this.components.header?.setStatus('connected', 'Connected');
     });
 
-    wsClient.on('disconnected', (e) => {
-      console.warn("⚠️ WS disconnected:", e);
+    wsClient.on('disconnected', () => {
       this.components.header?.setStatus('idle', 'Disconnected');
     });
 
     wsClient.on('error', (err) => {
-      console.error("❌ WS error:", err);
       UIManager.showNotification("Connection error", "error");
-    });
-
-    // optional debug (IMPORTANT for your 1008 issue)
-    wsClient.on('close', (e) => {
-      console.warn("🔴 WS CLOSE:", e?.code, e?.reason);
+      console.error(err);
     });
 
     wsClient.on('slide_data', (data) => {
@@ -132,24 +117,49 @@ class SmartTeacherApp {
         data.label || "Teacher"
       );
     });
+
+    // FIX-6: Handle session_started to display student profile
+    wsClient.on('session_started', (data) => {
+      console.log('✅ Session started', data);
+      
+      // Display student profile in header
+      if (data.student_profile) {
+        this.components.header?.updateProfile({
+          name: data.student_profile.name || data.student_profile.student_id || 'Étudiant',
+          level: data.student_profile.level || 'lycée',
+          language: data.student_profile.language || 'fr'
+        });
+        stateManager.studentProfile = data.student_profile;
+        localStorage.setItem('student_id', data.student_profile.student_id || '');
+      }
+      
+      // FIX-1: Sync session language from server
+      if (data.language) {
+        wsClient.sessionLanguage = data.language;
+        stateManager.setState('sessionLanguage', data.language);
+        console.log(`🌐 Session language synchronized: ${data.language}`);
+      }
+    });
   }
 
-  // =========================
-  // SESSION (CRITICAL FIX PART)
-  // =========================
-  async _ensureWebSocketSession(language, level) {
+  // ================= SESSION FIX =================
+  async _ensureSession(language, level) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
     try {
       const res = await fetch('/session', {
-        method: 'POST'
+        method: 'POST',
+        signal: controller.signal
       });
 
-      if (!res.ok) {
-        throw new Error("Session creation failed");
-      }
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error("Session failed");
 
       const data = await res.json();
 
-      if (!data.session_id || !data.token) {
+      if (!data?.session_id || !data?.token) {
         throw new Error("Invalid session response");
       }
 
@@ -162,73 +172,131 @@ class SmartTeacherApp {
       localStorage.setItem('session_id', data.session_id);
       localStorage.setItem('token', data.token);
 
-      console.log("🔐 session initialized");
+      console.log("🔐 session OK");
 
-      return data;
-
-    } catch (err) {
-      console.error("❌ session error:", err);
-      throw err;
+    } catch (e) {
+      console.error("SESSION ERROR", e);
+      throw e;
     }
   }
 
-  // =========================
-  // COURSE UPLOAD (SAFE)
-  // =========================
+  // ================= UPLOAD =================
   _setupCourseUpload() {
     const dz = document.getElementById('dz');
     const fi = document.getElementById('fi');
     const btn = document.getElementById('buildBtn');
+    const bstat = document.getElementById('bstat');
+    const ingestionLog = document.getElementById('ingestionLog');
+    const pfill = document.getElementById('pfill');
 
-    if (!dz || !fi || !btn) {
-      console.warn("Upload elements missing");
-      return;
-    }
+    if (!dz || !fi || !btn) return;
 
     dz.onclick = () => fi.click();
 
     fi.onchange = () => {
-      btn.disabled = fi.files.length === 0;
+      btn.disabled = !fi.files.length;
     };
 
-    btn.onclick = async () => {
+    btn.onclick = () => {
       if (!fi.files.length) return;
 
       const form = new FormData();
-      for (const f of fi.files) form.append("files", f);
+      [...fi.files].forEach(f => form.append("files", f));
+      const bLang = document.getElementById('bLang');
+      const bLevel = document.getElementById('bLevel');
+      const language = bLang ? bLang.value : 'fr';
+      const level = bLevel ? bLevel.value : 'lycée';
+      form.append('language', language);
+      form.append('level', level);
 
-      try {
-        UIManager.showNotification("Uploading...", "info");
+      if (bstat) bstat.textContent = '⏳ Démarrage de l’upload…';
+      if (ingestionLog) ingestionLog.innerHTML = '';
+      if (pfill) pfill.style.width = '0%';
 
-        const res = await fetch("/course/build", {
-          method: "POST",
-          body: form
-        });
+      UIManager.showNotification("Uploading...", "info");
+      if (bstat) bstat.textContent = '⏳ Upload en cours…';
 
-        if (!res.ok) throw new Error("Upload failed");
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/course/build', true);
 
-        const data = await res.json();
-        console.log("UPLOAD OK:", data);
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && pfill) {
+          const percent = Math.round((event.loaded / event.total) * 100);
+          pfill.style.width = percent + '%';
+        }
+      };
 
-        UIManager.showNotification("Upload success", "success");
+      xhr.onload = async () => {
+        try {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            const payload = JSON.parse(xhr.responseText || '{}');
+            let logHtml = '';
+            let okCount = 0;
+            if (payload && Array.isArray(payload.results)) {
+              payload.results.forEach((item) => {
+                if (item.status === 'ok') {
+                  logHtml += `<div style='color:green'>✅ ${item.file} importé avec succès</div>`;
+                  okCount++;
+                } else {
+                  logHtml += `<div style='color:red'>❌ ${item.file} : ${item.error || 'Erreur inconnue'}`;
+                  if (item.traceback) logHtml += `<details><summary>Traceback</summary><pre>${item.traceback}</pre></details>`;
+                  logHtml += `</div>`;
+                }
+              });
+              if (bstat) bstat.textContent = okCount > 0 ? `✅ ${okCount}/${payload.results.length} fichier(s) importé(s)` : '❌ Aucun cours importé';
+              if (ingestionLog) ingestionLog.innerHTML = logHtml;
+            } else {
+              if (bstat) bstat.textContent = '✅ Upload terminé';
+            }
+            if (pfill) pfill.style.width = '100%';
 
-      } catch (e) {
-        console.error(e);
-        UIManager.showNotification("Upload error", "error");
-      }
+            UIManager.showNotification("Upload success", "success");
+
+            // Refresh course list
+            try {
+              const res = await fetch('/course/list');
+              if (res.ok) {
+                const json = await res.json();
+                const courses = (json.courses || []).map(c => ({
+                  id: c.id,
+                  name: c.title || c.name || c.id,
+                  domain: c.domain || '',
+                  subject: c.subject || '',
+                }));
+                this.components.courseSelector?.displayCourses(courses);
+              }
+            } catch (e) {
+              console.warn('Failed to refresh course list', e);
+            }
+
+          } else {
+            let errMsg = 'Upload failed';
+            try { errMsg = JSON.parse(xhr.responseText).detail || JSON.parse(xhr.responseText).message || errMsg; } catch(e){}
+            if (bstat) bstat.textContent = '❌ Erreur lors de l’upload';
+            if (ingestionLog) ingestionLog.innerHTML = `<div style='color:red'>${errMsg}</div>`;
+            if (pfill) pfill.style.width = '0%';
+            UIManager.showNotification(errMsg, 'error');
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      };
+
+      xhr.onerror = () => {
+        if (bstat) bstat.textContent = '❌ Erreur lors de l’upload';
+        if (pfill) pfill.style.width = '0%';
+        UIManager.showNotification('Upload error', 'error');
+      };
+
+      xhr.send(form);
     };
   }
 
-  // =========================
-  // PUBLIC API
-  // =========================
+  // ================= API =================
   askQuestion(text) {
     if (!wsClient.isConnected()) return;
 
-    wsClient.send({
-      type: "question",
-      text
-    });
+    wsClient.send({ type: "question", text });
   }
 
   selectCourse(courseId) {
@@ -241,9 +309,6 @@ class SmartTeacherApp {
   }
 }
 
-// =========================
-// BOOTSTRAP
-// =========================
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", () => {
     window.app = new SmartTeacherApp();

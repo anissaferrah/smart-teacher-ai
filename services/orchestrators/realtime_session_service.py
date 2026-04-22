@@ -515,6 +515,9 @@
 #                     "narration": resume_text,
 #                     "image_url": ctx.slide.slide_path,
 #                     "slide_path": ctx.slide.slide_path,
+#                     "language": ctx.language,  # FIX-1
+#                     "chapter_index": ctx.slide.chapter_index,  # FIX-3
+#                     "section_index": ctx.slide.section_index,  # FIX-4
 #                 })
 
 #                 try:
