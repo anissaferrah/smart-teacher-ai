@@ -1020,24 +1020,30 @@ class CourseBuilder:
             subject=course_slug,
         )
 
-    async def save_to_database(self, course_data: dict, db, domain: str = DEFAULT_DOMAIN) -> str:
+    async def save_to_database(self, course_data: dict, db, domain: str = "general") -> str:
+        """
+        Persist course_data to PostgreSQL.
+    
+        FIX-4: section.order is set to page_index (= PDF page number).
+        FIX-5: sections are inserted in ascending page_index order so the DB
+            stores them in the same order as the PDF.
+        """
         from database.models import Course, Chapter, Section, Concept
-        log.info("💾 Sauvegarde PostgreSQL…")
-
+    
         course = Course(
             title=course_data.get("title", "Cours importé"),
-            domain=domain,  # 🎯 Stocker le domaine
-            subject=course_data.get("subject", DEFAULT_COURSE),
-            language=course_data.get("language", "en"),
-            level=course_data.get("level", "université"),
+            domain=domain,
+            subject=course_data.get("subject", "generic"),
+            language=course_data.get("language", "fr"),
+            level=course_data.get("level", "lycée"),
             description=course_data.get("description", ""),
             file_path=course_data.get("file_path", ""),
         )
         db.add(course)
         await db.flush()
-
-        slides = course_data.get("slides", [])  # 🎨 Récupérer les PNG paths
-
+    
+        slides = course_data.get("slides", [])
+    
         for ch_data in course_data.get("chapters", []):
             chapter = Chapter(
                 course_id=course.id,
@@ -1047,37 +1053,50 @@ class CourseBuilder:
             )
             db.add(chapter)
             await db.flush()
+    
+            # FIX-5: sort sections by page_index ASC before inserting
+            raw_sections = ch_data.get("sections", [])
             sorted_sections = sorted(
-                ch_data.get("sections", []),
+                raw_sections,
                 key=lambda s: int(s.get("page_index") or s.get("order") or 0)
             )
-            for i, sec_data in enumerate(sorted_sections):  
-                # 🎨 Préserver le lien exact entre la section et sa slide PNG.
-                section_order = sec_data.get("page_index") or sec_data.get("order") or (i + 1)
+    
+            for sec_data in sorted_sections:
+                # FIX-4: use page_index as order (= PDF page number)
+                page_index = int(
+                    sec_data.get("page_index") or sec_data.get("order") or 0
+                )
+    
                 image_url = (sec_data.get("image_url") or "").strip()
-
-                if not image_url and section_order:
-                    slide_index = int(section_order) - 1
-                    if 0 <= slide_index < len(slides):
-                        image_url = slides[slide_index]
-
-                if not image_url and i < len(slides):
-                    image_url = slides[i]
-
-                image_urls = sec_data.get("image_urls") or ([] if not image_url else [image_url])
-                
+    
+                # Match PNG by page_index (1-based)
+                if not image_url and page_index:
+                    slide_idx = page_index - 1          # 0-based list index
+                    if 0 <= slide_idx < len(slides):
+                        image_url = slides[slide_idx]
+    
+                # Fallback: positional match if page_index unavailable
+                if not image_url:
+                    pos = sorted_sections.index(sec_data)
+                    if 0 <= pos < len(slides):
+                        image_url = slides[pos]
+    
+                image_urls = sec_data.get("image_urls") or (
+                    [] if not image_url else [image_url]
+                )
+    
                 section = Section(
                     chapter_id=chapter.id,
                     title=sec_data["title"],
-                    order=section_order,
+                    order=page_index,           # FIX-4: order = PDF page number
                     content=sec_data.get("content", ""),
-                    image_url=image_url,  # 🎨 PNG path de cette slide
+                    image_url=image_url,
                     image_urls=image_urls,
                     duration_s=sec_data.get("duration_s", 120),
                 )
                 db.add(section)
                 await db.flush()
-
+    
                 for c_data in sec_data.get("concepts", []):
                     concept = Concept(
                         section_id=section.id,
@@ -1087,11 +1106,15 @@ class CourseBuilder:
                         concept_type=c_data.get("type", "definition"),
                     )
                     db.add(concept)
-
+    
         await db.commit()
         course_id = str(course.id)
-        log.info(f"✅ Cours sauvegardé : ID={course_id}")
+        import logging
+        logging.getLogger("SmartTeacher.CourseBuilder").info(
+            f"✅ Cours sauvegardé (FIX-4/FIX-5): ID={course_id}"
+        )
         return course_id
+                
 
     def _estimate_duration(self, text: str) -> int:
         """Estime une durée de lecture (en secondes) selon le nombre de mots."""

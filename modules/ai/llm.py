@@ -399,7 +399,7 @@ class Brain:
                 f"{self.fallback.base_url}/api/generate",
                 json=payload,
                 stream=True,
-                timeout=(5, 15),
+                timeout=None,  # Pas de timeout - Mistral peut prendre 30-60s
             )
 
             if response.status_code == 200:
