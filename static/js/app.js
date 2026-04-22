@@ -67,7 +67,7 @@ class SmartTeacherApp {
       this._loadAvailableCourses().catch((error) => {
         console.warn('⚠️ Unable to load course list:', error);
       });
-
+      await this._loadStudentProfile();
       this.initialized = true;
       this._exposeAuthHelpers();
       console.log('🎉 Application ready!');
@@ -931,7 +931,7 @@ class SmartTeacherApp {
       stateManager.setState('course', selectedCourse);
     }
     stateManager.setState('chapterIndex', 0);
-    stateManager.setState('sectionIndex', 0);
+    stateManager.setState('sectionIndex', 1);
     stateManager.setState('activePanel', 'course');
 
     this.components.header?.enableQuizButton();
@@ -1168,6 +1168,54 @@ class SmartTeacherApp {
       wsClient.sessionLanguage || stateManager.course?.language || 'fr',
       wsClient.sessionLevel || stateManager.course?.level || 'lycée'
     );
+  }
+  _normalizeReasoningTrace(trace) {
+    if (!Array.isArray(trace)) return [];
+    return trace.filter(step => step && typeof step === 'object');
+  }
+  async _loadStudentProfile() {
+    const token = localStorage.getItem('token');
+    
+    if (!token) {
+        this.components.header?.updateProfile({ name: 'Invité', level: 'lycée', language: 'fr' });
+        return;
+    }
+    
+    try {
+        const response = await fetch('/auth/me', {
+            headers: { 'Authorization': 'Bearer ' + token }
+        });
+        
+        if (response.ok) {
+            const data = await response.json();
+            const student = data.student || {};
+            const lp = data.learning_profile || {};
+            
+            stateManager.studentId = student.id || '';
+            stateManager.studentName = student.first_name || 'Étudiant';
+            
+            this.components.header?.updateProfile({
+                name: (student.first_name || '') + ' ' + (student.last_name || ''),
+                level: lp.level || student.account_level || 'lycée',
+                language: lp.language || student.preferred_language || 'fr',
+            });
+            
+            // Sync session language to student preference
+            if (lp.language || student.preferred_language) {
+                wsClient.sessionLanguage = lp.language || student.preferred_language;
+            }
+            wsClient.sessionLevel = lp.level || 'lycée';
+            localStorage.setItem('student_id', student.id || '');
+            
+        } else {
+            // Token invalid
+            localStorage.removeItem('token');
+            this.components.header?.updateProfile({ name: 'Invité', level: 'lycée', language: 'fr' });
+        }
+    } catch (err) {
+        console.warn('Profile load failed:', err);
+        this.components.header?.updateProfile({ name: 'Invité', level: 'lycée', language: 'fr' });
+    }
   }
 }
 

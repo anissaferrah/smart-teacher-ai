@@ -341,6 +341,10 @@ async def list_courses() -> dict:
                 chapters = list(course.chapters or [])
                 chapter_count = len(chapters)
                 section_count = sum(len(chapter.sections or []) for chapter in chapters)
+                first_chapter_order = 0
+                if chapters:
+                    sorted_chs = sorted(chapters, key=lambda c: c.order or 0)
+                    first_chapter_order = sorted_chs[0].order if sorted_chs else 0
 
                 payload_courses.append({
                     "id": str(course.id),
@@ -353,6 +357,7 @@ async def list_courses() -> dict:
                     "chapter_count": chapter_count,
                     "section_count": section_count,
                     "file_path": course.file_path,
+                    "first_chapter_order": first_chapter_order,
                 })
 
             return {"courses": payload_courses}

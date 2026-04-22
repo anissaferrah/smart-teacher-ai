@@ -22,6 +22,7 @@ from domain.session_state import SessionContext, DialogState
 from infrastructure.config import settings
 from infrastructure.logging import get_logger
 from services.analytics.clickhouse_events import get_analytics_sink
+from config import Config as _Cfg
 
 log = get_logger(__name__)
 
@@ -304,6 +305,51 @@ class QAService:
         )
         
         try:
+            if _Cfg.RAG_MODE == "agentic":
+                try:
+                    from services.app_state import agentic_rag_orchestrator
+
+                    if agentic_rag_orchestrator is not None:
+                        _result = await agentic_rag_orchestrator.answer_question(
+                            query=question_text,
+                            course_id=ctx.slide.course_id if ctx.slide else None,
+                            history=history,
+                            language=language,
+                            student_profile={
+                                "level": ctx.student_profile.level if ctx.student_profile else "lycée",
+                                "language": language,
+                            },
+                        )
+
+                        _answer = _result.get("answer", "")
+
+                        _audio, _, _eng, _voice, _mime = await self.voice.generate_audio_async(
+                            _answer,
+                            language=language,
+                        )
+
+                        if _audio and on_audio_chunk:
+                            await on_audio_chunk(_audio, _mime, False)
+
+                        metrics["llm_time_ms"] = (
+                            _result.get("metrics", {}).get("total_time", 0) * 1000
+                        )
+
+                        metrics["reasoning_trace"] = _result.get(
+                            "reasoning", {}
+                        ).get("steps", [])
+
+                        metrics["agentic_rag_state"] = {
+                            "enabled": True,
+                            "mode": "agentic",
+                        }
+
+                        return _answer, _audio, metrics
+
+                except Exception as _aex:
+                    log.warning(
+                        f"Agentic RAG failed, falling back to classic: {_aex}"
+                    )
             # Step 1: RAG retrieval
             rag_start = time.time()
             
@@ -328,6 +374,29 @@ class QAService:
                     course_id=ctx.slide.course_id if ctx.slide else None,
                     top_k=settings.rag.num_results,
                 )
+                # ✅ Normalize RAG results to (Document, score, source) tuples
+                try:
+                    from langchain_core.documents import Document as _LCDoc
+                except Exception:
+                    _LCDoc = None
+
+                _normalized = []
+                for _item in rag_results:
+                    if isinstance(_item, dict):
+                        _doc = _item.get("document")
+                        if _doc is None and _LCDoc is not None:
+                            _doc = _LCDoc(
+                                page_content=_item.get("content", ""),
+                                metadata=_item.get("metadata", {})
+                            )
+                        _score = float(_item.get("score", 0.5) or 0.5)
+                        _src = _item.get("source", "")
+                        _normalized.append((_doc, _score, _src))
+                    elif isinstance(_item, tuple):
+                        _normalized.append(_item)
+                    else:
+                        _normalized.append((_item, 0.5, ""))
+                rag_results = _normalized
             
             metrics['rag_time_ms'] = (time.time() - rag_start) * 1000
             metrics['rag_chunks'] = len(rag_results)

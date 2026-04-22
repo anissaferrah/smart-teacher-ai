@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import asyncio as _asyncio
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("SmartTeacher.HybridRetriever")
@@ -58,7 +59,7 @@ class HybridRetriever:
         if not self.rag_system or not hasattr(self.rag_system, "retrieve_chunks"):
             return []
 
-        raw_results = self.rag_system.retrieve_chunks(query, k=k, course_id=course_id)
+        raw_results = await _asyncio.to_thread(self.rag_system.retrieve_chunks, query, k=k, course_id=course_id)
         if inspect.isawaitable(raw_results):
             raw_results = await raw_results
         return [self._normalize_result(item, method="rag") for item in raw_results or []]

@@ -13,6 +13,7 @@ websocket_endpoint function in main.py.
 
 import asyncio
 import base64
+from email.mime import message
 import logging
 import uuid
 import secrets
@@ -292,6 +293,7 @@ class RealtimeSessionService:
 
                 await send({
                     "type": "presentation_started",
+                    "language": ctx.language,  
                     "course": slide.course_title,
                     "chapter": slide.chapter_title,
                     "chapter_number": slide.chapter_number,
@@ -881,6 +883,19 @@ class RealtimeSessionService:
                         requested_language = str(message.get("language", "") or "").strip().lower()
                         if requested_language and requested_language != "auto":
                             ctx.language = requested_language
+                        else:
+                            # ✅ Sync session language to course language
+                            try:
+                                import uuid as _uuid
+                                from database.core import AsyncSessionLocal
+                                from database.repositories.crud import get_course
+                                async with AsyncSessionLocal() as _db:
+                                    _course = await get_course(_db, _uuid.UUID(course_id))
+                                    if _course and _course.language:
+                                        ctx.language = _course.language
+                                        log.info(f"[{session_id[:8]}] Lang synced to course: {ctx.language}")
+                            except Exception as _exc:
+                                log.debug(f"[{session_id[:8]}] Could not sync course lang: {_exc}")
 
                         presentation_task = asyncio.create_task(
                             handle_presentation_turn(course_id, chapter_idx, section_idx)
@@ -925,7 +940,17 @@ class RealtimeSessionService:
                             continue
 
                         question = message.get("content") or message.get("text") or message.get("question") or ""
-                        language = message.get("language", ctx.language)
+                        _msg_lang = str(message.get("language", "") or "").strip().lower()
+                        if _msg_lang and _msg_lang not in ("auto", ""):
+                            language = _msg_lang
+                        else:
+                            # Auto-detect language from the actual question text
+                            try:
+                                from langdetect import detect as _detect
+                                _detected = _detect(question)
+                                language = _detected[:2].lower() if _detected else ctx.language
+                            except Exception:
+                                language = ctx.language
                         subject = message.get("subject", "") or message.get("topic", "")
 
                         await cancel_tasks()

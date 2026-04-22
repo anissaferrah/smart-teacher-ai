@@ -71,22 +71,23 @@ class PresentationService:
                 course_struct = await get_course_with_structure(db, course_uuid)
                 if not course_struct:
                     return None
-                
                 # Navigate the ORM hierarchy directly: Course -> Chapter -> Section
                 chapters = sorted(course_struct.chapters or [], key=lambda chapter: chapter.order or 0)
-
-                if not chapters:
-                    return None
-
                 chapter_index = max(0, int(chapter_index))
-                section_index = max(0, int(section_index))
 
-                if chapter_index >= len(chapters):
-                    chapter_index = len(chapters) - 1
+                # Try to find chapter by its order number (e.g., chapter_index=2 → finds Chapter with order=2)
+                chapter = None
+                for ch in chapters:
+                    if (ch.order or 0) == chapter_index:
+                        chapter = ch
+                        break
 
-                chapter = chapters[chapter_index]
+                # Fallback: treat as array index
+                if chapter is None:
+                    arr_idx = chapter_index if chapter_index < len(chapters) else len(chapters) - 1
+                    chapter = chapters[arr_idx]
+
                 sections = sorted(chapter.sections or [], key=lambda section: section.order or 0)
-
                 if not sections:
                     return None
 

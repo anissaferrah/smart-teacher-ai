@@ -62,15 +62,30 @@ async def load_course_slide_context(course_id: str, chapter_index: int, section_
                 return None
 
             chapters = sorted(course.chapters, key=lambda ch: ch.order or 0)
-            if chapter_index < 0 or chapter_index >= len(chapters):
-                return None
 
-            chapter = chapters[chapter_index]
+            # Find by order number first
+            chapter = None
+            for ch in chapters:
+                if (ch.order or 0) == chapter_index:
+                    chapter = ch
+                    break
+            if chapter is None:
+                if chapter_index < 0 or chapter_index >= len(chapters):
+                    return None
+                chapter = chapters[chapter_index]
+
             sections = sorted(chapter.sections, key=lambda sec: sec.order or 0)
-            if section_index < 0 or section_index >= len(sections):
-                return None
 
-            section = sections[section_index]
+            # Find section by page number (order field) first
+            section = None
+            for sec in sections:
+                if (sec.order or 0) == section_index:
+                    section = sec
+                    break
+            if section is None:
+                if section_index < 0 or section_index >= len(sections):
+                    return None
+                section = sections[section_index]
             slide_path = section.image_url or (section.image_urls[0] if getattr(section, "image_urls", None) else "")
             total_sections = sum(len(sorted(ch.sections, key=lambda sec: sec.order or 0)) for ch in chapters)
             global_slide_index = sum(len(sorted(ch.sections, key=lambda sec: sec.order or 0)) for ch in chapters[:chapter_index]) + section_index

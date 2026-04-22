@@ -20,14 +20,38 @@ export class Header extends BaseComponent {
         <button class="nav-tab" data-panel="library">📚 Mes Cours</button>
         <button class="nav-tab" id="quizBtn" data-panel="quiz" disabled>📝 Quiz</button>
       </div>
+      <!-- ✅ ADD: Student profile display -->
+      <div class="student-profile-bar" id="studentProfileBar" style="
+        display:flex; align-items:center; gap:8px;
+        padding:4px 12px; background:rgba(255,255,255,0.05);
+        border-radius:20px; font-size:.8em;">
+        <span id="studentAvatar">👤</span>
+        <span id="studentDisplayName" style="color:var(--text);">—</span>
+        <span id="studentDisplayLevel" style="
+          background:rgba(0,212,170,.15); color:#00d4aa;
+          padding:2px 8px; border-radius:10px; font-size:.75em;">—</span>
+        <span id="studentDisplayLang" style="
+          background:rgba(108,99,255,.15); color:#6c63ff;
+          padding:2px 8px; border-radius:10px; font-size:.75em;">—</span>
+      </div>
       <div class="nav-status">
         <div class="status-dot" id="statusDot"></div>
         <span class="status-text" id="statusText">Connexion…</span>
       </div>
       <button class="nav-tab" onclick="window.open('/dashboard','_blank')">📊 Dashboard</button>
     `;
-
     this._attachTabListeners();
+  }
+  updateProfile(data) {
+    const bar = this.query('#studentProfileBar');
+    const name = this.query('#studentDisplayName');
+    const level = this.query('#studentDisplayLevel');
+    const lang = this.query('#studentDisplayLang');
+    if (!data) return;
+    if (bar) bar.style.display = 'flex';
+    if (name) name.textContent = data.name || 'Invité';
+    if (level) level.textContent = data.level || '—';
+    if (lang) lang.textContent = (data.language || '—').toUpperCase();
   }
 
   _attachTabListeners() {
@@ -112,6 +136,7 @@ export class Header extends BaseComponent {
       this.setStatus(data.status.state, data.status.text);
     }
   }
+
 }
 
 export default Header;

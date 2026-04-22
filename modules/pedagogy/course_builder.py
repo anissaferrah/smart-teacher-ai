@@ -22,6 +22,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import Optional
+import re as _re
 
 # Import configuration domaines & cours
 import sys
@@ -181,7 +182,7 @@ class LocalStructurer:
                 return fallback
 
         return next(iter(sorted(self.available_ocr_langs)), "")
-
+    
     def _pdf_to_images(self, pdf_path: str, output_dir: str) -> list[str]:
         """Convertit PDF en images PNG."""
         output_path = Path(output_dir)
@@ -193,47 +194,57 @@ class LocalStructurer:
             except Exception:
                 pass
 
+        def _sort_pngs(paths: list[str]) -> list[str]:
+            import re
+            def _page_num(p):
+                m = re.search(r'page_(\d+)', p)
+                return int(m.group(1)) if m else 0
+            return sorted(paths, key=_page_num)
+
+        paths = []
+
+        # pdf2image
         if self.convert_from_path:
             try:
                 images = self.convert_from_path(pdf_path, dpi=150)
-                paths = []
+
                 for i, img in enumerate(images, 1):
                     png_path = output_path / f"page_{i:03d}.png"
                     img.save(str(png_path), "PNG")
                     paths.append(str(png_path))
-                if paths:
-                    log.info(f"  ✅ {len(paths)} PNG générées")
-                    return paths
-                log.warning("  ⚠️ pdf2image n'a produit aucune image, fallback pypdfium2…")
-            except Exception as e:
-                log.info(f"  ℹ️ Conversion PDF→PNG via pdf2image échouée: {e}")
 
+                if paths:
+                    log.info(f"✅ {len(paths)} PNG générées")
+                    return _sort_pngs(paths)
+
+            except Exception as e:
+                log.info(f"ℹ️ pdf2image échouée: {e}")
+
+        # fallback pypdfium2
         try:
             import pypdfium2 as pdfium
 
             pdf = pdfium.PdfDocument(pdf_path)
             paths = []
-            try:
-                for i in range(len(pdf)):
-                    page = pdf[i]
-                    bitmap = page.render(scale=2.0)
-                    image = bitmap.to_pil()
-                    png_path = output_path / f"page_{i + 1:03d}.png"
-                    image.save(str(png_path), "PNG")
-                    paths.append(str(png_path))
-            finally:
-                close = getattr(pdf, "close", None)
-                if callable(close):
-                    close()
+
+            for i in range(len(pdf)):
+                page = pdf[i]
+                bitmap = page.render(scale=2.0)
+                image = bitmap.to_pil()
+
+                png_path = output_path / f"page_{i+1:03d}.png"
+                image.save(str(png_path), "PNG")
+                paths.append(str(png_path))
 
             if paths:
-                log.info(f"  ✅ {len(paths)} PNG générées via pypdfium2")
-            return paths
-        except ImportError:
-            log.info("  ℹ️ pypdfium2 non disponible pour convertir le PDF en PNG")
+                log.info(f"✅ {len(paths)} PNG générées via pypdfium2")
+                return _sort_pngs(paths)
+
         except Exception as e:
-            log.info(f"  ℹ️ Conversion PDF→PNG via pypdfium2 échouée: {e}")
-            return []
+            log.info(f"ℹ️ pypdfium2 échouée: {e}")
+
+        return []
+     
 
     def _extract_text_with_ocr(self, pdf_path: str, lang: str = "fra+ara+eng") -> str:
         """Extrait le texte brut avec Tesseract-OCR."""
@@ -410,29 +421,30 @@ class CourseBuilder:
             or re.fullmatch(r"chapitre[_\-\s]*\d+", normalized)
             or re.fullmatch(r"ch\d+", normalized)
         )
-
+    
     @staticmethod
     def _chapter_number_from_value(value: str | None) -> int | None:
         if not value:
             return None
-
         normalized = value.strip().lower().replace("\\", "/").split("/")[-1]
+        # Remove extension
+        normalized = re.sub(r'\.[a-z]{2,5}$', '', normalized)
         patterns = [
-            r"(?:chapter|chapitre|chap)\s*[_\-\s]*(\d+)",
-            r"\bchapter[_\-\s]*(\d+)\b",
-            r"\bchapitre[_\-\s]*(\d+)\b",
-            r"\bchap[_\-\s]*(\d+)\b",
-            r"\bch[_\-\s]*(\d+)\b",
+            r"(?:chapter|chapitre|chap|ch)\s*[_\-\s]*(\d+)",
+            r"^(\d+)$",            # bare number: "2"
+            r"_(\d+)$",            # suffix: "cours_2"
+            r"\s(\d+)$",           # trailing: "cours 2"
+            r"(\d+)$",             # any trailing number
         ]
-
         for pattern in patterns:
             match = re.search(pattern, normalized)
             if match:
-                try:
-                    return max(1, int(match.group(1)))
-                except (TypeError, ValueError):
-                    continue
-
+                for group in match.groups():
+                    if group:
+                        try:
+                            return max(1, int(group))
+                        except (TypeError, ValueError):
+                            continue
         return None
 
     @staticmethod
@@ -881,6 +893,16 @@ class CourseBuilder:
                 f"/media/slides/{domain}/{course_slug}/{chapter_slug}/page_{i+1:03d}.png"
                 for i in range(len(png_paths))
             ]
+            png_paths_sorted = sorted(
+            png_paths,
+            key=lambda p: int(_re.search(r'page_(\d+)', p).group(1))
+            if _re.search(r'page_(\d+)', p) else 0
+            )
+            slides = []
+            for p in png_paths_sorted:
+                m = _re.search(r'page_(\d+)', p)
+                n = int(m.group(1)) if m else (len(slides) + 1)
+                slides.append(f"/media/slides/{domain}/{course_slug}/{chapter_slug}/page_{n:03d}.png")
 
             pages = self._extract_pdf_pages(str(path))
             title_source_text = "\n\n".join(page_text for _, page_text in pages if page_text)
@@ -1025,8 +1047,11 @@ class CourseBuilder:
             )
             db.add(chapter)
             await db.flush()
-
-            for i, sec_data in enumerate(ch_data.get("sections", [])):
+            sorted_sections = sorted(
+                ch_data.get("sections", []),
+                key=lambda s: int(s.get("page_index") or s.get("order") or 0)
+            )
+            for i, sec_data in enumerate(sorted_sections):  
                 # 🎨 Préserver le lien exact entre la section et sa slide PNG.
                 section_order = sec_data.get("page_index") or sec_data.get("order") or (i + 1)
                 image_url = (sec_data.get("image_url") or "").strip()

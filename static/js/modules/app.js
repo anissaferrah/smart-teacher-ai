@@ -569,15 +569,15 @@ class SmartTeacherApp {
       UIManager.showNotification('WebSocket non connecté, impossible d\'envoyer la question.', 'error');
       return false;
     }
+    const courseLanguage = selectedCourse?.language || wsClient.sessionLanguage || 'fr';
+    wsClient.sessionLanguage = courseLanguage;
 
     wsClient.send({
-      type: 'text_question',
-      content: text,
-      text,
-      course_id: stateManager.courseId,
-      language: wsClient.sessionLanguage || 'fr',
-      subject: stateManager.course?.domain || stateManager.course?.subject || '',
-      turn_id: stateManager.activeQuestionTurnId
+        type: 'start_presentation',
+        course_id: courseId,
+        chapter_index: selectedCourse?.first_chapter_order ?? 0,
+        section_index: 1,          // Page 1 is index 1 (matches PDF page numbers)
+        language: courseLanguage,   // ✅ Send course language
     });
 
     return true;

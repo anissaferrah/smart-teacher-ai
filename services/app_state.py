@@ -53,3 +53,25 @@ transcript_search_service = get_searcher()
 analytics_service = get_analytics()
 course_analyzer_service = get_analyzer()
 ingestion_service = IngestionManager()
+# ✅ Initialize Agentic RAG Orchestrator if mode is configured
+if Config.RAG_MODE == "agentic":
+    try:
+        from services.agentic_rag.orchestrator import AgenticRAGOrchestrator
+        from services.agentic_rag.memory.short_term import ShortTermMemory
+        from services.agentic_rag.memory.long_term import LongTermMemory
+        _stm = ShortTermMemory()
+        _ltm = LongTermMemory()
+        agentic_rag_orchestrator = AgenticRAGOrchestrator(
+            llm=language_brain,
+            rag=knowledge_retrieval_engine,
+            short_term_memory=_stm,
+            long_term_memory=_ltm,
+        )
+        import logging as _log
+        _log.getLogger("SmartTeacher").info("✅ AgenticRAGOrchestrator initialized")
+    except Exception as _exc:
+        import logging as _log
+        _log.getLogger("SmartTeacher").warning(f"⚠️ AgenticRAGOrchestrator failed: {_exc}")
+        agentic_rag_orchestrator = None
+else:
+    agentic_rag_orchestrator = None
