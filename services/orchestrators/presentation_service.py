@@ -74,15 +74,34 @@ class PresentationService:
                 
                 # Navigate the ORM hierarchy directly: Course -> Chapter -> Section
                 chapters = sorted(course_struct.chapters or [], key=lambda chapter: chapter.order or 0)
-                
-                if chapter_index >= len(chapters):
+
+                if not chapters:
                     return None
-                
+
+                chapter_index = max(0, int(chapter_index))
+                section_index = max(0, int(section_index))
+
+                if chapter_index >= len(chapters):
+                    chapter_index = len(chapters) - 1
+
                 chapter = chapters[chapter_index]
                 sections = sorted(chapter.sections or [], key=lambda section: section.order or 0)
-                
-                if section_index >= len(sections):
+
+                if not sections:
                     return None
+
+                if section_index >= len(sections):
+                    # If caller asks for "next" past chapter end, move to next chapter first section.
+                    if chapter_index + 1 < len(chapters):
+                        chapter_index += 1
+                        chapter = chapters[chapter_index]
+                        sections = sorted(chapter.sections or [], key=lambda section: section.order or 0)
+                        if not sections:
+                            return None
+                        section_index = 0
+                    else:
+                        # Clamp to the last available section of the last chapter.
+                        section_index = len(sections) - 1
                 
                 section = sections[section_index]
                 slide_path = section.image_url or (

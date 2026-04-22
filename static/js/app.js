@@ -33,6 +33,8 @@ class SmartTeacherApp {
     try {
       console.log('🚀 Initializing Smart Teacher Application...');
 
+      this._restoreStudentContext();
+
       this._initializeComponents();
       console.log('✅ Components initialized');
 
@@ -67,6 +69,7 @@ class SmartTeacherApp {
       });
 
       this.initialized = true;
+      this._exposeAuthHelpers();
       console.log('🎉 Application ready!');
     } catch (error) {
       console.error('❌ Initialization failed:', error);
@@ -150,9 +153,15 @@ class SmartTeacherApp {
       this.components.header?.setStatus('idle', 'Déconnecté');
     });
 
-    wsClient.on('error', (error) => {
-      console.error('❌ WebSocket error:', error);
-      UIManager.showNotification('Erreur de connexion', 'error');
+    wsClient.on('ws_error', (error) => {
+      console.error('❌ WebSocket transport error:', error);
+      UIManager.showNotification('Erreur de connexion WebSocket', 'error');
+    });
+
+    wsClient.on('server_error', (payload) => {
+      const message = payload?.message || 'Erreur serveur';
+      console.warn('⚠️ Server error:', payload);
+      UIManager.showNotification(message, 'error');
     });
 
     wsClient.on('slide_data', (data) => {
@@ -695,16 +704,22 @@ class SmartTeacherApp {
     const progressCurrent = Number(data.progress?.current ?? data.section_number ?? data.section ?? data.section_index ?? 0);
     const progressTotal = Number(data.progress?.total ?? data.total_sections ?? data.section_total ?? 0);
 
-    const chapterNumber = Number(data.chapter_number ?? data.progress?.chapter ?? data.chapter_index ?? 1);
-    const sectionNumber = Number(data.section_number ?? data.progress?.current ?? data.section ?? data.section_index ?? 1);
+    const chapterIndexFromPayload = Number(data.chapter_index);
+    const sectionIndexFromPayload = Number(data.section_index);
+    const chapterNumber = Number(data.chapter_number ?? data.progress?.chapter ?? (Number.isFinite(chapterIndexFromPayload) ? chapterIndexFromPayload + 1 : 1));
+    const sectionNumber = Number(data.section_number ?? data.progress?.current ?? data.section ?? (Number.isFinite(sectionIndexFromPayload) ? sectionIndexFromPayload + 1 : 1));
 
     stateManager.setState('slideTitle', slideTitle);
     stateManager.setState('slideText', slideText);
     stateManager.setState('slidePath', imageUrl || '');
-    if (Number.isFinite(chapterNumber) && chapterNumber > 0) {
+    if (Number.isFinite(chapterIndexFromPayload) && chapterIndexFromPayload >= 0) {
+      stateManager.setState('chapterIndex', chapterIndexFromPayload);
+    } else if (Number.isFinite(chapterNumber) && chapterNumber > 0) {
       stateManager.setState('chapterIndex', chapterNumber - 1);
     }
-    if (Number.isFinite(sectionNumber) && sectionNumber > 0) {
+    if (Number.isFinite(sectionIndexFromPayload) && sectionIndexFromPayload >= 0) {
+      stateManager.setState('sectionIndex', sectionIndexFromPayload);
+    } else if (Number.isFinite(sectionNumber) && sectionNumber > 0) {
       stateManager.setState('sectionIndex', sectionNumber - 1);
     }
 
@@ -737,16 +752,22 @@ class SmartTeacherApp {
       data.reasoning || data.reasoning_trace || data.metrics?.reasoning_trace || []
     );
 
-    const chapterNumber = Number(data.chapter_number ?? data.chapter_index ?? 1);
-    const sectionNumber = Number(data.section_number ?? data.section ?? data.section_index ?? 1);
+    const chapterIndexFromPayload = Number(data.chapter_index);
+    const sectionIndexFromPayload = Number(data.section_index);
+    const chapterNumber = Number(data.chapter_number ?? (Number.isFinite(chapterIndexFromPayload) ? chapterIndexFromPayload + 1 : 1));
+    const sectionNumber = Number(data.section_number ?? data.section ?? (Number.isFinite(sectionIndexFromPayload) ? sectionIndexFromPayload + 1 : 1));
 
     stateManager.setState('activePanel', 'course');
     stateManager.setState('slideTitle', sectionTitle);
     stateManager.setState('slideText', narration);
-    if (Number.isFinite(chapterNumber) && chapterNumber > 0) {
+    if (Number.isFinite(chapterIndexFromPayload) && chapterIndexFromPayload >= 0) {
+      stateManager.setState('chapterIndex', chapterIndexFromPayload);
+    } else if (Number.isFinite(chapterNumber) && chapterNumber > 0) {
       stateManager.setState('chapterIndex', chapterNumber - 1);
     }
-    if (Number.isFinite(sectionNumber) && sectionNumber > 0) {
+    if (Number.isFinite(sectionIndexFromPayload) && sectionIndexFromPayload >= 0) {
+      stateManager.setState('sectionIndex', sectionIndexFromPayload);
+    } else if (Number.isFinite(sectionNumber) && sectionNumber > 0) {
       stateManager.setState('sectionIndex', sectionNumber - 1);
     }
 
@@ -927,6 +948,11 @@ class SmartTeacherApp {
       return false;
     }
 
+    if (!this._ensureRealtimeSessionStarted()) {
+      UIManager.showNotification('Session non initialisée, réessaie dans quelques secondes.', 'warning');
+      return false;
+    }
+
     wsClient.send({
       type: 'start_presentation',
       course_id: courseId,
@@ -969,6 +995,11 @@ class SmartTeacherApp {
       return false;
     }
 
+    if (!this._ensureRealtimeSessionStarted()) {
+      UIManager.showNotification('Session non initialisée, impossible de changer la slide.', 'warning');
+      return false;
+    }
+
     this._interruptCurrentPlayback('slide_change');
 
     const nextSectionIndex = (stateManager.sectionIndex || 0) + 1;
@@ -987,6 +1018,11 @@ class SmartTeacherApp {
 
   previousSlide() {
     if (!wsClient.isConnected()) {
+      return false;
+    }
+
+    if (!this._ensureRealtimeSessionStarted()) {
+      UIManager.showNotification('Session non initialisée, impossible de changer la slide.', 'warning');
       return false;
     }
 
@@ -1024,6 +1060,114 @@ class SmartTeacherApp {
     }
 
     return null;
+  }
+
+  _restoreStudentContext() {
+    const studentId = localStorage.getItem('student_id') || '';
+    const studentEmail = localStorage.getItem('student_email') || '';
+    const studentName = localStorage.getItem('student_name') || '';
+
+    if (studentId) {
+      stateManager.setState('studentId', studentId);
+    }
+    if (studentEmail) {
+      stateManager.setState('studentEmail', studentEmail);
+    }
+    if (studentName) {
+      stateManager.setState('studentName', studentName);
+    }
+  }
+
+  _storeStudentContext(student = {}) {
+    const id = String(student.id || '').trim();
+    const email = String(student.email || '').trim();
+    const firstName = String(student.first_name || '').trim();
+
+    if (id) {
+      localStorage.setItem('student_id', id);
+      stateManager.setState('studentId', id);
+    }
+    if (email) {
+      localStorage.setItem('student_email', email);
+      stateManager.setState('studentEmail', email);
+    }
+    if (firstName) {
+      localStorage.setItem('student_name', firstName);
+      stateManager.setState('studentName', firstName);
+    }
+  }
+
+  _clearStudentContext() {
+    localStorage.removeItem('student_id');
+    localStorage.removeItem('student_email');
+    localStorage.removeItem('student_name');
+    localStorage.removeItem('auth_token');
+    stateManager.setState('studentId', null);
+    stateManager.setState('studentEmail', '');
+    stateManager.setState('studentName', '');
+  }
+
+  _exposeAuthHelpers() {
+    this.auth = {
+      register: async (payload) => {
+        const response = await fetch('/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data?.detail || `Register failed (${response.status})`);
+        }
+        localStorage.setItem('auth_token', data.token || '');
+        this._storeStudentContext(data.student || {});
+        UIManager.showNotification('Compte cree avec succes', 'success');
+        return data;
+      },
+      login: async (email, password) => {
+        const response = await fetch('/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data?.detail || `Login failed (${response.status})`);
+        }
+        localStorage.setItem('auth_token', data.token || '');
+        this._storeStudentContext(data.student || {});
+        UIManager.showNotification('Connexion reussie', 'success');
+        return data;
+      },
+      me: async () => {
+        const token = localStorage.getItem('auth_token') || '';
+        if (!token) {
+          throw new Error('Aucun token de connexion');
+        }
+        const response = await fetch('/auth/me', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data?.detail || `Me failed (${response.status})`);
+        }
+        this._storeStudentContext(data.student || {});
+        return data;
+      },
+      logout: () => {
+        this._clearStudentContext();
+        UIManager.showNotification('Deconnexion effectuee', 'info');
+      },
+    };
+  }
+
+  _ensureRealtimeSessionStarted() {
+    if (!wsClient.isConnected()) return false;
+    if (wsClient.sessionStarted) return true;
+    return wsClient.startSession(
+      wsClient.sessionLanguage || stateManager.course?.language || 'fr',
+      wsClient.sessionLevel || stateManager.course?.level || 'lycée'
+    );
   }
 }
 

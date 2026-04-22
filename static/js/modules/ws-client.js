@@ -86,6 +86,9 @@ class WSClient {
         try {
           const data = JSON.parse(event.data);
           this._emit('message', data);
+          if (data && data.type === 'error') {
+            this._emit('server_error', data);
+          }
           this._emit(data.type, data);
         } catch (error) {
           console.error('❌ Failed to parse WebSocket message:', error);
@@ -94,7 +97,7 @@ class WSClient {
 
       this.ws.onerror = (error) => {
         this.connected = false;
-        this._emit('error', { error, timestamp: Date.now() });
+        this._emit('ws_error', { error, timestamp: Date.now() });
         console.error('❌ WebSocket error:', error);
       };
 
@@ -205,6 +208,7 @@ class WSClient {
       language,
       level,
       token,
+      student_id: stateManager.studentId || localStorage.getItem('student_id') || null,
       course_id: stateManager.courseId || '',
     });
 

@@ -25,6 +25,9 @@ async def answer_text_question(request: Request, question: str = Form(...), cour
 
     language = detect_lang_text(question)
     subject = detect_subject(question)
+    rag_class = knowledge_retrieval_engine.__class__.__name__
+    rag_module = knowledge_retrieval_engine.__class__.__module__
+    agentic_mode = "agentic" in rag_class.lower() or "agentic" in rag_module.lower()
     chunks_with_scores = knowledge_retrieval_engine.retrieve_chunks(question, k=Config.RAG_NUM_RESULTS, course_id=course_id)
 
     llm_start = __import__("time").time()
@@ -53,6 +56,20 @@ async def answer_text_question(request: Request, question: str = Form(...), cour
             "llm_time": round(llm_time, 2),
             "tts_time": round(tts_time, 2),
             "total_time": round(total_time, 2),
+        },
+        "agentic_rag_state": {
+            "enabled": bool(Config.RAG_ENABLED),
+            "mode": "agentic" if agentic_mode else "classic",
+            "rag_class": rag_class,
+            "rag_module": rag_module,
+            "supported_stages": {
+                "analyze_question": True,
+                "reformulate_query": agentic_mode,
+                "retrieve_documents": bool(Config.RAG_ENABLED),
+                "reason": True,
+                "verify_answer": agentic_mode,
+                "improve_answer": agentic_mode,
+            },
         },
     }
 

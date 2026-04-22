@@ -8,6 +8,9 @@ class StateManager {
   constructor() {
     // Session & course state
     this.sessionId = null;
+    this.studentId = null;
+    this.studentEmail = '';
+    this.studentName = '';
     this.course = null;
     this.courseId = null;
     this.chapterIndex = 0;

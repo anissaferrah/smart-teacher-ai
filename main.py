@@ -46,6 +46,7 @@ from database.core import AsyncSessionLocal, check_db_connection, create_tables
 from api.ws_router import router as ws_router, set_session_service
 from services.orchestrators.realtime_session_service import create_session_service
 from api import analytics as analytics_api
+from api import auth as auth_api
 from api import cache as cache_api
 from api import course as course_api
 from api import health as health_api
@@ -142,6 +143,7 @@ if Path("static").exists():
 app.include_router(ws_router, prefix="", tags=["websocket"])
 app.include_router(dashboard_router, tags=["monitoring"])
 app.include_router(health_api.router, prefix="/health", tags=["health"])
+app.include_router(auth_api.router, prefix="/auth", tags=["auth"])
 app.include_router(sessions_api.router, prefix="/sessions", tags=["sessions"])
 app.include_router(search_api.router, prefix="/search", tags=["search"])
 app.include_router(analytics_api.router, prefix="/analytics", tags=["analytics"])

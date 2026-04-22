@@ -48,6 +48,37 @@ class QAService:
         self._qa_cache_order: List[str] = []
         self._qa_cache_max_entries = 300
 
+    def _resolve_rag_state(self) -> Dict[str, Any]:
+        """Expose the effective RAG mode used for this QA turn."""
+        rag_enabled = bool(settings.rag.enabled and self.rag)
+        rag_class = self.rag.__class__.__name__ if self.rag else "None"
+        rag_module = self.rag.__class__.__module__ if self.rag else ""
+
+        is_agentic = "agentic" in rag_module.lower() or "agentic" in rag_class.lower()
+        if not is_agentic and self.rag:
+            # Heuristic for future agentic adapters exposing richer orchestration hooks.
+            is_agentic = any(
+                hasattr(self.rag, attr)
+                for attr in ("run_pipeline", "orchestrate", "process_query", "execute")
+            )
+
+        supported_stages = {
+            "analyze_question": True,
+            "reformulate_query": is_agentic,
+            "retrieve_documents": rag_enabled,
+            "reason": True,
+            "verify_answer": is_agentic,
+            "improve_answer": is_agentic,
+        }
+
+        return {
+            "enabled": rag_enabled,
+            "mode": "agentic" if is_agentic else "classic",
+            "rag_class": rag_class,
+            "rag_module": rag_module,
+            "supported_stages": supported_stages,
+        }
+
     @staticmethod
     def _normalize_question(text: str) -> str:
         normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
@@ -163,6 +194,8 @@ class QAService:
         }
         reasoning_trace: List[Dict[str, Any]] = []
         history = history or []
+        rag_state = self._resolve_rag_state()
+        metrics['agentic_rag_state'] = rag_state
 
         normalized_question = self._normalize_question(question_text)
         cache_prefix = self._question_context_prefix(session_id, language, subject, ctx)
@@ -254,6 +287,21 @@ class QAService:
                     await result
             except Exception as audio_exc:
                 log.debug(f"QA audio chunk callback failed: {audio_exc}")
+
+        await add_trace_step(
+            step=0,
+            key='agentic_rag_state',
+            title='État du pipeline RAG',
+            state=DialogState.PROCESSING.value,
+            status='done',
+            summary=(
+                f"Mode RAG: {rag_state['mode']} ({rag_state['rag_class']})"
+                if rag_state['enabled']
+                else 'RAG désactivé pour cette question'
+            ),
+            duration_ms=0.0,
+            details=rag_state,
+        )
         
         try:
             # Step 1: RAG retrieval

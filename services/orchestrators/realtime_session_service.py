@@ -591,6 +591,7 @@ class RealtimeSessionService:
                         "steps": combined_reasoning,
                         "current_state": metrics.get("system_state", "idle"),
                         "current_stage": metrics.get("current_stage", "completed"),
+                        "agentic_rag_state": metrics.get("agentic_rag_state", {}),
                     },
                 })
 
@@ -744,6 +745,7 @@ class RealtimeSessionService:
                         "steps": combined_reasoning,
                         "current_state": metrics.get("system_state", "idle"),
                         "current_stage": metrics.get("current_stage", "completed"),
+                        "agentic_rag_state": metrics.get("agentic_rag_state", {}),
                     },
                 })
 
