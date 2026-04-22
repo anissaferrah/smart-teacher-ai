@@ -1,3 +1,9 @@
 event_time,session_id,student_id,course_id,language,level,event_type,question,answer_length,stt_time,llm_time,tts_time,total_time,kpi_ok,subject,chapter_idx,section_idx,confidence,interruptions
 2026-04-22T10:03:38.373342,654f9c3f-9cf4-4c3c-a65f-df0186a0974b,,90362aee-9daa-4c94-af46-4b72641727c6,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
 2026-04-22T10:13:49.451138,728cb5b0-24b9-438b-b24e-e44677d849b5,,90362aee-9daa-4c94-af46-4b72641727c6,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-04-22T15:57:36.955814,67d8a1bc-f388-45ce-a90a-fb107a417e91,,a4d4f532-9767-4a4d-a502-cebae6269ed5,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,0,0.0,0
+2026-04-22T15:58:15.923776,67d8a1bc-f388-45ce-a90a-fb107a417e91,,a4d4f532-9767-4a4d-a502-cebae6269ed5,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,2,0.0,0
+2026-04-22T15:58:18.670534,67d8a1bc-f388-45ce-a90a-fb107a417e91,,a4d4f532-9767-4a4d-a502-cebae6269ed5,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,4,0.0,0
+2026-04-22T15:58:20.121536,67d8a1bc-f388-45ce-a90a-fb107a417e91,,a4d4f532-9767-4a4d-a502-cebae6269ed5,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,6,0.0,0
+2026-04-22T15:58:21.155527,67d8a1bc-f388-45ce-a90a-fb107a417e91,,a4d4f532-9767-4a4d-a502-cebae6269ed5,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,8,0.0,0
+2026-04-22T15:58:22.299429,67d8a1bc-f388-45ce-a90a-fb107a417e91,,a4d4f532-9767-4a4d-a502-cebae6269ed5,en,lycée,section_start,,0,0.0,0.0,0.0,0.0,False,,0,10,0.0,0

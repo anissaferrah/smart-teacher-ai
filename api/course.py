@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import tempfile
 import uuid
 from pathlib import Path
@@ -10,6 +11,8 @@ from database.core import AsyncSessionLocal
 from domains_config import auto_detect_course
 from modules.pedagogy.course_builder import CourseBuilder
 from services.app_state import agentic_document_manager, ingestion_service, knowledge_retrieval_engine, media_service
+
+log = logging.getLogger("SmartTeacher.CourseAPI")
 
 router = APIRouter(tags=["course"])
 
@@ -205,6 +208,7 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 chapter=target_chapter,
                 course_title_hint=extracted_title,
             )
+            log.info(f"📄 build_from_file_direct result: title={course_data.get('title')}, chapters={len(course_data.get('chapters', []))}, sections={sum(len(ch.get('sections',[])) for ch in course_data.get('chapters',[]))}")
 
             course_id = None
             db_error = None
@@ -220,6 +224,7 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                     course_id = await builder.save_to_database(course_data, db, domain=target_domain)
             except Exception as exc:
                 db_error = str(exc)
+                log.error(f"❌ save_to_database a échoué pour {upload_filename}: {exc}", exc_info=True)
 
             files_to_index.append({
                 "course_data": course_data,
@@ -230,6 +235,10 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 "storage_path": str(destination.resolve()),
                 "media_upload_path": media_upload_path,
             })
+            log.info(f"✅ fichier ajouté à files_to_index: {upload_filename}, sections={len(course_data.get('sections', []))}, chapters={len(course_data.get('chapters', []))}")
+
+            if db_error:
+                log.warning(f"⚠️ DB save partial pour {upload_filename}: {db_error}")
 
             chapters = len(course_data.get("chapters", []))
             sections = sum(len(ch.get("sections", [])) for ch in course_data.get("chapters", []))
@@ -256,6 +265,7 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 stage="file_done",
             )
         except Exception as exc:
+            log.error(f"❌ Erreur traitement fichier {upload_filename}: {exc}", exc_info=True)
             results.append({"file": uploaded_file.filename, "status": "error", "error": str(exc)})
 
             await ingestion_service.update_progress(
@@ -272,6 +282,11 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
                 except Exception:
                     pass
 
+    if not files_to_index and results:
+        # Tous les fichiers ont échoué — diagnostics
+        errors = [r.get("error", "unknown") for r in results if r.get("status") == "error"]
+        log.error(f"❌ Aucun fichier indexé. Erreurs: {errors}")
+
     if files_to_index:
         await ingestion_service.update_progress(
             processed_files=len(files_to_index),
@@ -286,13 +301,18 @@ async def build_course_from_upload(files: list[UploadFile] = File(...), language
             course_id = item["course_id"]
             target_domain = item["domain"]
             target_course = item["course"]
-            agentic_document_manager.index_course_data(
-                course_data,
-                domain=target_domain,
-                course=target_course,
-                course_id=course_id,
-                incremental=True,
-            )
+            try:
+                ok = agentic_document_manager.index_course_data(
+                    course_data,
+                    domain=target_domain,
+                    course=target_course,
+                    course_id=course_id,
+                    incremental=True,
+                )
+                if not ok:
+                    log.warning(f"⚠️ index_course_data a retourné False pour course_id={course_id}")
+            except Exception as exc:
+                log.error(f"❌ index_course_data a levé: {exc}", exc_info=True)
 
         stats = knowledge_retrieval_engine.get_stats()
         await ingestion_service.complete_ingestion(int(stats.get("total_docs", 0)))
