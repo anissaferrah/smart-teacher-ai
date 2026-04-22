@@ -22,6 +22,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import Optional
+import re as _re
 
 # Import configuration domaines & cours
 import sys
@@ -38,11 +39,15 @@ log = logging.getLogger("SmartTeacher.CourseBuilder")
 class TextExtractor:
     """Extrait le texte structuré depuis PDF, DOCX, PPTX, TXT."""
 
-    def extract(self, file_path: str) -> str:
+    def extract(self, file_path: str, force_ocr: bool = False, lang: str = "fra") -> str:
         ext = Path(file_path).suffix.lower()
         log.info(f"📄 Extraction : {Path(file_path).name}")
         if ext == ".pdf":
-            return self._extract_pdf(file_path)
+            if force_ocr:
+                log.info(f"✅ Extraction OCR forcée avec langue : {lang}")
+                return LocalStructurer()._extract_text_with_ocr(file_path, lang=lang)
+            else:
+                return self._extract_pdf(file_path)
         elif ext == ".docx":
             return self._extract_docx(file_path)
         elif ext == ".pptx":
@@ -166,22 +171,45 @@ class LocalStructurer:
             self.convert_from_path = None
             self.available_ocr_langs = set()
 
+    # Mapping des codes ISO 639-1 vers codes Tesseract
+    _ISO_TO_TESSERACT = {
+        "en": "eng",
+        "fr": "fra",
+        "ar": "ara",
+        "es": "spa",
+        "de": "deu",
+        "it": "ita",
+        "pt": "por",
+        "ru": "rus",
+        "zh": "chi_sim",
+        "ja": "jpn",
+    }
+
     def _select_ocr_language(self, requested_lang: str) -> str:
         """Choisit une langue Tesseract réellement installée pour éviter le fallback English par défaut."""
         if not self.pytesseract or not self.available_ocr_langs:
             return ""
 
-        requested_parts = [part.strip() for part in requested_lang.split("+") if part.strip()]
-        selected = [part for part in requested_parts if part in self.available_ocr_langs]
-        if selected:
-            return "+".join(selected)
+        # Convertir code ISO vers code Tesseract
+        resolved = []
+        for part in requested_lang.split("+"):
+            part = part.strip()
+            if part in self.available_ocr_langs:
+                resolved.append(part)
+            elif part in self._ISO_TO_TESSERACT:
+                tesseract_code = self._ISO_TO_TESSERACT[part]
+                if tesseract_code in self.available_ocr_langs:
+                    resolved.append(tesseract_code)
 
-        for fallback in ("fra", "ara", "eng"):
+        if resolved:
+            return "+".join(resolved)
+
+        for fallback in ("eng", "fra", "ara"):
             if fallback in self.available_ocr_langs:
                 return fallback
 
         return next(iter(sorted(self.available_ocr_langs)), "")
-
+    
     def _pdf_to_images(self, pdf_path: str, output_dir: str) -> list[str]:
         """Convertit PDF en images PNG."""
         output_path = Path(output_dir)
@@ -193,47 +221,57 @@ class LocalStructurer:
             except Exception:
                 pass
 
+        def _sort_pngs(paths: list[str]) -> list[str]:
+            import re
+            def _page_num(p):
+                m = re.search(r'page_(\d+)', p)
+                return int(m.group(1)) if m else 0
+            return sorted(paths, key=_page_num)
+
+        paths = []
+
+        # pdf2image
         if self.convert_from_path:
             try:
                 images = self.convert_from_path(pdf_path, dpi=150)
-                paths = []
+
                 for i, img in enumerate(images, 1):
                     png_path = output_path / f"page_{i:03d}.png"
                     img.save(str(png_path), "PNG")
                     paths.append(str(png_path))
-                if paths:
-                    log.info(f"  ✅ {len(paths)} PNG générées")
-                    return paths
-                log.warning("  ⚠️ pdf2image n'a produit aucune image, fallback pypdfium2…")
-            except Exception as e:
-                log.info(f"  ℹ️ Conversion PDF→PNG via pdf2image échouée: {e}")
 
+                if paths:
+                    log.info(f"✅ {len(paths)} PNG générées")
+                    return _sort_pngs(paths)
+
+            except Exception as e:
+                log.info(f"ℹ️ pdf2image échouée: {e}")
+
+        # fallback pypdfium2
         try:
             import pypdfium2 as pdfium
 
             pdf = pdfium.PdfDocument(pdf_path)
             paths = []
-            try:
-                for i in range(len(pdf)):
-                    page = pdf[i]
-                    bitmap = page.render(scale=2.0)
-                    image = bitmap.to_pil()
-                    png_path = output_path / f"page_{i + 1:03d}.png"
-                    image.save(str(png_path), "PNG")
-                    paths.append(str(png_path))
-            finally:
-                close = getattr(pdf, "close", None)
-                if callable(close):
-                    close()
+
+            for i in range(len(pdf)):
+                page = pdf[i]
+                bitmap = page.render(scale=2.0)
+                image = bitmap.to_pil()
+
+                png_path = output_path / f"page_{i+1:03d}.png"
+                image.save(str(png_path), "PNG")
+                paths.append(str(png_path))
 
             if paths:
-                log.info(f"  ✅ {len(paths)} PNG générées via pypdfium2")
-            return paths
-        except ImportError:
-            log.info("  ℹ️ pypdfium2 non disponible pour convertir le PDF en PNG")
+                log.info(f"✅ {len(paths)} PNG générées via pypdfium2")
+                return _sort_pngs(paths)
+
         except Exception as e:
-            log.info(f"  ℹ️ Conversion PDF→PNG via pypdfium2 échouée: {e}")
-            return []
+            log.info(f"ℹ️ pypdfium2 échouée: {e}")
+
+        return []
+     
 
     def _extract_text_with_ocr(self, pdf_path: str, lang: str = "fra+ara+eng") -> str:
         """Extrait le texte brut avec Tesseract-OCR."""
@@ -410,30 +448,29 @@ class CourseBuilder:
             or re.fullmatch(r"chapitre[_\-\s]*\d+", normalized)
             or re.fullmatch(r"ch\d+", normalized)
         )
-
-    @staticmethod
-    def _chapter_number_from_value(value: str | None) -> int | None:
+    
+    def _chapter_number_from_value(self, value: str | None) -> int | None:
         if not value:
             return None
 
-        normalized = value.strip().lower().replace("\\", "/").split("/")[-1]
+        import re
+        normalized = value.lower()
+
         patterns = [
-            r"(?:chapter|chapitre|chap)\s*[_\-\s]*(\d+)",
-            r"\bchapter[_\-\s]*(\d+)\b",
-            r"\bchapitre[_\-\s]*(\d+)\b",
-            r"\bchap[_\-\s]*(\d+)\b",
-            r"\bch[_\-\s]*(\d+)\b",
+            r"(?:chapter|chapitre|chap)\s*(\d+)",
+            r"ch(\d+)",
+            r"(\d+)"
         ]
 
-        for pattern in patterns:
-            match = re.search(pattern, normalized)
-            if match:
+        for p in patterns:
+            m = re.search(p, normalized)
+            if m:
                 try:
-                    return max(1, int(match.group(1)))
-                except (TypeError, ValueError):
-                    continue
-
+                    return int(m.group(1))
+                except:
+                    pass
         return None
+
 
     @staticmethod
     def _chapter_slug(value: str | None, fallback: str = "chapter_1") -> str:
@@ -664,20 +701,31 @@ class CourseBuilder:
         log.info(f"\n✅ Cours {course} prêt : {len(results)}/{len(chapters)} chapitres chargés")
         return results
 
+
     def _infer_context_from_file(
         self,
         file_path: str,
         fallback_domain: str = DEFAULT_DOMAIN,
         fallback_course: str | None = None,
         fallback_chapter: str = "chapter_1",
-    ) -> tuple[str, str, str]:
-        """Infère la hiérarchie à partir du chemin local sauvegardé."""
-        return self.infer_upload_context(
-            file_path,
-            fallback_domain=fallback_domain,
-            fallback_course=fallback_course,
-            fallback_chapter=fallback_chapter,
-        )
+    ):
+        import os
+
+        raw = file_path.replace("\\", "/")
+        parts = raw.split("/")
+
+        file_stem = os.path.splitext(parts[-1])[0]
+
+        domain = fallback_domain
+        course = fallback_course or file_stem
+        chapter = fallback_chapter
+
+        # 🔥 FIX: detect chapter properly
+        chapter_num = self._chapter_number_from_value(file_stem)
+        if chapter_num:
+            chapter = f"chapter_{chapter_num}"
+
+        return domain, course, chapter
 
     async def _build_chapter(
         self,
@@ -828,141 +876,122 @@ class CourseBuilder:
         course_data["slides"] = [f"/media/slides/{domain}/{course_slug}/{chapter_slug}/page_{i+1:03d}.png" for i in range(len(png_paths))]
         self._print_summary(course_data)
         return course_data
+    
+
 
     async def build_from_file_direct(
         self,
-        file_path: str,
-        language: str = "en",
-        level: str = "université",
-        subject: str = "",
-        domain: str = DEFAULT_DOMAIN,
-        chapter: str = "chapter_1",
-        course_title_hint: str | None = None,
-    ) -> dict:
-        """
-        Construit un cours directement depuis le fichier, sans génération IA.
-        - PPTX : 1 slide = 1 section (structure conservée)
-        - PDF  : 1 page  = 1 section (ordre exact conservé)
-        - DOCX/TXT/MD : sections extraites par heuristique sur les titres
-        """
+        file_path,
+        language="en",
+        level="université",
+        subject="",
+        domain="general",
+        chapter="chapter_1",
+        course_title_hint: str | None = None,   # ✅ FIX IMPORTANT
+    ):
         path = Path(file_path)
+
         if not path.exists():
             raise FileNotFoundError(f"Fichier introuvable : {file_path}")
 
+        # ─────────────────────────────────────────
+        # 1. INFÉRENCE CONTEXTE
+        # ─────────────────────────────────────────
         inferred_domain, course_slug, chapter_slug = self._infer_context_from_file(
             str(path),
             fallback_domain=domain,
-            fallback_course=subject or None,
-            fallback_chapter=chapter,
+            fallback_course=subject,
+            fallback_chapter=chapter
         )
-        domain = inferred_domain or domain
-        chapter_title = self._display_label(chapter_slug, "Chapter 1")
-        course_title_hint = (course_title_hint or "").strip()
 
-        if course_slug.lower() in {DEFAULT_COURSE, "generic"} and course_title_hint:
-            course_slug = self._course_slug(course_title_hint, fallback=course_slug, domain=domain)
+        domain = inferred_domain
 
-        log.info(f"\n{'='*60}")
-        log.info(f"📚 Construction directe (sans IA) : {path.name}")
-        log.info(f"{'='*60}")
+        chapter_order = self._chapter_number_from_value(path.stem)
+        if not chapter_order:
+            chapter_order = self._chapter_number_from_value(chapter_slug)
+        if not chapter_order:
+            chapter_order = 1
 
-        sections: list[dict] = []
-        ext = path.suffix.lower()
-        slides: list[str] = []
-        title_source_text = ""
+        chapter_title = self._display_label(chapter_slug, f"Chapter {chapter_order}")
 
-        if ext == ".pdf":
-            course_dir = Path("media/slides") / domain / course_slug
-            chapter_dir = course_dir / chapter_slug
-            chapter_dir.mkdir(parents=True, exist_ok=True)
+        log.info(f"📚 BUILD: {domain} / {course_slug} / {chapter_slug}")
 
+        # ─────────────────────────────────────────
+        # 2. EXTRACTION SLIDES + PDF
+        # ─────────────────────────────────────────
+        course_dir = Path("media/slides") / domain / course_slug
+        chapter_dir = course_dir / chapter_slug
+        chapter_dir.mkdir(parents=True, exist_ok=True)
+
+        png_paths = []
+
+        if path.suffix.lower() == ".pdf":
             png_paths = self.structurer._pdf_to_images(str(path), str(chapter_dir))
-            slides = [
-                f"/media/slides/{domain}/{course_slug}/{chapter_slug}/page_{i+1:03d}.png"
-                for i in range(len(png_paths))
-            ]
 
-            pages = self._extract_pdf_pages(str(path))
-            title_source_text = "\n\n".join(page_text for _, page_text in pages if page_text)
-            for page_idx, page_text in pages:
-                content = (page_text or "").strip()
-                if not content:
-                    continue
+        slides = [
+            f"/media/slides/{domain}/{course_slug}/{chapter_slug}/page_{i+1:03d}.png"
+            for i in range(len(png_paths))
+        ]
 
-                title = self._infer_page_title(content, page_idx)
-                sections.append({
-                    "title": title,
-                    "order": page_idx,
-                    "page_index": page_idx,
-                    "content": content,
-                    "duration_s": self._estimate_duration(content),
-                    "concepts": [],
-                    "image_url": slides[page_idx - 1] if page_idx - 1 < len(slides) else "",
-                })
-        elif ext == ".pptx":
-            slides_data = self.extractor.extract_structured_pptx(str(path))
-            title_source_text = "\n\n".join((s.get("content") or "") for s in slides_data if s.get("content"))
-            for i, s in enumerate(slides_data, start=1):
-                title = (s.get("title") or f"Slide {i}").strip()
-                content = (s.get("content") or "").strip()
-                if not content:
-                    continue
-                sections.append({
-                    "title": title,
-                    "order": i,
-                    "page_index": i,
-                    "content": content,
-                    "duration_s": self._estimate_duration(content),
-                    "concepts": [],
-                    "image_url": "",
-                })
-        else:
-            raw_text = self.extractor.extract(str(path)).strip()
-            title_source_text = raw_text
-            if len(raw_text) < 30:
-                raise ValueError(f"Texte trop court : {len(raw_text)} chars")
+        # ─────────────────────────────────────────
+        # 3. EXTRACTION TEXTE
+        # ─────────────────────────────────────────
+        # Essayer extraction normale d'abord (PDF avec texte intégrél)
+        raw_text = self.extractor.extract(str(path), force_ocr=False, lang=language)
 
-            chunks = self._split_text_into_sections(raw_text)
-            for i, chunk in enumerate(chunks, start=1):
-                title, content = chunk
-                if not content.strip():
-                    continue
-                sections.append({
-                    "title": title or f"Section {i}",
-                    "order": i,
-                    "page_index": i,
-                    "content": content.strip(),
-                    "duration_s": self._estimate_duration(content),
-                    "concepts": [],
-                    "image_url": "",
-                })
+        # Si texte trop court, fallback vers OCR (pour PDFs scannés)
+        if len(raw_text.strip()) < 100:
+            raw_text = self.extractor.extract(str(path), force_ocr=True, lang=language)
 
-        if not sections:
-            raise ValueError("Impossible d'extraire des sections depuis ce fichier")
+        if len(raw_text.strip()) < 100:
+            raise ValueError("Texte trop court pour construire un cours")
 
-        course_title = self._display_label(course_title_hint, path.stem) if course_title_hint else self._infer_course_title(title_source_text, course_slug, path.stem)
+        # ─────────────────────────────────────────
+        # 4. TITRE COURS (FIX IMPORTANT)
+        # ─────────────────────────────────────────
+        course_title = (
+            self._display_label(course_title_hint, path.stem)
+            if course_title_hint
+            else self._infer_course_title(raw_text, course_slug, path.stem)
+        )
 
-        course_data = {
-            "title": course_title,
+        # ─────────────────────────────────────────
+        # 5. STRUCTURATION
+        # ─────────────────────────────────────────
+        course_data = await self.structurer.structure(
+            raw_text=raw_text,
+            language=language,
+            level=level,
+            title=course_title,
+            subject=course_slug,
+            chapter_idx=chapter_order,
+        )
+
+        # ─────────────────────────────────────────
+        # 6. ENRICHISSEMENT FINAL
+        # ─────────────────────────────────────────
+        course_data.update({
+            "file_path": str(path),
             "subject": course_slug,
-            "language": language,
-            "level": level,
-            "description": "Cours importé directement (sans génération IA)",
-            "chapter_order": self._chapter_number_from_value(chapter_slug) or 1,
+            "title": course_title,
+            "chapter_slug": chapter_slug,
+            "chapter_order": chapter_order,
+            "slides": slides,
             "chapters": [
                 {
                     "title": chapter_title,
-                    "order": self._chapter_number_from_value(chapter_slug) or 1,
+                    "order": chapter_order,
                     "summary": "Import direct du document original",
-                    "sections": sections,
+                    "sections": course_data["chapters"][0]["sections"],
                 }
             ],
-            "file_path": str(path),
-            "slides": slides,
-            "chapter_slug": chapter_slug,
-        }
+        })
 
+        # ─────────────────────────────────────────
+        # 7. LOG FINAL
+        # ─────────────────────────────────────────
         self._print_summary(course_data)
+
         return course_data
 
     def _extract_pdf_pages(self, path: str) -> list[tuple[int, str]]:
@@ -998,24 +1027,30 @@ class CourseBuilder:
             subject=course_slug,
         )
 
-    async def save_to_database(self, course_data: dict, db, domain: str = DEFAULT_DOMAIN) -> str:
+    async def save_to_database(self, course_data: dict, db, domain: str = "general") -> str:
+        """
+        Persist course_data to PostgreSQL.
+    
+        FIX-4: section.order is set to page_index (= PDF page number).
+        FIX-5: sections are inserted in ascending page_index order so the DB
+            stores them in the same order as the PDF.
+        """
         from database.models import Course, Chapter, Section, Concept
-        log.info("💾 Sauvegarde PostgreSQL…")
-
+    
         course = Course(
             title=course_data.get("title", "Cours importé"),
-            domain=domain,  # 🎯 Stocker le domaine
-            subject=course_data.get("subject", DEFAULT_COURSE),
-            language=course_data.get("language", "en"),
-            level=course_data.get("level", "université"),
+            domain=domain,
+            subject=course_data.get("subject", "generic"),
+            language=course_data.get("language", "fr"),
+            level=course_data.get("level", "lycée"),
             description=course_data.get("description", ""),
             file_path=course_data.get("file_path", ""),
         )
         db.add(course)
         await db.flush()
-
-        slides = course_data.get("slides", [])  # 🎨 Récupérer les PNG paths
-
+    
+        slides = course_data.get("slides", [])
+    
         for ch_data in course_data.get("chapters", []):
             chapter = Chapter(
                 course_id=course.id,
@@ -1025,34 +1060,50 @@ class CourseBuilder:
             )
             db.add(chapter)
             await db.flush()
-
-            for i, sec_data in enumerate(ch_data.get("sections", [])):
-                # 🎨 Préserver le lien exact entre la section et sa slide PNG.
-                section_order = sec_data.get("page_index") or sec_data.get("order") or (i + 1)
+    
+            # FIX-5: sort sections by page_index ASC before inserting
+            raw_sections = ch_data.get("sections", [])
+            sorted_sections = sorted(
+                raw_sections,
+                key=lambda s: int(s.get("page_index") or s.get("order") or 0)
+            )
+    
+            for sec_data in sorted_sections:
+                # FIX-4: use page_index as order (= PDF page number)
+                page_index = int(
+                    sec_data.get("page_index") or sec_data.get("order") or 0
+                )
+    
                 image_url = (sec_data.get("image_url") or "").strip()
-
-                if not image_url and section_order:
-                    slide_index = int(section_order) - 1
-                    if 0 <= slide_index < len(slides):
-                        image_url = slides[slide_index]
-
-                if not image_url and i < len(slides):
-                    image_url = slides[i]
-
-                image_urls = sec_data.get("image_urls") or ([] if not image_url else [image_url])
-                
+    
+                # Match PNG by page_index (1-based)
+                if not image_url and page_index:
+                    slide_idx = page_index - 1          # 0-based list index
+                    if 0 <= slide_idx < len(slides):
+                        image_url = slides[slide_idx]
+    
+                # Fallback: positional match if page_index unavailable
+                if not image_url:
+                    pos = sorted_sections.index(sec_data)
+                    if 0 <= pos < len(slides):
+                        image_url = slides[pos]
+    
+                image_urls = sec_data.get("image_urls") or (
+                    [] if not image_url else [image_url]
+                )
+    
                 section = Section(
                     chapter_id=chapter.id,
                     title=sec_data["title"],
-                    order=section_order,
+                    order=page_index,           # FIX-4: order = PDF page number
                     content=sec_data.get("content", ""),
-                    image_url=image_url,  # 🎨 PNG path de cette slide
+                    image_url=image_url,
                     image_urls=image_urls,
                     duration_s=sec_data.get("duration_s", 120),
                 )
                 db.add(section)
                 await db.flush()
-
+    
                 for c_data in sec_data.get("concepts", []):
                     concept = Concept(
                         section_id=section.id,
@@ -1062,11 +1113,15 @@ class CourseBuilder:
                         concept_type=c_data.get("type", "definition"),
                     )
                     db.add(concept)
-
+    
         await db.commit()
         course_id = str(course.id)
-        log.info(f"✅ Cours sauvegardé : ID={course_id}")
+        import logging
+        logging.getLogger("SmartTeacher.CourseBuilder").info(
+            f"✅ Cours sauvegardé (FIX-4/FIX-5): ID={course_id}"
+        )
         return course_id
+                
 
     def _estimate_duration(self, text: str) -> int:
         """Estime une durée de lecture (en secondes) selon le nombre de mots."""

@@ -80,7 +80,7 @@ IDLE -> PRESENTING -> LISTENING -> PROCESSING -> RESPONDING
 ### 1. Créer et activer l’environnement Python
 
 ```powershell
-envProject\Scripts\Activate.ps1
+envProject\Scripts\Activate
 ```
 
 ### 2. Installer les dépendances

@@ -399,7 +399,7 @@ class Brain:
                 f"{self.fallback.base_url}/api/generate",
                 json=payload,
                 stream=True,
-                timeout=(5, 15),
+                timeout=None,  # Pas de timeout - Mistral peut prendre 30-60s
             )
 
             if response.status_code == 200:
@@ -546,55 +546,112 @@ class Brain:
         prompt: str,
         temperature: float = 0.7,
         max_tokens: int = 400,
+        system_prompt: str = "",
     ) -> str:
-        """Backward-compatible generic generation helper.
-
-        Older services still call `generate(...)` directly. This wrapper keeps
-        those call sites working while routing through the same OpenAI/Ollama
-        backends used elsewhere in this module.
-        """
+        """Backward-compatible generic generation helper."""
+        
         prompt = (prompt or "").strip()
         if not prompt:
             return ""
 
         start = time.time()
 
+        # Build messages first
+        if system_prompt.strip():
+            messages = [
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": prompt},
+            ]
+        else:
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+
+        # OpenAI
         if self.client:
             try:
                 log.info("🤖 Generic generation: OpenAI...")
+
                 response = self.client.chat.completions.create(
                     model=Config.GPT_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                answer = self._clean_for_speech(response.choices[0].message.content or "")
+
+                answer = response.choices[0].message.content or ""
+                answer = self._clean_for_speech(answer)
                 answer = self._dedupe_answer_text(answer)
+
                 duration = time.time() - start
                 log.info(f"✅ OpenAI generate OK | {duration:.2f}s | {len(answer)} chars")
+
                 return answer
+
             except Exception as openai_err:
                 if self._should_disable_openai(openai_err):
                     self._disable_openai(str(openai_err))
-                log.warning(f"⚠️  OpenAI generate failed: {openai_err} → Fallback Ollama...")
 
+                log.warning(
+                    f"⚠️ OpenAI generate failed: {openai_err} → Fallback Ollama..."
+                )
+
+        # Ollama fallback
         if self.fallback and self.fallback.available:
             log.info("🖥️ Generic generation: Ollama fallback...")
+
+            full_prompt = prompt
+            if system_prompt.strip():
+                full_prompt = f"{system_prompt.strip()}\n\nUser: {prompt}"
+
             answer = self._call_ollama_sync(
-                prompt=prompt,
+                prompt=full_prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+
             if answer:
                 answer = self._clean_for_speech(answer)
                 answer = self._dedupe_answer_text(answer)
+
                 duration = time.time() - start
                 log.info(f"✅ Ollama generate OK | {duration:.2f}s | {len(answer)} chars")
+
                 return answer
 
         log.error("❌ LLM generic generation unavailable")
         return ""
 
+    async def agenerate(
+        self,
+        messages: list,
+        temperature: float = 0.7,
+        max_tokens: int = 400,
+    ) -> object:
+        """Async LLM call from a messages list (required by Agentic RAG agents)."""
+        system_parts, user_parts = [], []
+        for msg in (messages or []):
+            role = (msg.get("role") or "user").lower()
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            (system_parts if role == "system" else user_parts).append(content)
+
+        system_text = "\n\n".join(system_parts)
+        user_text = "\n\n".join(user_parts)
+        full_prompt = f"{system_text}\n\n{user_text}".strip() if system_text else user_text
+
+        result = await self.generate(
+            full_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_text,
+        )
+
+        class _R:
+            def __init__(self, t):
+                self.content = t or ""
+        return _R(result)
     def label_confusion(
         self,
         text: str,

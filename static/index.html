@@ -10,27 +10,38 @@
   <link rel="stylesheet" href="/static/css/components.css">
   <link rel="stylesheet" href="/static/css/layout.css">
 </head>
+
 <body>
   <div id="appPanel">
+
     <header id="headerContainer" class="header"></header>
 
     <main class="main">
+
+      <!-- COURSE VIEW -->
       <section class="panel active" id="panel-course">
         <div id="slideViewerContainer" class="slide-area"></div>
         <div id="chatPanelContainer" class="chat-col collapsed"></div>
       </section>
 
+      <!-- LIBRARY -->
       <section class="panel" id="panel-library">
         <div class="lib">
+
+          <!-- UPLOAD ZONE -->
           <div class="up-zone" id="dz">
             <input type="file" id="fi" multiple accept=".pdf,.docx,.pptx,.txt">
             <div class="up-icon">📄</div>
             <div class="up-txt"><strong>Glissez vos cours ici</strong> ou cliquez</div>
-            <div class="up-txt" style="margin-top:4px;font-size:.78em">PDF · DOCX · PPTX · TXT</div>
+            <div class="up-txt" style="margin-top:4px;font-size:.78em">
+              PDF · DOCX · PPTX · TXT
+            </div>
           </div>
 
+          <!-- FILE INFO -->
           <div id="finfo"></div>
 
+          <!-- OPTIONS -->
           <div class="opts">
             <div class="og">
               <div class="ol">🌐 Language</div>
@@ -39,6 +50,7 @@
                 <option value="en">English</option>
               </select>
             </div>
+
             <div class="og">
               <div class="ol">🎓 Niveau</div>
               <select class="os" id="bLevel">
@@ -49,24 +61,34 @@
             </div>
           </div>
 
-          <button class="btn-build" id="buildBtn" disabled>📤 Importer le cours pour présentation</button>
+          <button class="btn-build" id="buildBtn" disabled>
+            📤 Importer le cours pour présentation
+          </button>
 
+          <!-- PROGRESS -->
           <div class="bp" id="bprog">
             <div class="ps" id="bstat">Construction…</div>
             <div class="pb"><div class="pf" id="pfill"></div></div>
           </div>
 
+          <!-- ✅ NEW: INGESTION LOG -->
+          <div class="ingestion-log" id="ingestionLog"></div>
+
+          <!-- COURSES -->
           <div class="sec-ttl">Cours disponibles</div>
           <div id="courseSelectorContainer"></div>
+
         </div>
       </section>
 
+      <!-- Q/A -->
       <section class="panel" id="panel-qa">
         <div id="qaPanelContainer" class="qa-panel"></div>
       </section>
+
     </main>
   </div>
 
-  <script type="module" src="/static/js/app.js?v=20260421i"></script>
+  <script type="module" src="/static/js/modules/app.js?v=20260421i"></script>
 </body>
 </html>
