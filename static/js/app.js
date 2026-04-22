@@ -1024,7 +1024,7 @@ class SmartTeacherApp {
     if (!this._ensureRealtimeSessionStarted()) {
       UIManager.showNotification('Session non initialisée, impossible de changer la slide.', 'warning');
       return false;
-    }
+     }
 
     this._interruptCurrentPlayback('slide_change');
 

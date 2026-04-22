@@ -98,18 +98,18 @@ export class SlideViewer extends BaseComponent {
   }
 
   next() {
-    stateManager.setState('sectionIndex', stateManager.sectionIndex + 1);
+    // Don't increment here - nextSlide() in app.js handles the increment
     if (this.onNext) this.onNext();
   }
 
   prev() {
-    stateManager.setState('sectionIndex', Math.max(0, stateManager.sectionIndex - 1));
+    // Don't decrement here - previousSlide() in app.js handles the decrement
     if (this.onPrev) this.onPrev();
   }
 
   togglePause() {
+    // Don't modify state here - pause()/resume() in app.js handles it
     const isPaused = stateManager.paused;
-    stateManager.setState('paused', !isPaused);
 
     const btn = this.query('#pauseBtn');
     if (btn) {

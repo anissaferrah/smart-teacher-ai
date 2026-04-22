@@ -78,6 +78,7 @@ class CourseSlide:
     course_id: str
     course_title: str = ""
     course_domain: str = ""
+    course_language: str = "fr"  # Original course language
     chapter_index: int = 0
     chapter_number: int = 1
     chapter_title: str = ""

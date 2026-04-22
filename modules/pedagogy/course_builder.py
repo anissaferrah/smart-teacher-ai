@@ -890,13 +890,15 @@ class CourseBuilder:
                     continue
 
                 title = self._infer_page_title(content, page_idx)
+                # Extract concepts from the OCR'd page content
+                extracted_concepts = self._extract_concepts(content, course_slug)
                 sections.append({
                     "title": title,
                     "order": page_idx,
                     "page_index": page_idx,
                     "content": content,
                     "duration_s": self._estimate_duration(content),
-                    "concepts": [],
+                    "concepts": extracted_concepts,
                     "image_url": slides[page_idx - 1] if page_idx - 1 < len(slides) else "",
                 })
         elif ext == ".pptx":
@@ -907,13 +909,15 @@ class CourseBuilder:
                 content = (s.get("content") or "").strip()
                 if not content:
                     continue
+                # Extract concepts from slide content
+                extracted_concepts = self._extract_concepts(content, course_slug)
                 sections.append({
                     "title": title,
                     "order": i,
                     "page_index": i,
                     "content": content,
                     "duration_s": self._estimate_duration(content),
-                    "concepts": [],
+                    "concepts": extracted_concepts,
                     "image_url": "",
                 })
         else:

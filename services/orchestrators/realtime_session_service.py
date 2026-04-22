@@ -350,10 +350,13 @@ class RealtimeSessionService:
 
                 log.info(f"📖 Presentation started: {slide.course_title}/{slide.chapter_title}")
 
+                # Use course's original language for presentation
+                presentation_language = slide.course_language or "fr"
+
                 narration, audio_bytes = await self.presentation_service.explain_slide_focused(
                     slide,
                     ctx.student_profile,
-                    ctx.language,
+                    presentation_language,
                     cancel_event=presentation_cancel_event,
                 )
 
@@ -516,9 +519,11 @@ class RealtimeSessionService:
                 })
 
                 try:
+                    # Use course language for resume TTS
+                    resume_language = ctx.slide.course_language if ctx.slide else "fr"
                     audio_bytes, _, _, _, mime_type = await self.voice.generate_audio_async(
                         resume_text,
-                        language=ctx.language,
+                        language=resume_language,
                         rate_override="+10%" if settings.realtime_session.enable_rate_adaptation else "+0%",
                     )
                     if audio_bytes:
@@ -878,9 +883,8 @@ class RealtimeSessionService:
                         course_id = message.get("course_id", "")
                         chapter_idx = message.get("chapter_index", 0)
                         section_idx = message.get("section_index", 0)
-                        requested_language = str(message.get("language", "") or "").strip().lower()
-                        if requested_language and requested_language != "auto":
-                            ctx.language = requested_language
+                        # Don't override ctx.language - presentation uses course's original language
+                        # The frontend can still send language but we ignore it for presentation
 
                         presentation_task = asyncio.create_task(
                             handle_presentation_turn(course_id, chapter_idx, section_idx)

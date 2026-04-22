@@ -112,6 +112,7 @@ class PresentationService:
                     course_id=course_id,
                     course_title=course_struct.title or "",
                     course_domain=course_struct.domain or "",
+                    course_language=course_struct.language or "fr",
                     chapter_index=chapter_index,
                     chapter_number=int(chapter.order or (chapter_index + 1)),
                     chapter_title=chapter.title or "",
